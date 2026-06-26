@@ -20,6 +20,18 @@
 #include <emscripten/html5.h>
 #include <spirv_reflect.h>
 #include <vector>
+#include <cstring>
+
+// Returns the device's preferred canvas format so the surface (and pipeline color
+// targets, which share m_format) avoid an extra blit copy: 1 = rgba8unorm,
+// 0 = bgra8unorm (the WebGPU-guaranteed canvas formats).
+EM_JS(int, mobilegl_preferred_canvas_format, (), {
+    try {
+        return navigator["gpu"]["getPreferredCanvasFormat"]() === "rgba8unorm" ? 1 : 0;
+    } catch (e) {
+        return 0;
+    }
+});
 
 namespace MobileGL::MG_Backend::DirectWebGPU {
     namespace {
@@ -67,6 +79,29 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             default: return WGPUTextureFormat_Undefined;
             }
         }
+
+        WGPUFilterMode ToWgpuFilter(SamplerFilterMode mode) {
+            return mode == SamplerFilterMode::Nearest ? WGPUFilterMode_Nearest : WGPUFilterMode_Linear;
+        }
+
+        WGPUMipmapFilterMode ToWgpuMipmapFilter(SamplerMipmapMode mode) {
+            return mode == SamplerMipmapMode::Linear ? WGPUMipmapFilterMode_Linear
+                                                     : WGPUMipmapFilterMode_Nearest;
+        }
+
+        // WebGPU core has only ClampToEdge / Repeat / MirrorRepeat. ClampToBorder and
+        // MirrorClampToEdge have no equivalent, so they degrade to ClampToEdge (border
+        // color is a separate unsupported feature).
+        WGPUAddressMode ToWgpuAddressMode(SamplerWrapMode mode) {
+            switch (mode) {
+            case SamplerWrapMode::Repeat: return WGPUAddressMode_Repeat;
+            case SamplerWrapMode::MirroredRepeat: return WGPUAddressMode_MirrorRepeat;
+            case SamplerWrapMode::ClampToEdge:
+            case SamplerWrapMode::ClampToBorder:
+            case SamplerWrapMode::MirrorClampToEdge:
+            default: return WGPUAddressMode_ClampToEdge;
+            }
+        }
     } // namespace
 } // namespace MobileGL::MG_Backend::DirectWebGPU
 
@@ -93,6 +128,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             return false;
         }
         m_queue = wgpuDeviceGetQueue(m_device);
+
+        // Match the canvas' preferred format (avoids an implicit copy at present).
+        m_format = mobilegl_preferred_canvas_format() == 1 ? WGPUTextureFormat_RGBA8Unorm
+                                                           : WGPUTextureFormat_BGRA8Unorm;
 
         // Create the canvas surface (emdawnwebgpu canvas selector source).
         WGPUEmscriptenSurfaceSourceCanvasHTMLSelector canvasSrc{};
@@ -142,7 +181,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             if (t.texture) wgpuTextureRelease(t.texture);
         }
         m_textureCache.clear();
-        if (m_defaultSampler) { wgpuSamplerRelease(m_defaultSampler); m_defaultSampler = nullptr; }
+        for (auto& [k, s] : m_samplerCache) { if (s) wgpuSamplerRelease(s); }
+        m_samplerCache.clear();
         for (auto& [k, prog] : m_programCache) {
             if (prog.vertex) wgpuShaderModuleRelease(prog.vertex);
             if (prog.fragment) wgpuShaderModuleRelease(prog.fragment);
@@ -451,9 +491,6 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
 
     const WebGPURenderer::WgpuTexture*
     WebGPURenderer::GetOrCreateTexture(MG_State::GLState::ITextureObject& texture) {
-        if (auto it = m_textureCache.find(&texture); it != m_textureCache.end()) {
-            return &it->second; // M2b minimal: no re-upload on texture change yet
-        }
         const WGPUTextureFormat fmt = ToTextureFormat(texture.GetFormat());
         if (fmt == WGPUTextureFormat_Undefined) {
             MGLOG_E("DirectWebGPU: unsupported texture internal format for sampling");
@@ -467,17 +504,34 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (dim.x() <= 0 || dim.y() <= 0) {
             return nullptr;
         }
+        const Uint32 w = static_cast<Uint32>(dim.x());
+        const Uint32 h = static_cast<Uint32>(dim.y());
         const auto target = TextureUploadTarget::Texture2D;
-        const SizeT byteSize = mip->GetMipmapByteSize(target, 0);
-        void* pixels = mip->MapMipmapData(target, 0);
-        if (!pixels || byteSize == 0) {
-            return nullptr;
+
+        // Reuse the cached GPU texture unless its content is dirty (glTexImage2D /
+        // glTexSubImage2D mark it so). A size/format change forces a recreate.
+        auto it = m_textureCache.find(&texture);
+        if (it != m_textureCache.end()) {
+            WgpuTexture& cached = it->second;
+            if (!mip->IsStorageDirty(target, 0)) {
+                return &cached; // up to date
+            }
+            if (cached.width != w || cached.height != h || cached.format != fmt) {
+                if (cached.view) wgpuTextureViewRelease(cached.view);
+                if (cached.texture) wgpuTextureRelease(cached.texture);
+                m_textureCache.erase(it);
+            } else {
+                if (UploadTextureLevel0(cached.texture, *mip, w, h)) {
+                    mip->MarkStorageDirty(target, 0, false);
+                }
+                return &cached;
+            }
         }
 
         WGPUTextureDescriptor td{};
         td.usage = WGPUTextureUsage_CopyDst | WGPUTextureUsage_TextureBinding;
         td.dimension = WGPUTextureDimension_2D;
-        td.size = {static_cast<Uint32>(dim.x()), static_cast<Uint32>(dim.y()), 1};
+        td.size = {w, h, 1};
         td.format = fmt;
         td.mipLevelCount = 1;
         td.sampleCount = 1;
@@ -485,38 +539,85 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (!tex) {
             return nullptr;
         }
-
-        WGPUTexelCopyTextureInfo dst{};
-        dst.texture = tex;
-        WGPUTexelCopyBufferLayout dataLayout{};
-        dataLayout.bytesPerRow = static_cast<Uint32>(dim.x()) * 4u; // RGBA8
-        dataLayout.rowsPerImage = static_cast<Uint32>(dim.y());
-        WGPUExtent3D ext{static_cast<Uint32>(dim.x()), static_cast<Uint32>(dim.y()), 1};
-        wgpuQueueWriteTexture(m_queue, &dst, pixels, byteSize, &dataLayout, &ext);
+        if (!UploadTextureLevel0(tex, *mip, w, h)) {
+            wgpuTextureRelease(tex);
+            return nullptr;
+        }
+        mip->MarkStorageDirty(target, 0, false);
 
         WgpuTexture wt;
         wt.texture = tex;
         wt.view = wgpuTextureCreateView(tex, nullptr);
+        wt.width = w;
+        wt.height = h;
+        wt.format = fmt;
         auto [ins, ok] = m_textureCache.emplace(&texture, wt);
         return &ins->second;
     }
 
-    WGPUSampler WebGPURenderer::GetDefaultSampler() {
-        if (m_defaultSampler) {
-            return m_defaultSampler;
+    Bool WebGPURenderer::UploadTextureLevel0(WGPUTexture tex, MG_State::GLState::TextureObjectMipmap& mip,
+                                             Uint32 w, Uint32 h) {
+        const auto target = TextureUploadTarget::Texture2D;
+        const SizeT byteSize = mip.GetMipmapByteSize(target, 0);
+        void* pixels = mip.MapMipmapData(target, 0);
+        if (!pixels || byteSize == 0) {
+            return false;
         }
+        WGPUTexelCopyTextureInfo dst{};
+        dst.texture = tex;
+        WGPUTexelCopyBufferLayout dataLayout{};
+        dataLayout.bytesPerRow = w * 4u; // RGBA8 (4 bytes/texel)
+        dataLayout.rowsPerImage = h;
+        WGPUExtent3D ext{w, h, 1};
+        wgpuQueueWriteTexture(m_queue, &dst, pixels, byteSize, &dataLayout, &ext);
+        return true;
+    }
+
+    WGPUSampler WebGPURenderer::GetOrCreateSampler(const MG_State::GLState::SamplerObject& sampler) {
         WGPUSamplerDescriptor sd{};
-        sd.addressModeU = WGPUAddressMode_Repeat;
-        sd.addressModeV = WGPUAddressMode_Repeat;
-        sd.addressModeW = WGPUAddressMode_Repeat;
-        sd.magFilter = WGPUFilterMode_Linear;
-        sd.minFilter = WGPUFilterMode_Linear;
-        sd.mipmapFilter = WGPUMipmapFilterMode_Linear;
-        sd.lodMinClamp = 0.0f;
-        sd.lodMaxClamp = 32.0f;
+        sd.addressModeU = ToWgpuAddressMode(sampler.GetWrapS());
+        sd.addressModeV = ToWgpuAddressMode(sampler.GetWrapT());
+        sd.addressModeW = ToWgpuAddressMode(sampler.GetWrapR());
+        sd.magFilter = ToWgpuFilter(sampler.GetMagFilter());
+        sd.minFilter = ToWgpuFilter(sampler.GetMinFilter());
+        sd.mipmapFilter = ToWgpuMipmapFilter(sampler.GetMipmapMode());
+        // WebGPU requires 0 <= lodMinClamp <= lodMaxClamp; GL defaults (-1000..1000)
+        // must be clamped. With no mipmaps yet this only affects validity.
+        const Float maxLod = sampler.GetMipmapMode() == SamplerMipmapMode::None
+                                 ? 0.0f
+                                 : (sampler.GetMaxLod() < 0.0f ? 0.0f : sampler.GetMaxLod());
+        const Float minLod = sampler.GetMinLod() < 0.0f ? 0.0f : sampler.GetMinLod();
+        sd.lodMinClamp = minLod < maxLod ? minLod : maxLod;
+        sd.lodMaxClamp = maxLod;
         sd.maxAnisotropy = 1;
-        m_defaultSampler = wgpuDeviceCreateSampler(m_device, &sd);
-        return m_defaultSampler;
+        // compare-samplers are a depth-texture feature; not wired up yet (would need
+        // tint to emit a sampler_comparison binding), so leave .compare unset.
+
+        // Key the cache by the resolved WGPU descriptor fields (dedupes identical
+        // samplers across textures, like the Vulkan backend's sampler cache).
+        Uint64 key = 1469598103934665603ull; // FNV-1a
+        auto mix = [&key](Uint32 v) {
+            for (int i = 0; i < 4; ++i) {
+                key ^= static_cast<Uint8>(v >> (i * 8));
+                key *= 1099511628211ull;
+            }
+        };
+        mix(static_cast<Uint32>(sd.addressModeU));
+        mix(static_cast<Uint32>(sd.addressModeV));
+        mix(static_cast<Uint32>(sd.addressModeW));
+        mix(static_cast<Uint32>(sd.magFilter));
+        mix(static_cast<Uint32>(sd.minFilter));
+        mix(static_cast<Uint32>(sd.mipmapFilter));
+        Uint32 lodBits;
+        std::memcpy(&lodBits, &sd.lodMinClamp, 4); mix(lodBits);
+        std::memcpy(&lodBits, &sd.lodMaxClamp, 4); mix(lodBits);
+
+        if (auto it = m_samplerCache.find(key); it != m_samplerCache.end()) {
+            return it->second;
+        }
+        WGPUSampler s = wgpuDeviceCreateSampler(m_device, &sd);
+        m_samplerCache.emplace(key, s);
+        return s;
     }
 
     WGPURenderPassEncoder WebGPURenderer::BeginDrawPass(MG_State::GLState::ProgramObject& program,
@@ -563,19 +664,24 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                     const Int u = program.GetUniformSamplerOrImageUnitIndex(static_cast<Uint>(loc));
                     if (u >= 0) unit = u;
                 }
-                auto texObj = MG_State::pGLContext->GetTextureUnitObject(unit)
-                                  .GetBindingSlot(TextureTarget::Texture2D)
-                                  .GetBoundObject();
+                auto& textureUnit = MG_State::pGLContext->GetTextureUnitObject(unit);
+                auto texObj = textureUnit.GetBindingSlot(TextureTarget::Texture2D).GetBoundObject();
                 if (!texObj) continue;
                 const WgpuTexture* wt = GetOrCreateTexture(*texObj);
                 if (!wt) continue;
+                // Effective sampler: a bound GL sampler object (glBindSampler) overrides
+                // the texture object's own glTexParameter-set params.
+                const auto& samplerOverride = textureUnit.GetSamplerObject();
+                const auto& effectiveSampler = samplerOverride ? samplerOverride : texObj->GetSamplerObject();
+                WGPUSampler sampler = effectiveSampler ? GetOrCreateSampler(*effectiveSampler) : nullptr;
+                if (!sampler) continue;
                 WGPUBindGroupEntry te{};
                 te.binding = s.textureBinding;
                 te.textureView = wt->view;
                 entries.push_back(te);
                 WGPUBindGroupEntry se{};
                 se.binding = s.samplerBinding;
-                se.sampler = GetDefaultSampler();
+                se.sampler = sampler;
                 entries.push_back(se);
             }
             if (!entries.empty()) {

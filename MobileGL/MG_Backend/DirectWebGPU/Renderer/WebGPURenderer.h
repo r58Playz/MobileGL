@@ -15,6 +15,8 @@ namespace MobileGL::MG_State::GLState {
     class VertexArrayObject;
     class BufferObject;
     class ITextureObject;
+    class TextureObjectMipmap;
+    class SamplerObject;
 } // namespace MobileGL::MG_State::GLState
 
 namespace MobileGL::MG_Backend::DirectWebGPU {
@@ -70,6 +72,9 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         struct WgpuTexture {
             WGPUTexture texture = nullptr;
             WGPUTextureView view = nullptr;
+            Uint32 width = 0;
+            Uint32 height = 0;
+            WGPUTextureFormat format = WGPUTextureFormat_Undefined;
         };
 
         void BeginFrameIfNeeded();
@@ -83,7 +88,13 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         WGPUBuffer GetOrCreateVertexBuffer(MG_State::GLState::BufferObject& buffer);
         WGPUBuffer GetOrCreateIndexBuffer(MG_State::GLState::BufferObject& buffer);
         const WgpuTexture* GetOrCreateTexture(MG_State::GLState::ITextureObject& texture);
-        WGPUSampler GetDefaultSampler();
+        // Uploads mip level 0 (RGBA8) of `mip` into `tex` via the queue. Returns false
+        // if the source pixels aren't available.
+        Bool UploadTextureLevel0(WGPUTexture tex, MG_State::GLState::TextureObjectMipmap& mip,
+                                 Uint32 w, Uint32 h);
+        // Builds (or reuses) a WGPUSampler matching the GL sampler params
+        // (glTexParameter / glBindSampler). Cached by the resolved param values.
+        WGPUSampler GetOrCreateSampler(const MG_State::GLState::SamplerObject& sampler);
         WGPUShaderModule MakeShaderModule(const char* wgsl);
         // Begins a Load render pass, binds the pipeline + vertex buffers for the
         // current program/VAO. Returns the pass (caller draws + ends) or nullptr.
@@ -105,7 +116,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         UnorderedMap<const MG_State::GLState::BufferObject*, WGPUBuffer> m_vertexBufferCache;
         UnorderedMap<const MG_State::GLState::BufferObject*, WGPUBuffer> m_indexBufferCache;
         UnorderedMap<const MG_State::GLState::ITextureObject*, WgpuTexture> m_textureCache;
-        WGPUSampler m_defaultSampler = nullptr;
+        // WGPUSamplers keyed by a hash of their resolved descriptor (GL sampler params).
+        UnorderedMap<Uint64, WGPUSampler> m_samplerCache;
         // Bind groups reference runtime resources (textures/UBO contents), so they are
         // rebuilt each draw and released at frame end.
         Vector<WGPUBindGroup> m_frameBindGroups;

@@ -13,6 +13,8 @@ namespace MobileGL { void Initialize(); }
 static EGLDisplay g_dpy = EGL_NO_DISPLAY;
 static EGLSurface g_surf = EGL_NO_SURFACE;
 static double g_t = 0.0;
+static GLuint g_tex = 0;
+static int g_frame = 0;
 
 static const char* kVert =
     "#version 330 core\n"
@@ -83,10 +85,9 @@ static void SetupQuad() {
         255, 0,   0,   255,   0,   255, 0,   255,
         0,   0,   255, 255,   255, 255, 0,   255,
     };
-    GLuint tex = 0;
-    glGenTextures(1, &tex);
+    glGenTextures(1, &g_tex);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tex);
+    glBindTexture(GL_TEXTURE_2D, g_tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 2, 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, texels);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -94,6 +95,25 @@ static void SetupQuad() {
 
 static void Frame() {
     g_t += 0.016;
+    // Every ~40 frames, rotate the 2x2 texel colors via glTexSubImage2D to exercise
+    // the re-upload-on-dirty path (the quadrant colors should cycle).
+    if (g_frame % 40 == 0) {
+        static const unsigned char palette[4][4] = {
+            {255, 0, 0, 255}, {0, 255, 0, 255}, {0, 0, 255, 255}, {255, 255, 0, 255},
+        };
+        const int shift = (g_frame / 40) % 4;
+        unsigned char texels[16];
+        for (int i = 0; i < 4; ++i) {
+            const int c = (i + shift) % 4;
+            texels[i * 4 + 0] = palette[c][0];
+            texels[i * 4 + 1] = palette[c][1];
+            texels[i * 4 + 2] = palette[c][2];
+            texels[i * 4 + 3] = palette[c][3];
+        }
+        glBindTexture(GL_TEXTURE_2D, g_tex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 2, 2, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+    }
+    ++g_frame;
     glClearColor(0.1f, 0.2f, 0.3f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, (const void*)0);
