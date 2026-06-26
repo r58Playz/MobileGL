@@ -588,4 +588,63 @@ if (EMSCRIPTEN)
             "--shell-file=${CMAKE_SOURCE_DIR}/tools/web_harness/shell.html")
         set_target_properties(mobilegl_web_harness PROPERTIES SUFFIX ".html")
     endif()
+
+    # Browser-side apitrace replayer: replays a recorded GL trace through MobileGL ->
+    # DirectWebGPU and reads back the framebuffer at a target call (golden compare).
+    # Configure with -DMOBILEGL_TRACE_FILE=/abs/path/to/trace.trace (preloaded into the FS).
+    option(MOBILEGL_BUILD_TRACE_REPLAY_WEB "Build the browser-side apitrace replayer" OFF)
+    if (MOBILEGL_BUILD_TRACE_REPLAY_WEB)
+        set(_ap ${CMAKE_SOURCE_DIR}/3rdparty/apitrace)
+        set(_sn ${_ap}/thirdparty/snappy)
+        # Generate snappy-stubs-public.h (Linux substitutions) into the build dir.
+        file(READ "${_sn}/snappy-stubs-public.h.in" _snhdr)
+        string(REPLACE "\${HAVE_SYS_UIO_H_01}" "1" _snhdr "${_snhdr}")
+        string(REPLACE "\${PROJECT_VERSION_MAJOR}" "1" _snhdr "${_snhdr}")
+        string(REPLACE "\${PROJECT_VERSION_MINOR}" "1" _snhdr "${_snhdr}")
+        string(REPLACE "\${PROJECT_VERSION_PATCH}" "9" _snhdr "${_snhdr}")
+        file(WRITE "${CMAKE_BINARY_DIR}/apitrace_gen/snappy-stubs-public.h" "${_snhdr}")
+
+        add_executable(mobilegl_trace_replay_web
+            ${CMAKE_SOURCE_DIR}/tools/web_harness/trace_replay_web.cpp
+            # apitrace parser (snappy-only; createForRead provided in the cpp above)
+            ${_ap}/lib/trace/trace_parser.cpp
+            ${_ap}/lib/trace/trace_parser_flags.cpp
+            ${_ap}/lib/trace/trace_model.cpp
+            ${_ap}/lib/trace/trace_file.cpp
+            ${_ap}/lib/trace/trace_file_snappy.cpp
+            ${_ap}/lib/trace/trace_option.cpp
+            ${_ap}/lib/os/os_posix.cpp
+            ${_ap}/lib/os/os_backtrace.cpp
+            ${_sn}/snappy.cc ${_sn}/snappy-sinksource.cc ${_sn}/snappy-stubs-internal.cc)
+        target_include_directories(mobilegl_trace_replay_web PRIVATE
+            ${_ap}/lib/trace ${_ap}/lib/os ${_ap}/lib/common ${_ap}/lib/highlight
+            ${_ap}/thirdparty/zstd/contrib/seekable_format ${_sn}
+            ${CMAKE_BINARY_DIR}/apitrace_gen)
+        # apitrace is C++17 (a C++20 build hits a deleted ostream<<wchar_t* overload in
+        # dead trace_parser code); keep RTTI/exceptions; PATH_MAX for os_posix on wasm.
+        target_compile_options(mobilegl_trace_replay_web PRIVATE
+            -std=c++17 -fexceptions -frtti -DPATH_MAX=4096 -Wno-deprecated-declarations -Wno-\#warnings)
+        target_link_libraries(mobilegl_trace_replay_web PRIVATE ${CMAKE_PROJECT_NAME})
+        set(_rep_js_flags)
+        foreach(_js ${EMDAWNWEBGPU_JS_LIBRARIES})
+            list(APPEND _rep_js_flags "--js-library=${_js}")
+        endforeach()
+        if (NOT MOBILEGL_TRACE_FILE)
+            set(MOBILEGL_TRACE_FILE "" CACHE STRING "Absolute path to a .trace to preload as /trace.trace")
+        endif()
+        set(_preload)
+        if (MOBILEGL_TRACE_FILE)
+            set(_preload "--preload-file=${MOBILEGL_TRACE_FILE}@/trace.trace")
+        endif()
+        target_link_options(mobilegl_trace_replay_web PRIVATE
+            ${_rep_js_flags}
+            "--js-library=${CMAKE_SOURCE_DIR}/MobileGL/MG_Backend/DirectWebGPU/lib_mobilegl_webgpu.js"
+            "-sWASM_BIGINT" "-sSTACK_SIZE=32MB" "-sALLOW_MEMORY_GROWTH=1" "-sEXIT_RUNTIME=0"
+            "-sEXPORTED_RUNTIME_METHODS=addRunDependency,removeRunDependency,HEAPU8"
+            "-sEXPORTED_FUNCTIONS=_main,_replay_run,_replay_capture,_replay_done,_replay_pixels,_replay_width,_replay_height"
+            "-sWASM_ASYNC_COMPILATION=0" "-fexceptions"
+            ${_preload}
+            "--shell-file=${CMAKE_SOURCE_DIR}/tools/web_harness/replay_shell.html")
+        set_target_properties(mobilegl_trace_replay_web PROPERTIES SUFFIX ".html")
+    endif()
 endif()

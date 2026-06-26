@@ -1,0 +1,67 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>MobileGL apitrace replayer</title></head>
+<body style="margin:0;background:#111">
+  <canvas id="canvas" width="854" height="480" style="display:block;margin:8px auto;background:#000"></canvas>
+  <pre id="log" style="color:#0f0;font:12px monospace;padding:8px;white-space:pre-wrap"></pre>
+  <script>
+    var Module = {
+      canvas: document.getElementById('canvas'),
+      print: (t)    => { document.getElementById('log').textContent += t + "\n"; console.log(t); },
+      printErr: (t) => { document.getElementById('log').textContent += "ERR: " + t + "\n"; console.error(t); },
+      preRun: [function() {
+        if (!navigator.gpu) { Module.printErr("WebGPU not available"); return; }
+        addRunDependency('webgpu-device');
+        (async () => {
+          try {
+            const adapter = await navigator.gpu.requestAdapter();
+            const device = await adapter.requestDevice({ requiredLimits: {
+              maxBufferSize: adapter.limits.maxBufferSize,
+              maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+            }});
+            Module.preinitializedWebGPUDevice = device;
+            Module.print("[shell] WebGPU device acquired");
+          } catch (e) { Module.printErr("device acquisition failed: " + e); }
+          finally { removeRunDependency('webgpu-device'); }
+        })();
+      }],
+      // Called after the replay's promising run resolves: compare to the golden PNG.
+      onReplayDone: function() {
+        if (!Module._replay_done || !Module._replay_done()) { Module.printErr("replay did not capture"); return; }
+        const w = Module._replay_width(), h = Module._replay_height();
+        const ptr = Module._replay_pixels();
+        const px = Module.HEAPU8.subarray(ptr, ptr + w * h * 4); // RGBA, GL bottom-up
+        const img = new Image();
+        img.onload = function() {
+          const c = document.createElement('canvas'); c.width = w; c.height = h;
+          const g = c.getContext('2d'); g.drawImage(img, 0, 0, w, h);
+          const golden = g.getImageData(0, 0, w, h).data; // RGBA, top-down
+          const FUZZ = 51, TOL = 20; // 20% per-channel, 20 mismatched pixels (fixture config)
+          let mismatch = 0;
+          for (let y = 0; y < h; y++) {
+            const gy = y, ry = h - 1 - y; // flip: GL readback is bottom-up
+            for (let x = 0; x < w; x++) {
+              const gi = (gy * w + x) * 4, ri = (ry * w + x) * 4;
+              if (Math.abs(px[ri] - golden[gi]) > FUZZ ||
+                  Math.abs(px[ri+1] - golden[gi+1]) > FUZZ ||
+                  Math.abs(px[ri+2] - golden[gi+2]) > FUZZ) mismatch++;
+            }
+          }
+          Module.print("[compare] mismatch=" + mismatch + " / " + (w*h) +
+                       " (tolerance " + TOL + ") -> " + (mismatch <= TOL ? "PASS" : "FAIL"));
+          // Also paint the replay result so it's visible.
+          const out = Module.canvas.getContext('2d');
+          if (out) {
+            const id = out.createImageData(w, h);
+            for (let y = 0; y < h; y++) for (let x = 0; x < w*4; x++) id.data[y*w*4+x] = px[(h-1-y)*w*4+x];
+            out.putImageData(id, 0, 0);
+          }
+        };
+        img.onerror = function() { Module.printErr("[compare] failed to load golden.png"); };
+        img.src = "golden.png";
+      },
+    };
+  </script>
+  {{{ SCRIPT }}}
+</body>
+</html>
