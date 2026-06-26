@@ -12,8 +12,13 @@
 #include <MG_State/GLState/ProgramState/ShaderObject.h>
 #include <MG_State/GLState/VertexArrayState/VertexArrayObject.h>
 #include <MG_State/GLState/BufferState/BufferObject.h>
+#include <MG_State/GLState/TextureState/TextureUnit.h>
+#include <MG_State/GLState/TextureState/TextureObject.h>
+#include <MG_State/GLState/TextureState/TextureEnum.h>
+#include <MG_State/GLState/SamplerState/SamplerObject.h>
 #include "MG_Util/ShaderTranspiler/WgslTranspiler.h"
 #include <emscripten/html5.h>
+#include <spirv_reflect.h>
 #include <vector>
 
 namespace MobileGL::MG_Backend::DirectWebGPU {
@@ -49,6 +54,17 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             case GL_UNSIGNED_SHORT: return WGPUIndexFormat_Uint16;
             case GL_UNSIGNED_INT: return WGPUIndexFormat_Uint32;
             default: return WGPUIndexFormat_Undefined; // GL_UNSIGNED_BYTE unsupported by WebGPU
+            }
+        }
+
+        // Minimal GL internal format -> WGPU texture format (8-bit, 4-channel for now;
+        // WebGPU has no 3-channel rgb8, so RGB textures must be expanded by the caller).
+        WGPUTextureFormat ToTextureFormat(TextureInternalFormat fmt) {
+            using F = TextureInternalFormat;
+            switch (fmt) {
+            case F::RGBA8: return WGPUTextureFormat_RGBA8Unorm;
+            case F::SRGB8Alpha8: return WGPUTextureFormat_RGBA8UnormSrgb;
+            default: return WGPUTextureFormat_Undefined;
             }
         }
     } // namespace
@@ -116,11 +132,17 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         for (auto& [k, buf] : m_indexBufferCache) { if (buf) wgpuBufferRelease(buf); }
         m_indexBufferCache.clear();
         for (auto& [k, p] : m_pipelineCache) {
-            if (p.bindGroup) wgpuBindGroupRelease(p.bindGroup);
+            if (p.group0Layout) wgpuBindGroupLayoutRelease(p.group0Layout);
             if (p.uboBuffer) wgpuBufferRelease(p.uboBuffer);
             if (p.pipeline) wgpuRenderPipelineRelease(p.pipeline);
         }
         m_pipelineCache.clear();
+        for (auto& [k, t] : m_textureCache) {
+            if (t.view) wgpuTextureViewRelease(t.view);
+            if (t.texture) wgpuTextureRelease(t.texture);
+        }
+        m_textureCache.clear();
+        if (m_defaultSampler) { wgpuSamplerRelease(m_defaultSampler); m_defaultSampler = nullptr; }
         for (auto& [k, prog] : m_programCache) {
             if (prog.vertex) wgpuShaderModuleRelease(prog.vertex);
             if (prog.fragment) wgpuShaderModuleRelease(prog.fragment);
@@ -158,6 +180,9 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     }
 
     void WebGPURenderer::EndFrame() {
+        // Bind groups were referenced by the just-submitted commands; safe to release now.
+        for (WGPUBindGroup bg : m_frameBindGroups) { if (bg) wgpuBindGroupRelease(bg); }
+        m_frameBindGroups.clear();
         if (m_frameView) { wgpuTextureViewRelease(m_frameView); m_frameView = nullptr; }
         if (m_frameTexture) { wgpuTextureRelease(m_frameTexture); m_frameTexture = nullptr; }
         if (m_encoder) { wgpuCommandEncoderRelease(m_encoder); m_encoder = nullptr; }
@@ -253,10 +278,43 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             if (prog.fragment) wgpuShaderModuleRelease(prog.fragment);
             return nullptr;
         }
-        // Default-block uniforms are packed into the global UBO; glslang auto-maps it
-        // to binding 0 for uniform-only shaders (tint preserves @group(0)@binding(0)).
-        if (program.GetUBOSize() > 0) {
-            prog.globalUboBinding = 0;
+        // Reflect resource bindings from the SPIR-V (SPIRV-Reflect) so they match the
+        // @group(0)/@binding(N) that tint emits: the global UBO at its binding, and
+        // each combined sampler2D at N (texture) / N+1 (sampler, tint's split).
+        for (SizeT i = 0; i < spirv.size(); ++i) {
+            if (spirv[i].empty()) continue;
+            SpvReflectShaderModule mod;
+            if (spvReflectCreateShaderModule(spirv[i].size() * sizeof(unsigned), spirv[i].data(), &mod) !=
+                SPV_REFLECT_RESULT_SUCCESS) {
+                continue;
+            }
+            uint32_t count = 0;
+            spvReflectEnumerateDescriptorBindings(&mod, &count, nullptr);
+            std::vector<SpvReflectDescriptorBinding*> binds(count);
+            spvReflectEnumerateDescriptorBindings(&mod, &count, binds.data());
+            for (auto* b : binds) {
+                if (b->descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
+                    const char* tn = b->type_description ? b->type_description->type_name : nullptr;
+                    if (prog.globalUboBinding < 0 && tn && String(tn).find("MGL_GLOBAL_UBO") != String::npos) {
+                        prog.globalUboBinding = static_cast<Int>(b->binding);
+                    }
+                } else if (b->descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+                    Bool dup = false;
+                    for (const auto& s : prog.samplers) {
+                        if (s.textureBinding == b->binding) { dup = true; break; }
+                    }
+                    if (!dup) {
+                        SamplerRef ref;
+                        ref.textureBinding = b->binding;
+                        ref.samplerBinding = b->binding + 1;
+                        ref.name = b->name ? b->name : "";
+                        prog.samplers.push_back(ref);
+                    }
+                }
+            }
+            spvReflectDestroyShaderModule(&mod);
+        }
+        if (prog.globalUboBinding >= 0) {
             prog.globalUboSize = program.GetUBOSize();
         }
         auto [ins, ok] = m_programCache.emplace(&program, prog);
@@ -334,26 +392,16 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
         WgpuPipeline entry;
         entry.pipeline = pipeline;
-        // If the program has default-block uniforms, create the global-UBO buffer and
-        // a group-0 bind group against the pipeline's auto-generated layout.
-        if (prog->globalUboBinding >= 0 && prog->globalUboSize > 0) {
-            WGPUBufferDescriptor bd{};
-            bd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
-            bd.size = (static_cast<Uint64>(prog->globalUboSize) + 15u) & ~Uint64(15); // 16-byte aligned
-            entry.uboBuffer = wgpuDeviceCreateBuffer(m_device, &bd);
-            entry.uboSize = prog->globalUboSize;
-            WGPUBindGroupLayout group0 = wgpuRenderPipelineGetBindGroupLayout(pipeline, 0);
-            WGPUBindGroupEntry bge{};
-            bge.binding = static_cast<Uint32>(prog->globalUboBinding);
-            bge.buffer = entry.uboBuffer;
-            bge.offset = 0;
-            bge.size = bd.size;
-            WGPUBindGroupDescriptor bgd{};
-            bgd.layout = group0;
-            bgd.entryCount = 1;
-            bgd.entries = &bge;
-            entry.bindGroup = wgpuDeviceCreateBindGroup(m_device, &bgd);
-            wgpuBindGroupLayoutRelease(group0);
+        // Keep the auto-generated group-0 layout for building per-draw bind groups,
+        // and create the global-UBO backing buffer once.
+        if (prog->HasResources()) {
+            entry.group0Layout = wgpuRenderPipelineGetBindGroupLayout(pipeline, 0);
+            if (prog->globalUboBinding >= 0 && prog->globalUboSize > 0) {
+                WGPUBufferDescriptor bd{};
+                bd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+                bd.size = (static_cast<Uint64>(prog->globalUboSize) + 15u) & ~Uint64(15); // 16-byte aligned
+                entry.uboBuffer = wgpuDeviceCreateBuffer(m_device, &bd);
+            }
         }
         auto [ins, ok] = m_pipelineCache.emplace(&program, entry);
         return &ins->second;
@@ -401,6 +449,76 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         return buf;
     }
 
+    const WebGPURenderer::WgpuTexture*
+    WebGPURenderer::GetOrCreateTexture(MG_State::GLState::ITextureObject& texture) {
+        if (auto it = m_textureCache.find(&texture); it != m_textureCache.end()) {
+            return &it->second; // M2b minimal: no re-upload on texture change yet
+        }
+        const WGPUTextureFormat fmt = ToTextureFormat(texture.GetFormat());
+        if (fmt == WGPUTextureFormat_Undefined) {
+            MGLOG_E("DirectWebGPU: unsupported texture internal format for sampling");
+            return nullptr;
+        }
+        auto* mip = dynamic_cast<MG_State::GLState::TextureObjectMipmap*>(&texture);
+        if (!mip) {
+            return nullptr;
+        }
+        const IntVec3 dim = texture.GetBaseSize();
+        if (dim.x() <= 0 || dim.y() <= 0) {
+            return nullptr;
+        }
+        const auto target = TextureUploadTarget::Texture2D;
+        const SizeT byteSize = mip->GetMipmapByteSize(target, 0);
+        void* pixels = mip->MapMipmapData(target, 0);
+        if (!pixels || byteSize == 0) {
+            return nullptr;
+        }
+
+        WGPUTextureDescriptor td{};
+        td.usage = WGPUTextureUsage_CopyDst | WGPUTextureUsage_TextureBinding;
+        td.dimension = WGPUTextureDimension_2D;
+        td.size = {static_cast<Uint32>(dim.x()), static_cast<Uint32>(dim.y()), 1};
+        td.format = fmt;
+        td.mipLevelCount = 1;
+        td.sampleCount = 1;
+        WGPUTexture tex = wgpuDeviceCreateTexture(m_device, &td);
+        if (!tex) {
+            return nullptr;
+        }
+
+        WGPUTexelCopyTextureInfo dst{};
+        dst.texture = tex;
+        WGPUTexelCopyBufferLayout dataLayout{};
+        dataLayout.bytesPerRow = static_cast<Uint32>(dim.x()) * 4u; // RGBA8
+        dataLayout.rowsPerImage = static_cast<Uint32>(dim.y());
+        WGPUExtent3D ext{static_cast<Uint32>(dim.x()), static_cast<Uint32>(dim.y()), 1};
+        wgpuQueueWriteTexture(m_queue, &dst, pixels, byteSize, &dataLayout, &ext);
+
+        WgpuTexture wt;
+        wt.texture = tex;
+        wt.view = wgpuTextureCreateView(tex, nullptr);
+        auto [ins, ok] = m_textureCache.emplace(&texture, wt);
+        return &ins->second;
+    }
+
+    WGPUSampler WebGPURenderer::GetDefaultSampler() {
+        if (m_defaultSampler) {
+            return m_defaultSampler;
+        }
+        WGPUSamplerDescriptor sd{};
+        sd.addressModeU = WGPUAddressMode_Repeat;
+        sd.addressModeV = WGPUAddressMode_Repeat;
+        sd.addressModeW = WGPUAddressMode_Repeat;
+        sd.magFilter = WGPUFilterMode_Linear;
+        sd.minFilter = WGPUFilterMode_Linear;
+        sd.mipmapFilter = WGPUMipmapFilterMode_Linear;
+        sd.lodMinClamp = 0.0f;
+        sd.lodMaxClamp = 32.0f;
+        sd.maxAnisotropy = 1;
+        m_defaultSampler = wgpuDeviceCreateSampler(m_device, &sd);
+        return m_defaultSampler;
+    }
+
     WGPURenderPassEncoder WebGPURenderer::BeginDrawPass(MG_State::GLState::ProgramObject& program,
                                                         const MG_State::GLState::VertexArrayObject& vao,
                                                         GLenum mode) {
@@ -421,14 +539,54 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(m_encoder, &rp);
         wgpuRenderPassEncoderSetPipeline(pass, p->pipeline);
 
-        // Upload current default-block uniform values and bind the global UBO.
-        if (p->bindGroup && p->uboBuffer) {
-            const void* uboData = program.GetUBOData();
-            const Uint sz = program.GetUBOSize();
-            if (uboData && sz > 0) {
-                wgpuQueueWriteBuffer(m_queue, p->uboBuffer, 0, uboData, sz & ~Uint(3));
+        // Build the group-0 bind group from current state: global UBO + sampled
+        // textures. Rebuilt per draw (textures/UBO contents are runtime state).
+        const WgpuProgram* prog = GetOrCreateProgram(program);
+        if (prog && prog->HasResources() && p->group0Layout) {
+            std::vector<WGPUBindGroupEntry> entries;
+            if (prog->globalUboBinding >= 0 && p->uboBuffer) {
+                const void* uboData = program.GetUBOData();
+                const Uint sz = program.GetUBOSize();
+                if (uboData && sz > 0) {
+                    wgpuQueueWriteBuffer(m_queue, p->uboBuffer, 0, uboData, sz & ~Uint(3));
+                }
+                WGPUBindGroupEntry e{};
+                e.binding = static_cast<Uint32>(prog->globalUboBinding);
+                e.buffer = p->uboBuffer;
+                e.size = (static_cast<Uint64>(prog->globalUboSize) + 15u) & ~Uint64(15);
+                entries.push_back(e);
             }
-            wgpuRenderPassEncoderSetBindGroup(pass, 0, p->bindGroup, 0, nullptr);
+            for (const auto& s : prog->samplers) {
+                Int unit = 0;
+                const Int loc = program.GetUniformLocation(s.name);
+                if (loc >= 0) {
+                    const Int u = program.GetUniformSamplerOrImageUnitIndex(static_cast<Uint>(loc));
+                    if (u >= 0) unit = u;
+                }
+                auto texObj = MG_State::pGLContext->GetTextureUnitObject(unit)
+                                  .GetBindingSlot(TextureTarget::Texture2D)
+                                  .GetBoundObject();
+                if (!texObj) continue;
+                const WgpuTexture* wt = GetOrCreateTexture(*texObj);
+                if (!wt) continue;
+                WGPUBindGroupEntry te{};
+                te.binding = s.textureBinding;
+                te.textureView = wt->view;
+                entries.push_back(te);
+                WGPUBindGroupEntry se{};
+                se.binding = s.samplerBinding;
+                se.sampler = GetDefaultSampler();
+                entries.push_back(se);
+            }
+            if (!entries.empty()) {
+                WGPUBindGroupDescriptor bgd{};
+                bgd.layout = p->group0Layout;
+                bgd.entryCount = entries.size();
+                bgd.entries = entries.data();
+                WGPUBindGroup bg = wgpuDeviceCreateBindGroup(m_device, &bgd);
+                m_frameBindGroups.push_back(bg);
+                wgpuRenderPassEncoderSetBindGroup(pass, 0, bg, 0, nullptr);
+            }
         }
 
         Uint32 slot = 0;

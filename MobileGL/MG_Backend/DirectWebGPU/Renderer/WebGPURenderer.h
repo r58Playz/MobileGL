@@ -14,6 +14,7 @@ namespace MobileGL::MG_State::GLState {
     class ProgramObject;
     class VertexArrayObject;
     class BufferObject;
+    class ITextureObject;
 } // namespace MobileGL::MG_State::GLState
 
 namespace MobileGL::MG_Backend::DirectWebGPU {
@@ -41,24 +42,34 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         Bool IsInitialized() const { return m_device != nullptr; }
 
     private:
+        // A GLSL combined sampler2D at SPIR-V binding N: tint splits it into a
+        // texture at @binding(N) and a sampler at @binding(N+1) (group 0).
+        struct SamplerRef {
+            Uint32 textureBinding = 0;
+            Uint32 samplerBinding = 0;
+            String name; // sampler uniform name, e.g. "tex0"
+        };
+
         struct WgpuProgram {
             WGPUShaderModule vertex = nullptr;
             WGPUShaderModule fragment = nullptr;
-            // Default-block uniforms are packed by glslang into the "MGL_GLOBAL_UBO".
-            // For uniform-only shaders glslang auto-maps it to @group(0) @binding(0)
-            // (which tint preserves). >=0 means the program has a global UBO.
-            // TODO: reflect the binding (SpvcSession) once textures/explicit UBOs land.
-            Int globalUboBinding = -1;
+            // Resource bindings reflected (SPIRV-Reflect) from the SPIR-V, matching
+            // the @group(0)/@binding(...) that tint emits.
+            Int globalUboBinding = -1; // >=0 if the default-block "MGL_GLOBAL_UBO" exists
             Uint globalUboSize = 0;
+            Vector<SamplerRef> samplers;
+            Bool HasResources() const { return globalUboBinding >= 0 || !samplers.empty(); }
         };
 
         struct WgpuPipeline {
             WGPURenderPipeline pipeline = nullptr;
-            // Global-UBO bind group (group 0), created against the pipeline's auto
-            // layout; null when the program has no uniforms.
-            WGPUBuffer uboBuffer = nullptr;
-            WGPUBindGroup bindGroup = nullptr;
-            Uint uboSize = 0;
+            WGPUBindGroupLayout group0Layout = nullptr; // pipeline auto layout (if resources)
+            WGPUBuffer uboBuffer = nullptr;             // global-UBO backing buffer (if any)
+        };
+
+        struct WgpuTexture {
+            WGPUTexture texture = nullptr;
+            WGPUTextureView view = nullptr;
         };
 
         void BeginFrameIfNeeded();
@@ -71,6 +82,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                                                 GLenum mode);
         WGPUBuffer GetOrCreateVertexBuffer(MG_State::GLState::BufferObject& buffer);
         WGPUBuffer GetOrCreateIndexBuffer(MG_State::GLState::BufferObject& buffer);
+        const WgpuTexture* GetOrCreateTexture(MG_State::GLState::ITextureObject& texture);
+        WGPUSampler GetDefaultSampler();
         WGPUShaderModule MakeShaderModule(const char* wgsl);
         // Begins a Load render pass, binds the pipeline + vertex buffers for the
         // current program/VAO. Returns the pass (caller draws + ends) or nullptr.
@@ -91,6 +104,11 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         UnorderedMap<const MG_State::GLState::ProgramObject*, WgpuPipeline> m_pipelineCache;
         UnorderedMap<const MG_State::GLState::BufferObject*, WGPUBuffer> m_vertexBufferCache;
         UnorderedMap<const MG_State::GLState::BufferObject*, WGPUBuffer> m_indexBufferCache;
+        UnorderedMap<const MG_State::GLState::ITextureObject*, WgpuTexture> m_textureCache;
+        WGPUSampler m_defaultSampler = nullptr;
+        // Bind groups reference runtime resources (textures/UBO contents), so they are
+        // rebuilt each draw and released at frame end.
+        Vector<WGPUBindGroup> m_frameBindGroups;
 
         // Per-frame transient state (valid only between BeginFrameIfNeeded and Present)
         WGPUCommandEncoder m_encoder = nullptr;
