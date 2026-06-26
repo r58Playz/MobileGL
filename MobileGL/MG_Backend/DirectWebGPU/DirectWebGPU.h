@@ -18,5 +18,6 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     // Free functions wired into the GlobalBackendFunctionsTable. They delegate to
     // the active renderer (and no-op safely before it exists).
     void Clear(GLbitfield mask);
+    void DrawArrays(GLenum mode, GLint first, GLsizei count);
     void Present();
 } // namespace MobileGL::MG_Backend::DirectWebGPU

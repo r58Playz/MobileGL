@@ -53,6 +53,26 @@ git -C "$DAWN_SRC" apply "$DAWN_PATCH"
 log "Fetching Dawn dependencies (shallow)"
 python3 "$DAWN_SRC/tools/fetch_dawn_dependencies.py" -d "$DAWN_SRC" -s >/dev/null
 
+# Unify SPIRV-Tools/SPIRV-Headers with MobileGL's glslang (3rdparty/glslang/known_good.json)
+# so tint's bundled copy is byte-identical to MobileGL's. Without this, the final link
+# has two different SPIRV-Tools and tint's reader binds to glslang's incompatible copy
+# (heap OOB in ast_parser). Pin from the canonical Khronos remotes.
+SPIRV_TOOLS_REV="${SPIRV_TOOLS_REV:-33e02568181e3312f49a3cf33df470bf96ef293a}"
+SPIRV_HEADERS_REV="${SPIRV_HEADERS_REV:-2a611a970fdbc41ac2e3e328802aed9985352dca}"
+# fetch_dawn_dependencies leaves the deps without their own .git, so re-pin by a
+# fresh shallow clone into a new repo at the exact revision.
+repin_dep() {  # <dir> <url> <rev>
+    rm -rf "$1"; mkdir -p "$1"
+    git -C "$1" init -q
+    git -C "$1" fetch -q --depth 1 "$2" "$3"
+    git -C "$1" checkout -q FETCH_HEAD
+}
+# Dawn expects the sources under <dep>/src (DAWN_SPIRV_TOOLS_DIR=.../spirv-tools/src).
+log "Re-pinning SPIRV-Tools -> $SPIRV_TOOLS_REV (match glslang)"
+repin_dep "$DAWN_SRC/third_party/spirv-tools/src" https://github.com/KhronosGroup/SPIRV-Tools "$SPIRV_TOOLS_REV"
+log "Re-pinning SPIRV-Headers -> $SPIRV_HEADERS_REV (match glslang)"
+repin_dep "$DAWN_SRC/third_party/spirv-headers/src" https://github.com/KhronosGroup/SPIRV-Headers "$SPIRV_HEADERS_REV"
+
 # ----------------------------------------------------------------------------
 log "Configuring Tint-only build (backends off; SPV reader + WGSL writer on)"
 emcmake cmake -S "$DAWN_SRC" -B "$DAWN_BUILD" -DCMAKE_BUILD_TYPE=Release \

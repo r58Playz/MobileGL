@@ -29,6 +29,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         m_backendFunctions = {};
         m_backendFunctions.Present = &DirectWebGPU::Present;
         m_backendFunctions.GL.Clear = &DirectWebGPU::Clear;
+        m_backendFunctions.GL.DrawArrays = &DirectWebGPU::DrawArrays;
     }
 
     Bool BackendObject_DirectWebGPU::InitCapabilities() {

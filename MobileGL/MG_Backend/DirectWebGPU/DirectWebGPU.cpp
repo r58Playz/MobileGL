@@ -18,6 +18,12 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
     }
 
+    void DrawArrays(GLenum mode, GLint first, GLsizei count) {
+        if (pWebGPURenderer) {
+            pWebGPURenderer->DrawArrays(mode, first, count);
+        }
+    }
+
     void Present() {
         if (pWebGPURenderer) {
             pWebGPURenderer->Present();
