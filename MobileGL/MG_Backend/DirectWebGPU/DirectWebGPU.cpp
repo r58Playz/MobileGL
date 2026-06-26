@@ -24,6 +24,12 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
     }
 
+    void DrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
+        if (pWebGPURenderer) {
+            pWebGPURenderer->DrawElements(mode, count, type, indices);
+        }
+    }
+
     void Present() {
         if (pWebGPURenderer) {
             pWebGPURenderer->Present();

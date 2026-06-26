@@ -43,6 +43,14 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             default: return WGPUPrimitiveTopology_TriangleList;
             }
         }
+
+        WGPUIndexFormat ToIndexFormat(GLenum type) {
+            switch (type) {
+            case GL_UNSIGNED_SHORT: return WGPUIndexFormat_Uint16;
+            case GL_UNSIGNED_INT: return WGPUIndexFormat_Uint32;
+            default: return WGPUIndexFormat_Undefined; // GL_UNSIGNED_BYTE unsupported by WebGPU
+            }
+        }
     } // namespace
 } // namespace MobileGL::MG_Backend::DirectWebGPU
 
@@ -105,7 +113,13 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         EndFrame();
         for (auto& [k, buf] : m_vertexBufferCache) { if (buf) wgpuBufferRelease(buf); }
         m_vertexBufferCache.clear();
-        for (auto& [k, pipe] : m_pipelineCache) { if (pipe) wgpuRenderPipelineRelease(pipe); }
+        for (auto& [k, buf] : m_indexBufferCache) { if (buf) wgpuBufferRelease(buf); }
+        m_indexBufferCache.clear();
+        for (auto& [k, p] : m_pipelineCache) {
+            if (p.bindGroup) wgpuBindGroupRelease(p.bindGroup);
+            if (p.uboBuffer) wgpuBufferRelease(p.uboBuffer);
+            if (p.pipeline) wgpuRenderPipelineRelease(p.pipeline);
+        }
         m_pipelineCache.clear();
         for (auto& [k, prog] : m_programCache) {
             if (prog.vertex) wgpuShaderModuleRelease(prog.vertex);
@@ -239,15 +253,21 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             if (prog.fragment) wgpuShaderModuleRelease(prog.fragment);
             return nullptr;
         }
+        // Default-block uniforms are packed into the global UBO; glslang auto-maps it
+        // to binding 0 for uniform-only shaders (tint preserves @group(0)@binding(0)).
+        if (program.GetUBOSize() > 0) {
+            prog.globalUboBinding = 0;
+            prog.globalUboSize = program.GetUBOSize();
+        }
         auto [ins, ok] = m_programCache.emplace(&program, prog);
         return &ins->second;
     }
 
-    WGPURenderPipeline
+    const WebGPURenderer::WgpuPipeline*
     WebGPURenderer::GetOrCreatePipeline(MG_State::GLState::ProgramObject& program,
                                         const MG_State::GLState::VertexArrayObject& vao, GLenum mode) {
         if (auto it = m_pipelineCache.find(&program); it != m_pipelineCache.end()) {
-            return it->second;
+            return &it->second;
         }
         const WgpuProgram* prog = GetOrCreateProgram(program);
         if (!prog) {
@@ -309,10 +329,34 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         desc.fragment = &fragment;
 
         WGPURenderPipeline pipeline = wgpuDeviceCreateRenderPipeline(m_device, &desc);
-        if (pipeline) {
-            m_pipelineCache.emplace(&program, pipeline);
+        if (!pipeline) {
+            return nullptr;
         }
-        return pipeline;
+        WgpuPipeline entry;
+        entry.pipeline = pipeline;
+        // If the program has default-block uniforms, create the global-UBO buffer and
+        // a group-0 bind group against the pipeline's auto-generated layout.
+        if (prog->globalUboBinding >= 0 && prog->globalUboSize > 0) {
+            WGPUBufferDescriptor bd{};
+            bd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+            bd.size = (static_cast<Uint64>(prog->globalUboSize) + 15u) & ~Uint64(15); // 16-byte aligned
+            entry.uboBuffer = wgpuDeviceCreateBuffer(m_device, &bd);
+            entry.uboSize = prog->globalUboSize;
+            WGPUBindGroupLayout group0 = wgpuRenderPipelineGetBindGroupLayout(pipeline, 0);
+            WGPUBindGroupEntry bge{};
+            bge.binding = static_cast<Uint32>(prog->globalUboBinding);
+            bge.buffer = entry.uboBuffer;
+            bge.offset = 0;
+            bge.size = bd.size;
+            WGPUBindGroupDescriptor bgd{};
+            bgd.layout = group0;
+            bgd.entryCount = 1;
+            bgd.entries = &bge;
+            entry.bindGroup = wgpuDeviceCreateBindGroup(m_device, &bgd);
+            wgpuBindGroupLayoutRelease(group0);
+        }
+        auto [ins, ok] = m_pipelineCache.emplace(&program, entry);
+        return &ins->second;
     }
 
     WGPUBuffer WebGPURenderer::GetOrCreateVertexBuffer(MG_State::GLState::BufferObject& buffer) {
@@ -336,26 +380,34 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         return buf;
     }
 
-    void WebGPURenderer::DrawArrays(GLenum mode, GLint first, GLsizei count) {
-        if (!m_device || !MG_State::pGLContext || count <= 0) {
-            return;
+    WGPUBuffer WebGPURenderer::GetOrCreateIndexBuffer(MG_State::GLState::BufferObject& buffer) {
+        if (auto it = m_indexBufferCache.find(&buffer); it != m_indexBufferCache.end()) {
+            return it->second;
         }
-        const auto& programPtr = MG_State::pGLContext->GetCurrentProgram();
-        const auto& vaoPtr = MG_State::pGLContext->GetBoundVertexArray();
-        if (!programPtr || !vaoPtr) {
-            return;
+        const SizeT size = buffer.GetSize();
+        const auto& data = buffer.GetDataReadOnly();
+        if (size == 0 || !data) {
+            return nullptr;
         }
+        WGPUBufferDescriptor bd{};
+        bd.usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst;
+        bd.size = (size + 3u) & ~SizeT(3);
+        WGPUBuffer buf = wgpuDeviceCreateBuffer(m_device, &bd);
+        if (!buf) {
+            return nullptr;
+        }
+        wgpuQueueWriteBuffer(m_queue, buf, 0, data->data(), size & ~SizeT(3));
+        m_indexBufferCache.emplace(&buffer, buf);
+        return buf;
+    }
 
-        BeginFrameIfNeeded();
-        if (!m_frameActive) {
-            return;
+    WGPURenderPassEncoder WebGPURenderer::BeginDrawPass(MG_State::GLState::ProgramObject& program,
+                                                        const MG_State::GLState::VertexArrayObject& vao,
+                                                        GLenum mode) {
+        const WgpuPipeline* p = GetOrCreatePipeline(program, vao, mode);
+        if (!p) {
+            return nullptr;
         }
-
-        WGPURenderPipeline pipeline = GetOrCreatePipeline(*programPtr, *vaoPtr, mode);
-        if (!pipeline) {
-            return;
-        }
-
         // Draw into a Load render pass so a prior glClear is preserved.
         WGPURenderPassColorAttachment color{};
         color.view = m_frameView;
@@ -367,12 +419,22 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         rp.colorAttachments = &color;
 
         WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(m_encoder, &rp);
-        wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+        wgpuRenderPassEncoderSetPipeline(pass, p->pipeline);
+
+        // Upload current default-block uniform values and bind the global UBO.
+        if (p->bindGroup && p->uboBuffer) {
+            const void* uboData = program.GetUBOData();
+            const Uint sz = program.GetUBOSize();
+            if (uboData && sz > 0) {
+                wgpuQueueWriteBuffer(m_queue, p->uboBuffer, 0, uboData, sz & ~Uint(3));
+            }
+            wgpuRenderPassEncoderSetBindGroup(pass, 0, p->bindGroup, 0, nullptr);
+        }
 
         Uint32 slot = 0;
         for (Uint i = 0; i < 16; ++i) {
-            if (!vaoPtr->IsAttributeEnabled(i)) continue;
-            const auto& a = vaoPtr->GetAttribute(i);
+            if (!vao.IsAttributeEnabled(i)) continue;
+            const auto& a = vao.GetAttribute(i);
             if (ToVertexFormat(a.Type, a.Size) == WGPUVertexFormat_Force32 || !a.Buffer) continue;
             WGPUBuffer vb = GetOrCreateVertexBuffer(*a.Buffer);
             if (!vb) continue;
@@ -380,8 +442,66 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                                                  WGPU_WHOLE_SIZE);
             ++slot;
         }
+        return pass;
+    }
 
+    void WebGPURenderer::DrawArrays(GLenum mode, GLint first, GLsizei count) {
+        if (!m_device || !MG_State::pGLContext || count <= 0) {
+            return;
+        }
+        const auto& programPtr = MG_State::pGLContext->GetCurrentProgram();
+        const auto& vaoPtr = MG_State::pGLContext->GetBoundVertexArray();
+        if (!programPtr || !vaoPtr) {
+            return;
+        }
+        BeginFrameIfNeeded();
+        if (!m_frameActive) {
+            return;
+        }
+        WGPURenderPassEncoder pass = BeginDrawPass(*programPtr, *vaoPtr, mode);
+        if (!pass) {
+            return;
+        }
         wgpuRenderPassEncoderDraw(pass, static_cast<Uint32>(count), 1, static_cast<Uint32>(first), 0);
+        wgpuRenderPassEncoderEnd(pass);
+        wgpuRenderPassEncoderRelease(pass);
+    }
+
+    void WebGPURenderer::DrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
+        if (!m_device || !MG_State::pGLContext || count <= 0) {
+            return;
+        }
+        const WGPUIndexFormat indexFormat = ToIndexFormat(type);
+        if (indexFormat == WGPUIndexFormat_Undefined) {
+            MGLOG_E("DirectWebGPU: unsupported index type 0x%x (GL_UNSIGNED_BYTE not in WebGPU)", type);
+            return;
+        }
+        const auto& programPtr = MG_State::pGLContext->GetCurrentProgram();
+        const auto& vaoPtr = MG_State::pGLContext->GetBoundVertexArray();
+        if (!programPtr || !vaoPtr) {
+            return;
+        }
+        const auto& iboPtr = vaoPtr->GetIndexBufferBindingSlot().GetBoundObject();
+        if (!iboPtr) {
+            MGLOG_E("DirectWebGPU: DrawElements with no element array buffer bound");
+            return;
+        }
+        BeginFrameIfNeeded();
+        if (!m_frameActive) {
+            return;
+        }
+        WGPUBuffer indexBuffer = GetOrCreateIndexBuffer(*iboPtr);
+        if (!indexBuffer) {
+            return;
+        }
+        WGPURenderPassEncoder pass = BeginDrawPass(*programPtr, *vaoPtr, mode);
+        if (!pass) {
+            return;
+        }
+        // `indices` is a byte offset into the bound element array buffer.
+        const uint64_t byteOffset = reinterpret_cast<uintptr_t>(indices);
+        wgpuRenderPassEncoderSetIndexBuffer(pass, indexBuffer, indexFormat, byteOffset, WGPU_WHOLE_SIZE);
+        wgpuRenderPassEncoderDrawIndexed(pass, static_cast<Uint32>(count), 1, 0, 0, 0);
         wgpuRenderPassEncoderEnd(pass);
         wgpuRenderPassEncoderRelease(pass);
     }

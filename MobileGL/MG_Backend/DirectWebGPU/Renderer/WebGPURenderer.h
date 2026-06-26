@@ -34,6 +34,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
 
         void Clear(GLbitfield mask);
         void DrawArrays(GLenum mode, GLint first, GLsizei count);
+        void DrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices);
         void Present();
 
         WGPUDevice GetDevice() const { return m_device; }
@@ -43,6 +44,21 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         struct WgpuProgram {
             WGPUShaderModule vertex = nullptr;
             WGPUShaderModule fragment = nullptr;
+            // Default-block uniforms are packed by glslang into the "MGL_GLOBAL_UBO".
+            // For uniform-only shaders glslang auto-maps it to @group(0) @binding(0)
+            // (which tint preserves). >=0 means the program has a global UBO.
+            // TODO: reflect the binding (SpvcSession) once textures/explicit UBOs land.
+            Int globalUboBinding = -1;
+            Uint globalUboSize = 0;
+        };
+
+        struct WgpuPipeline {
+            WGPURenderPipeline pipeline = nullptr;
+            // Global-UBO bind group (group 0), created against the pipeline's auto
+            // layout; null when the program has no uniforms.
+            WGPUBuffer uboBuffer = nullptr;
+            WGPUBindGroup bindGroup = nullptr;
+            Uint uboSize = 0;
         };
 
         void BeginFrameIfNeeded();
@@ -50,11 +66,16 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         void EndFrame();
 
         const WgpuProgram* GetOrCreateProgram(MG_State::GLState::ProgramObject& program);
-        WGPURenderPipeline GetOrCreatePipeline(MG_State::GLState::ProgramObject& program,
-                                               const MG_State::GLState::VertexArrayObject& vao,
-                                               GLenum mode);
+        const WgpuPipeline* GetOrCreatePipeline(MG_State::GLState::ProgramObject& program,
+                                                const MG_State::GLState::VertexArrayObject& vao,
+                                                GLenum mode);
         WGPUBuffer GetOrCreateVertexBuffer(MG_State::GLState::BufferObject& buffer);
+        WGPUBuffer GetOrCreateIndexBuffer(MG_State::GLState::BufferObject& buffer);
         WGPUShaderModule MakeShaderModule(const char* wgsl);
+        // Begins a Load render pass, binds the pipeline + vertex buffers for the
+        // current program/VAO. Returns the pass (caller draws + ends) or nullptr.
+        WGPURenderPassEncoder BeginDrawPass(MG_State::GLState::ProgramObject& program,
+                                            const MG_State::GLState::VertexArrayObject& vao, GLenum mode);
 
         WGPUInstance m_instance = nullptr;
         WGPUDevice m_device = nullptr;
@@ -67,8 +88,9 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
 
         // Caches (keyed by the MG_State object identity; minimal invalidation for now).
         UnorderedMap<const MG_State::GLState::ProgramObject*, WgpuProgram> m_programCache;
-        UnorderedMap<const MG_State::GLState::ProgramObject*, WGPURenderPipeline> m_pipelineCache;
+        UnorderedMap<const MG_State::GLState::ProgramObject*, WgpuPipeline> m_pipelineCache;
         UnorderedMap<const MG_State::GLState::BufferObject*, WGPUBuffer> m_vertexBufferCache;
+        UnorderedMap<const MG_State::GLState::BufferObject*, WGPUBuffer> m_indexBufferCache;
 
         // Per-frame transient state (valid only between BeginFrameIfNeeded and Present)
         WGPUCommandEncoder m_encoder = nullptr;

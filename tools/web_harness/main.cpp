@@ -20,8 +20,11 @@ static const char* kVert =
     "void main() { gl_Position = vec4(aPos, 1.0); }\n";
 static const char* kFrag =
     "#version 330 core\n"
+    "uniform vec4 uColor;\n"
     "out vec4 FragColor;\n"
-    "void main() { FragColor = vec4(1.0, 0.6, 0.1, 1.0); }\n";
+    "void main() { FragColor = uColor; }\n";
+
+static GLint g_uColorLoc = -1;
 
 static GLuint CompileShader(GLenum type, const char* src) {
     GLuint s = glCreateShader(type);
@@ -37,7 +40,7 @@ static GLuint CompileShader(GLenum type, const char* src) {
     return s;
 }
 
-static void SetupTriangle() {
+static void SetupQuad() {
     GLuint prog = glCreateProgram();
     glAttachShader(prog, CompileShader(GL_VERTEX_SHADER, kVert));
     glAttachShader(prog, CompileShader(GL_FRAGMENT_SHADER, kFrag));
@@ -47,13 +50,18 @@ static void SetupTriangle() {
     glGetProgramiv(prog, GL_LINK_STATUS, &linked);
     printf("[harness] program link status=%d\n", linked);
     glUseProgram(prog);
+    g_uColorLoc = glGetUniformLocation(prog, "uColor");
+    printf("[harness] uColor location=%d\n", g_uColorLoc);
 
     static const float verts[] = {
-         0.0f,  0.5f, 0.0f,
-        -0.5f, -0.5f, 0.0f,
-         0.5f, -0.5f, 0.0f,
+        -0.6f,  0.6f, 0.0f, // 0 top-left
+         0.6f,  0.6f, 0.0f, // 1 top-right
+         0.6f, -0.6f, 0.0f, // 2 bottom-right
+        -0.6f, -0.6f, 0.0f, // 3 bottom-left
     };
-    GLuint vao = 0, vbo = 0;
+    static const unsigned short indices[] = {0, 1, 2, 0, 2, 3};
+
+    GLuint vao = 0, vbo = 0, ebo = 0;
     glGenVertexArrays(1, &vao);
     glBindVertexArray(vao);
     glGenBuffers(1, &vbo);
@@ -61,13 +69,19 @@ static void SetupTriangle() {
     glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (const void*)0);
     glEnableVertexAttribArray(0);
+    // Element buffer captured by the bound VAO.
+    glGenBuffers(1, &ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
 }
 
 static void Frame() {
     g_t += 0.016;
-    glClearColor(0.1f, 0.2f, 0.5f + 0.3f * std::sin(g_t), 1.0f);
+    glClearColor(0.1f, 0.2f, 0.3f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+    // Animated uniform color so we can see the global-UBO path working.
+    glUniform4f(g_uColorLoc, 0.5f + 0.5f * std::sin(g_t), 0.5f, 0.5f + 0.5f * std::cos(g_t), 1.0f);
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, (const void*)0);
     eglSwapBuffers(g_dpy, g_surf);
 }
 
@@ -91,7 +105,7 @@ int main() {
     }
     eglMakeCurrent(g_dpy, g_surf, g_surf, ctx);
 
-    SetupTriangle();
+    SetupQuad();
     printf("[harness] setup done; starting draw loop\n");
     emscripten_set_main_loop(Frame, 0, 1);
     return 0;

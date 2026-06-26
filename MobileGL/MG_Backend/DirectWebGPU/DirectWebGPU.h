@@ -19,5 +19,6 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     // the active renderer (and no-op safely before it exists).
     void Clear(GLbitfield mask);
     void DrawArrays(GLenum mode, GLint first, GLsizei count);
+    void DrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices);
     void Present();
 } // namespace MobileGL::MG_Backend::DirectWebGPU
