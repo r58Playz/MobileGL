@@ -29,6 +29,12 @@ static GLuint g_instProg = 0, g_instVAO = 0, g_instColorLoc = 0, g_instQuadVBO =
 // M5 render-to-texture validation: an FBO with a color texture, plus a quad to sample it.
 static GLuint g_fbo = 0, g_fboTex = 0, g_fboInVBO = 0, g_fboSampleVAO = 0, g_fboSampleVBO = 0;
 
+// M5 vertex-format validation: a quad with a normalized GL_UNSIGNED_BYTE color attribute.
+static GLuint g_byteProg = 0, g_byteVAO = 0, g_byteVBO = 0;
+
+// M5 multi-draw + buffer-re-upload validation (Sodium's main draw path).
+static GLuint g_mdVAO = 0, g_mdVBO = 0, g_mdIBO = 0;
+
 // M4 validation: synchronous readback of the framebuffer via JSPI. glFinish and
 // glReadPixels suspend the wasm stack until the WebGPU copy/map completes; this is
 // only legal when reached from a WebAssembly.promising entry, so the scheduler below
@@ -109,6 +115,18 @@ static const char* kInstVert =
     "layout(location=0) in vec2 aPos;\n"        // per-vertex (divisor 0)
     "layout(location=1) in vec2 aOffset;\n"     // per-instance (divisor 1)
     "void main() { gl_Position = vec4(aPos + aOffset, 0.05, 1.0); }\n";
+
+static const char* kByteVert =
+    "#version 330 core\n"
+    "layout(location=0) in vec2 aPos;\n"
+    "layout(location=1) in vec4 aColor;\n"      // normalized GL_UNSIGNED_BYTE
+    "out vec4 vColor;\n"
+    "void main() { vColor = aColor; gl_Position = vec4(aPos, 0.05, 1.0); }\n";
+static const char* kByteFrag =
+    "#version 330 core\n"
+    "in vec4 vColor;\n"
+    "out vec4 FragColor;\n"
+    "void main() { FragColor = vColor; }\n";
 
 static GLuint CompileShader(GLenum type, const char* src) {
     GLuint s = glCreateShader(type);
@@ -271,6 +289,82 @@ static void DrawInstanced() {
     glDrawArraysInstanced(GL_TRIANGLES, 0, 6, 4);
 }
 
+static void SetupByteColor() {
+    g_byteProg = glCreateProgram();
+    glAttachShader(g_byteProg, CompileShader(GL_VERTEX_SHADER, kByteVert));
+    glAttachShader(g_byteProg, CompileShader(GL_FRAGMENT_SHADER, kByteFrag));
+    glBindAttribLocation(g_byteProg, 0, "aPos");
+    glBindAttribLocation(g_byteProg, 1, "aColor");
+    glLinkProgram(g_byteProg);
+    // Interleaved: vec2 float pos (8B) + 4x uint8 color (4B) = 12B stride.
+    struct V { float x, y; unsigned char r, g, b, a; };
+    static const V verts[6] = {
+        {-0.92f, 0.66f, 255, 128, 0, 255}, {-0.55f, 0.66f, 255, 128, 0, 255},
+        {-0.55f, 0.92f, 255, 128, 0, 255}, {-0.92f, 0.66f, 255, 128, 0, 255},
+        {-0.55f, 0.92f, 255, 128, 0, 255}, {-0.92f, 0.92f, 255, 128, 0, 255},
+    };
+    glGenVertexArrays(1, &g_byteVAO);
+    glBindVertexArray(g_byteVAO);
+    glGenBuffers(1, &g_byteVBO);
+    glBindBuffer(GL_ARRAY_BUFFER, g_byteVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
+}
+
+// Draw the byte-color quad (top-left): a normalized GL_UNSIGNED_BYTE color attribute
+// should render as orange (255,128,0).
+static void DrawByteColor() {
+    glUseProgram(g_byteProg);
+    glBindVertexArray(g_byteVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, g_byteVBO);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 12, (const void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribDivisor(0, 0);
+    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, 12, (const void*)8);
+    glEnableVertexAttribArray(1);
+    glVertexAttribDivisor(1, 0);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+}
+
+static void SetupMultiDraw() {
+    // 8 vertices = two quads (A at baseVertex 0, B at baseVertex 4) in the top-right.
+    glGenVertexArrays(1, &g_mdVAO);
+    glBindVertexArray(g_mdVAO);
+    glGenBuffers(1, &g_mdVBO);
+    glBindBuffer(GL_ARRAY_BUFFER, g_mdVBO);
+    glBufferData(GL_ARRAY_BUFFER, 8 * 3 * sizeof(float), nullptr, GL_DYNAMIC_DRAW); // filled each frame
+    static const unsigned short idx[] = {0, 1, 2, 0, 2, 3};
+    glGenBuffers(1, &g_mdIBO);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_mdIBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(idx), idx, GL_STATIC_DRAW);
+}
+
+// glMultiDrawElementsBaseVertex: two quads from one VBO/IBO via baseVertex. The VBO is
+// re-uploaded each frame with an animated Y so this also exercises buffer re-upload.
+static void DrawMultiDraw() {
+    const float dy = 0.04f * (float)((g_frame / 30) % 2); // small periodic shift
+    float v[24];
+    auto quad = [&](int base, float x0, float x1, float y0, float y1) {
+        const float p[12] = {x0, y0, 0.05f, x1, y0, 0.05f, x1, y1, 0.05f, x0, y1, 0.05f};
+        for (int i = 0; i < 12; ++i) v[base * 3 + i] = p[i];
+    };
+    quad(0, 0.55f, 0.72f, 0.66f + dy, 0.86f + dy); // quad A
+    quad(4, 0.74f, 0.92f, 0.66f + dy, 0.86f + dy); // quad B (baseVertex 4)
+    glBindBuffer(GL_ARRAY_BUFFER, g_mdVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(v), v, GL_DYNAMIC_DRAW); // re-upload -> bumps change serial
+    glUseProgram(g_solidProg);
+    glBindVertexArray(g_mdVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, g_mdVBO);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (const void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribDivisor(0, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_mdIBO);
+    glUniform4f(g_colorLoc, 1.0f, 0.5f, 1.0f, 1.0f); // pink
+    const GLsizei count[2] = {6, 6};
+    const void* const indices[2] = {(const void*)0, (const void*)0};
+    const GLint basevertex[2] = {0, 4};
+    glMultiDrawElementsBaseVertex(GL_TRIANGLES, count, GL_UNSIGNED_SHORT, indices, 2, basevertex);
+}
+
 static void SetupFBO() {
     // Color texture (no data; rendered into), no depth attachment.
     glGenTextures(1, &g_fboTex);
@@ -331,6 +425,14 @@ static void DrawFBOSample() {
     glBindTexture(GL_TEXTURE_2D, g_tex); // restore the main texture for next frame
 }
 
+// M5: glBlitFramebuffer the FBO (128x128 blue|green) to the bottom-left of the screen.
+static void DrawBlitTest() {
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBlitFramebuffer(0, 0, 128, 128, 10, 10, 138, 138, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0); // restore default for subsequent frames
+}
+
 static void Frame() {
     g_t += 0.016;
     // Every ~40 frames, rotate the 2x2 texel colors via glTexSubImage2D to exercise
@@ -367,6 +469,12 @@ static void Frame() {
     DrawInstanced();
     // M5: sample the FBO texture onto a top-center quad (shows blue|green).
     DrawFBOSample();
+    // M5: normalized-byte vertex color attribute (top-left orange quad).
+    DrawByteColor();
+    // M5: multi-draw + buffer re-upload (two pink quads, top-right).
+    DrawMultiDraw();
+    // M5: blit the FBO to the bottom-left corner (after all draws so it isn't overdrawn).
+    DrawBlitTest();
     eglSwapBuffers(g_dpy, g_surf);
 }
 
@@ -394,6 +502,8 @@ int main() {
     SetupSolids();
     SetupInstanced();
     SetupFBO();
+    SetupByteColor();
+    SetupMultiDraw();
     printf("[harness] setup done; starting draw loop\n");
     harness_schedule_readback(); // M4: fire a JSPI readback after ~1.5s of frames
     emscripten_set_main_loop(Frame, 0, 1);

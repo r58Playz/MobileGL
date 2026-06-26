@@ -37,6 +37,13 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     void DrawElementsInstancedBaseVertexBaseInstance(GLenum mode, GLsizei count, GLenum type,
                                                      const void* indices, GLsizei instancecount,
                                                      GLint basevertex, GLuint baseinstance);
+    void MultiDrawElementsBaseVertex(GLenum mode, const GLsizei* count, GLenum type,
+                                     const GLvoid* const* indices, GLsizei drawcount,
+                                     const GLint* basevertex);
+    void MultiDrawElements(GLenum mode, const GLsizei* count, GLenum type, const GLvoid* const* indices,
+                           GLsizei drawcount);
+    void BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0,
+                         GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter);
     void ReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type,
                     void* pixels);
     void GetTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLvoid* pixels);

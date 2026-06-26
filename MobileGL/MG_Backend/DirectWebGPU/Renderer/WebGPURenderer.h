@@ -11,6 +11,10 @@
 #include <MG_State/GLState/TextureState/TextureEnum.h>
 #include "../WgpuApi.h"
 
+namespace MobileGL {
+    enum class FramebufferTarget;
+} // namespace MobileGL
+
 namespace MobileGL::MG_State::GLState {
     class ProgramObject;
     class VertexArrayObject;
@@ -47,6 +51,11 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                                  GLuint baseInstance);
         void DrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void* indices,
                                    GLsizei instanceCount, GLint baseVertex, GLuint baseInstance);
+        // glMultiDrawElementsBaseVertex: WebGPU has no multi-draw, so this is a CPU loop
+        // of drawIndexed (one per sub-draw) sharing a single render pass.
+        void MultiDrawElementsBaseVertex(GLenum mode, const GLsizei* count, GLenum type,
+                                         const void* const* indices, GLsizei drawcount,
+                                         const GLint* basevertex);
         void Present();
         // Synchronous readback of the default framebuffer (the offscreen color
         // target). Blocks the caller via JSPI until the GPU copy is mapped. Must be
@@ -59,6 +68,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         void GetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void* pixels);
         void GetTextureImage(MG_State::GLState::ITextureObject& texture, TextureUploadTarget uploadTarget,
                              GLint level, GLenum format, GLenum type, GLsizei bufSize, void* pixels);
+        // glBlitFramebuffer: same-size color blit (resolve/copy) via copyTextureToTexture.
+        // Scaling/format-convert and depth/stencil blits aren't supported yet.
+        void BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0,
+                             GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter);
         // Blocks (via JSPI) until all submitted GPU work has completed.
         void Finish();
 
@@ -98,6 +111,14 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             WGPUTextureFormat format = WGPUTextureFormat_Undefined;
         };
 
+        // GPU copy of a GL buffer; re-uploaded when the buffer's change serial advances
+        // (glBufferData/glBufferSubData/map-flush all bump it), recreated if it grows.
+        struct WgpuBuffer {
+            WGPUBuffer buffer = nullptr;
+            Uint64 serial = ~Uint64(0);
+            Uint64 size = 0;
+        };
+
         void BeginFrameIfNeeded();
         Bool AcquireSurfaceView();
         void EndFrame();
@@ -114,6 +135,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // attachment texture (+ a transient depth texture if it has a depth attachment).
         // Returns false if the target can't be resolved (e.g. incomplete FBO).
         Bool ResolveDrawTarget();
+        // Resolves a framebuffer's color attachment 0 to a WGPU texture (+ size/format).
+        // Default FB -> the offscreen color target; user FBO -> its Color0 texture.
+        Bool ResolveColorTexture(FramebufferTarget target, WGPUTexture& outTex, Uint32& outW, Uint32& outH,
+                                 WGPUTextureFormat& outFmt);
         // Transient depth buffer for a user FBO (cached, recreated on size change).
         WGPUTextureView GetOrCreateFboDepth(const MG_State::GLState::FramebufferObject& fbo, Uint32 w,
                                             Uint32 h);
@@ -134,6 +159,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                                   const MG_State::GLState::VertexArrayObject& vao, GLenum mode) const;
         WGPUBuffer GetOrCreateVertexBuffer(MG_State::GLState::BufferObject& buffer);
         WGPUBuffer GetOrCreateIndexBuffer(MG_State::GLState::BufferObject& buffer);
+        WGPUBuffer GetOrCreateBuffer(UnorderedMap<const MG_State::GLState::BufferObject*, WgpuBuffer>& cache,
+                                     MG_State::GLState::BufferObject& buffer, WGPUBufferUsage usage);
         const WgpuTexture* GetOrCreateTexture(MG_State::GLState::ITextureObject& texture);
         // Uploads mip level 0 (RGBA8) of `mip` into `tex` via the queue. Returns false
         // if the source pixels aren't available.
@@ -163,8 +190,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // color-mask state, target formats): WebGPU bakes all of that into the
         // pipeline, so each distinct render-state combination is its own variant.
         UnorderedMap<Uint64, WgpuPipeline> m_pipelineCache;
-        UnorderedMap<const MG_State::GLState::BufferObject*, WGPUBuffer> m_vertexBufferCache;
-        UnorderedMap<const MG_State::GLState::BufferObject*, WGPUBuffer> m_indexBufferCache;
+        UnorderedMap<const MG_State::GLState::BufferObject*, WgpuBuffer> m_vertexBufferCache;
+        UnorderedMap<const MG_State::GLState::BufferObject*, WgpuBuffer> m_indexBufferCache;
         UnorderedMap<const MG_State::GLState::ITextureObject*, WgpuTexture> m_textureCache;
         // WGPUSamplers keyed by a hash of their resolved descriptor (GL sampler params).
         UnorderedMap<Uint64, WGPUSampler> m_samplerCache;

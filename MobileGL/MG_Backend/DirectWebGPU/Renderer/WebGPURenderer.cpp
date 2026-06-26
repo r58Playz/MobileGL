@@ -22,6 +22,8 @@
 #include <spirv_reflect.h>
 #include <vector>
 #include <cstring>
+#include <cstdlib>
+#include <algorithm>
 
 // Returns the device's preferred canvas format so the surface (and pipeline color
 // targets, which share m_format) avoid an extra blit copy: 1 = rgba8unorm,
@@ -43,19 +45,73 @@ extern "C" void mobilegl_jspi_signal();
 
 namespace MobileGL::MG_Backend::DirectWebGPU {
     namespace {
-        // Minimal GL-type -> WGPU vertex format (M2b supports float attributes).
-        template <typename DataTypeT>
-        WGPUVertexFormat ToVertexFormat(DataTypeT type, int size) {
-            if (type == DataTypeT::Float32) {
+        // Component byte size of a vertex attribute element.
+        Uint32 ComponentByteSize(DataType type) {
+            switch (type) {
+            case DataType::Int8:
+            case DataType::Uint8: return 1;
+            case DataType::Int16:
+            case DataType::Uint16:
+            case DataType::Float16: return 2;
+            default: return 4; // Int32/Uint32/Float32/Fixed32
+            }
+        }
+
+        // GL vertex attribute -> WGPU vertex format. WebGPU's 8/16-bit formats only come
+        // in x2/x4, so size 1/3 of those types is unsupported (returns the Force32
+        // sentinel and the attribute is skipped). `normalized` picks Unorm/Snorm;
+        // `isInteger` (glVertexAttribIPointer) picks Uint/Sint; otherwise float.
+        WGPUVertexFormat ToVertexFormat(DataType type, int size, Bool normalized, Bool isInteger) {
+            const Bool n = normalized;
+            switch (type) {
+            case DataType::Float32:
                 switch (size) {
                 case 1: return WGPUVertexFormat_Float32;
                 case 2: return WGPUVertexFormat_Float32x2;
                 case 3: return WGPUVertexFormat_Float32x3;
                 case 4: return WGPUVertexFormat_Float32x4;
-                default: break;
                 }
+                break;
+            case DataType::Float16:
+                if (size == 2) return WGPUVertexFormat_Float16x2;
+                if (size == 4) return WGPUVertexFormat_Float16x4;
+                break;
+            case DataType::Uint8:
+                if (size == 2) return n ? WGPUVertexFormat_Unorm8x2 : WGPUVertexFormat_Uint8x2;
+                if (size == 4) return n ? WGPUVertexFormat_Unorm8x4 : WGPUVertexFormat_Uint8x4;
+                break;
+            case DataType::Int8:
+                if (size == 2) return n ? WGPUVertexFormat_Snorm8x2 : WGPUVertexFormat_Sint8x2;
+                if (size == 4) return n ? WGPUVertexFormat_Snorm8x4 : WGPUVertexFormat_Sint8x4;
+                break;
+            case DataType::Uint16:
+                if (size == 2) return n ? WGPUVertexFormat_Unorm16x2 : WGPUVertexFormat_Uint16x2;
+                if (size == 4) return n ? WGPUVertexFormat_Unorm16x4 : WGPUVertexFormat_Uint16x4;
+                break;
+            case DataType::Int16:
+                if (size == 2) return n ? WGPUVertexFormat_Snorm16x2 : WGPUVertexFormat_Sint16x2;
+                if (size == 4) return n ? WGPUVertexFormat_Snorm16x4 : WGPUVertexFormat_Sint16x4;
+                break;
+            case DataType::Uint32:
+                switch (size) {
+                case 1: return WGPUVertexFormat_Uint32;
+                case 2: return WGPUVertexFormat_Uint32x2;
+                case 3: return WGPUVertexFormat_Uint32x3;
+                case 4: return WGPUVertexFormat_Uint32x4;
+                }
+                break;
+            case DataType::Int32:
+                switch (size) {
+                case 1: return WGPUVertexFormat_Sint32;
+                case 2: return WGPUVertexFormat_Sint32x2;
+                case 3: return WGPUVertexFormat_Sint32x3;
+                case 4: return WGPUVertexFormat_Sint32x4;
+                }
+                break;
+            default: break;
             }
-            return WGPUVertexFormat_Force32;
+            (void)isInteger;
+            return WGPUVertexFormat_Force32; // unsupported (type/size combination)
         }
 
         WGPUPrimitiveTopology ToTopology(GLenum mode) {
@@ -238,9 +294,9 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
 
     void WebGPURenderer::Shutdown() {
         EndFrame();
-        for (auto& [k, buf] : m_vertexBufferCache) { if (buf) wgpuBufferRelease(buf); }
+        for (auto& [k, b] : m_vertexBufferCache) { if (b.buffer) wgpuBufferRelease(b.buffer); }
         m_vertexBufferCache.clear();
-        for (auto& [k, buf] : m_indexBufferCache) { if (buf) wgpuBufferRelease(buf); }
+        for (auto& [k, b] : m_indexBufferCache) { if (b.buffer) wgpuBufferRelease(b.buffer); }
         m_indexBufferCache.clear();
         for (auto& [k, p] : m_pipelineCache) {
             if (p.group0Layout) wgpuBindGroupLayoutRelease(p.group0Layout);
@@ -299,7 +355,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (m_depthTexture) { wgpuTextureRelease(m_depthTexture); m_depthTexture = nullptr; }
         WGPUTextureDescriptor td{};
         td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc |
-                   WGPUTextureUsage_TextureBinding;
+                   WGPUTextureUsage_CopyDst | WGPUTextureUsage_TextureBinding;
         td.dimension = WGPUTextureDimension_2D;
         td.size = {m_width, m_height, 1};
         td.format = m_format;
@@ -387,6 +443,72 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                              ? GetOrCreateFboDepth(*fbo, wt->width, wt->height)
                              : nullptr;
         return true;
+    }
+
+    Bool WebGPURenderer::ResolveColorTexture(FramebufferTarget target, WGPUTexture& outTex, Uint32& outW,
+                                             Uint32& outH, WGPUTextureFormat& outFmt) {
+        auto* gl = MG_State::pGLContext.get();
+        const auto& fbo = gl->GetFramebufferBindingSlot(target).GetBoundObject();
+        if (!fbo || fbo->IsDefaultFramebuffer()) {
+            EnsureOffscreenTarget();
+            if (!m_offscreenTexture) return false;
+            outTex = m_offscreenTexture;
+            outW = m_width;
+            outH = m_height;
+            outFmt = m_format;
+            return true;
+        }
+        const auto& color0 = fbo->GetAttachment(FramebufferAttachmentType::Color0);
+        if (!color0.IsValid() || color0.IsEmpty() || !color0.IsTexture()) return false;
+        const WgpuTexture* wt = GetOrCreateTexture(*color0.GetTexture());
+        if (!wt || !wt->texture) return false;
+        outTex = wt->texture;
+        outW = wt->width;
+        outH = wt->height;
+        outFmt = wt->format;
+        return true;
+    }
+
+    void WebGPURenderer::BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0,
+                                         GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask,
+                                         GLenum filter) {
+        (void)filter;
+        if (!m_device || (mask & GL_COLOR_BUFFER_BIT) == 0) {
+            return; // depth/stencil blits unsupported for now
+        }
+        WGPUTexture srcTex = nullptr, dstTex = nullptr;
+        Uint32 srcW = 0, srcH = 0, dstW = 0, dstH = 0;
+        WGPUTextureFormat srcFmt = WGPUTextureFormat_Undefined, dstFmt = WGPUTextureFormat_Undefined;
+        if (!ResolveColorTexture(FramebufferTarget::Read, srcTex, srcW, srcH, srcFmt) ||
+            !ResolveColorTexture(FramebufferTarget::Draw, dstTex, dstW, dstH, dstFmt)) {
+            return;
+        }
+        const Int32 w = std::abs(srcX1 - srcX0), h = std::abs(srcY1 - srcY0);
+        const Int32 dw = std::abs(dstX1 - dstX0), dh = std::abs(dstY1 - dstY0);
+        if (w != dw || h != dh) {
+            MGLOG_E("DirectWebGPU: scaling glBlitFramebuffer unsupported (src %dx%d -> dst %dx%d)", w, h, dw,
+                    dh);
+            return;
+        }
+        if (srcFmt != dstFmt || srcTex == dstTex) {
+            MGLOG_E("DirectWebGPU: glBlitFramebuffer needs matching formats and distinct src/dst");
+            return;
+        }
+        BeginFrameIfNeeded();
+        if (!m_frameActive) {
+            return;
+        }
+        // GL framebuffer coords are bottom-left origin; flip to top-left texel space.
+        const Int32 sx = std::min(srcX0, srcX1), sy = static_cast<Int32>(srcH) - std::max(srcY0, srcY1);
+        const Int32 dx = std::min(dstX0, dstX1), dy = static_cast<Int32>(dstH) - std::max(dstY0, dstY1);
+        WGPUTexelCopyTextureInfo src{};
+        src.texture = srcTex;
+        src.origin = {static_cast<Uint32>(sx < 0 ? 0 : sx), static_cast<Uint32>(sy < 0 ? 0 : sy), 0};
+        WGPUTexelCopyTextureInfo dst{};
+        dst.texture = dstTex;
+        dst.origin = {static_cast<Uint32>(dx < 0 ? 0 : dx), static_cast<Uint32>(dy < 0 ? 0 : dy), 0};
+        WGPUExtent3D ext{static_cast<Uint32>(w), static_cast<Uint32>(h), 1};
+        wgpuCommandEncoderCopyTextureToTexture(m_encoder, &src, &dst, &ext);
     }
 
     void WebGPURenderer::BeginFrameIfNeeded() {
@@ -607,7 +729,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             if (!vao.IsAttributeEnabled(i)) continue;
             const auto& a = vao.GetAttribute(i);
             mix((static_cast<Uint64>(i) << 40) ^ (static_cast<Uint64>(a.Stride) << 8) ^
-                (a.Divisor > 0 ? (Uint64(1) << 60) : 0) ^ static_cast<Uint64>(ToVertexFormat(a.Type, a.Size)));
+                (a.Divisor > 0 ? (Uint64(1) << 60) : 0) ^ static_cast<Uint64>(ToVertexFormat(a.Type, a.Size, a.Normalized, a.IsInteger)));
         }
         // Render state WebGPU bakes into the pipeline.
         auto* gl = MG_State::pGLContext.get();
@@ -659,9 +781,9 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         for (Uint i = 0; i < kMaxAttribs; ++i) {
             if (!vao.IsAttributeEnabled(i)) continue;
             const auto& a = vao.GetAttribute(i);
-            if (ToVertexFormat(a.Type, a.Size) == WGPUVertexFormat_Force32) continue;
+            if (ToVertexFormat(a.Type, a.Size, a.Normalized, a.IsInteger) == WGPUVertexFormat_Force32) continue;
             WGPUVertexAttribute va{};
-            va.format = ToVertexFormat(a.Type, a.Size);
+            va.format = ToVertexFormat(a.Type, a.Size, a.Normalized, a.IsInteger);
             va.offset = 0;
             va.shaderLocation = i;
             attrs.push_back(va);
@@ -672,11 +794,14 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         for (Uint i = 0; i < kMaxAttribs; ++i) {
             if (!vao.IsAttributeEnabled(i)) continue;
             const auto& a = vao.GetAttribute(i);
-            if (ToVertexFormat(a.Type, a.Size) == WGPUVertexFormat_Force32) continue;
+            if (ToVertexFormat(a.Type, a.Size, a.Normalized, a.IsInteger) == WGPUVertexFormat_Force32) continue;
             WGPUVertexBufferLayout layout{};
             // Divisor>0 -> per-instance attribute (glVertexAttribDivisor); 0 -> per-vertex.
             layout.stepMode = a.Divisor > 0 ? WGPUVertexStepMode_Instance : WGPUVertexStepMode_Vertex;
-            const uint64_t packed = static_cast<uint64_t>(4 * a.Size); // float components
+            // Tightly-packed stride from the actual component size; WebGPU requires the
+            // arrayStride to be a multiple of 4, so round up.
+            uint64_t packed = static_cast<uint64_t>(ComponentByteSize(a.Type)) * a.Size;
+            packed = (packed + 3u) & ~uint64_t(3);
             layout.arrayStride = a.Stride ? static_cast<uint64_t>(a.Stride) : packed;
             layout.attributeCount = 1;
             layout.attributes = &attrs[ai++];
@@ -754,46 +879,52 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         return &ins->second;
     }
 
-    WGPUBuffer WebGPURenderer::GetOrCreateVertexBuffer(MG_State::GLState::BufferObject& buffer) {
-        if (auto it = m_vertexBufferCache.find(&buffer); it != m_vertexBufferCache.end()) {
-            return it->second; // M2b minimal: no update-on-change yet
-        }
+    // Shared: (re)upload a GL buffer to a cached WGPU buffer. Re-uploads when the GL
+    // buffer's change serial advances (glBufferData/SubData/map-flush); recreates the
+    // WGPU buffer when the size changes. Returns the GPU buffer (or null).
+    WGPUBuffer WebGPURenderer::GetOrCreateBuffer(
+        UnorderedMap<const MG_State::GLState::BufferObject*, WgpuBuffer>& cache,
+        MG_State::GLState::BufferObject& buffer, WGPUBufferUsage usage) {
+        const Uint64 serial = buffer.GetChangeSerial();
         const SizeT size = buffer.GetSize();
         const auto& data = buffer.GetDataReadOnly();
+        const Uint64 allocSize = (static_cast<Uint64>(size) + 3u) & ~Uint64(3); // 4-byte aligned
+        auto it = cache.find(&buffer);
+        if (it != cache.end()) {
+            WgpuBuffer& cb = it->second;
+            if (cb.serial == serial) {
+                return cb.buffer; // up to date
+            }
+            if (cb.buffer && cb.size == allocSize && data) {
+                // Same size, new contents -> re-upload in place.
+                wgpuQueueWriteBuffer(m_queue, cb.buffer, 0, data->data(), size & ~SizeT(3));
+                cb.serial = serial;
+                return cb.buffer;
+            }
+            if (cb.buffer) wgpuBufferRelease(cb.buffer);
+            cache.erase(it);
+        }
         if (size == 0 || !data) {
             return nullptr;
         }
         WGPUBufferDescriptor bd{};
-        bd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
-        bd.size = (size + 3u) & ~SizeT(3); // 4-byte aligned allocation
+        bd.usage = usage | WGPUBufferUsage_CopyDst;
+        bd.size = allocSize;
         WGPUBuffer buf = wgpuDeviceCreateBuffer(m_device, &bd);
         if (!buf) {
             return nullptr;
         }
         wgpuQueueWriteBuffer(m_queue, buf, 0, data->data(), size & ~SizeT(3));
-        m_vertexBufferCache.emplace(&buffer, buf);
+        cache.emplace(&buffer, WgpuBuffer{buf, serial, allocSize});
         return buf;
     }
 
+    WGPUBuffer WebGPURenderer::GetOrCreateVertexBuffer(MG_State::GLState::BufferObject& buffer) {
+        return GetOrCreateBuffer(m_vertexBufferCache, buffer, WGPUBufferUsage_Vertex);
+    }
+
     WGPUBuffer WebGPURenderer::GetOrCreateIndexBuffer(MG_State::GLState::BufferObject& buffer) {
-        if (auto it = m_indexBufferCache.find(&buffer); it != m_indexBufferCache.end()) {
-            return it->second;
-        }
-        const SizeT size = buffer.GetSize();
-        const auto& data = buffer.GetDataReadOnly();
-        if (size == 0 || !data) {
-            return nullptr;
-        }
-        WGPUBufferDescriptor bd{};
-        bd.usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst;
-        bd.size = (size + 3u) & ~SizeT(3);
-        WGPUBuffer buf = wgpuDeviceCreateBuffer(m_device, &bd);
-        if (!buf) {
-            return nullptr;
-        }
-        wgpuQueueWriteBuffer(m_queue, buf, 0, data->data(), size & ~SizeT(3));
-        m_indexBufferCache.emplace(&buffer, buf);
-        return buf;
+        return GetOrCreateBuffer(m_indexBufferCache, buffer, WGPUBufferUsage_Index);
     }
 
     const WebGPURenderer::WgpuTexture*
@@ -1054,7 +1185,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         for (Uint i = 0; i < 16; ++i) {
             if (!vao.IsAttributeEnabled(i)) continue;
             const auto& a = vao.GetAttribute(i);
-            if (ToVertexFormat(a.Type, a.Size) == WGPUVertexFormat_Force32 || !a.Buffer) continue;
+            if (ToVertexFormat(a.Type, a.Size, a.Normalized, a.IsInteger) == WGPUVertexFormat_Force32 || !a.Buffer) continue;
             WGPUBuffer vb = GetOrCreateVertexBuffer(*a.Buffer);
             if (!vb) continue;
             wgpuRenderPassEncoderSetVertexBuffer(pass, slot, vb, static_cast<uint64_t>(a.Offset),
@@ -1143,6 +1274,53 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         wgpuRenderPassEncoderDrawIndexed(pass, static_cast<Uint32>(count),
                                          static_cast<Uint32>(instanceCount), 0,
                                          static_cast<int32_t>(baseVertex), 0);
+        wgpuRenderPassEncoderEnd(pass);
+        wgpuRenderPassEncoderRelease(pass);
+    }
+
+    void WebGPURenderer::MultiDrawElementsBaseVertex(GLenum mode, const GLsizei* count, GLenum type,
+                                                     const void* const* indices, GLsizei drawcount,
+                                                     const GLint* basevertex) {
+        if (!m_device || !MG_State::pGLContext || drawcount <= 0 || !count || !indices) {
+            return;
+        }
+        const WGPUIndexFormat indexFormat = ToIndexFormat(type);
+        if (indexFormat == WGPUIndexFormat_Undefined) {
+            MGLOG_E("DirectWebGPU: MultiDrawElementsBaseVertex unsupported index type 0x%x", type);
+            return;
+        }
+        const Uint32 indexSize = (type == GL_UNSIGNED_INT) ? 4u : 2u;
+        const auto& programPtr = MG_State::pGLContext->GetCurrentProgram();
+        const auto& vaoPtr = MG_State::pGLContext->GetBoundVertexArray();
+        if (!programPtr || !vaoPtr) {
+            return;
+        }
+        const auto& iboPtr = vaoPtr->GetIndexBufferBindingSlot().GetBoundObject();
+        if (!iboPtr) {
+            return;
+        }
+        BeginFrameIfNeeded();
+        if (!m_frameActive) {
+            return;
+        }
+        WGPUBuffer indexBuffer = GetOrCreateIndexBuffer(*iboPtr);
+        if (!indexBuffer) {
+            return;
+        }
+        WGPURenderPassEncoder pass = BeginDrawPass(*programPtr, *vaoPtr, mode);
+        if (!pass) {
+            return;
+        }
+        wgpuRenderPassEncoderSetIndexBuffer(pass, indexBuffer, indexFormat, 0, WGPU_WHOLE_SIZE);
+        // One drawIndexed per sub-draw: firstIndex from the per-draw byte offset, plus
+        // its baseVertex. (Emulates the multi-draw on WebGPU's single-draw API.)
+        for (GLsizei i = 0; i < drawcount; ++i) {
+            if (count[i] <= 0) continue;
+            const uint64_t byteOffset = reinterpret_cast<uintptr_t>(indices[i]);
+            const Uint32 firstIndex = static_cast<Uint32>(byteOffset / indexSize);
+            const int32_t bv = basevertex ? static_cast<int32_t>(basevertex[i]) : 0;
+            wgpuRenderPassEncoderDrawIndexed(pass, static_cast<Uint32>(count[i]), 1, firstIndex, bv, 0);
+        }
         wgpuRenderPassEncoderEnd(pass);
         wgpuRenderPassEncoderRelease(pass);
     }
