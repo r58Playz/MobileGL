@@ -39,6 +39,13 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         void Clear(GLbitfield mask);
         void DrawArrays(GLenum mode, GLint first, GLsizei count);
         void DrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices);
+        // Instanced draws (all glDraw*Instanced* variants route here). baseVertex is
+        // applied via drawIndexed; baseInstance is clamped to 0 (WebGPU direct draws
+        // need the indirect-first-instance feature for a non-zero first instance).
+        void DrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instanceCount,
+                                 GLuint baseInstance);
+        void DrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void* indices,
+                                   GLsizei instanceCount, GLint baseVertex, GLuint baseInstance);
         void Present();
         // Synchronous readback of the default framebuffer (the offscreen color
         // target). Blocks the caller via JSPI until the GPU copy is mapped. Must be
@@ -80,7 +87,6 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         struct WgpuPipeline {
             WGPURenderPipeline pipeline = nullptr;
             WGPUBindGroupLayout group0Layout = nullptr; // pipeline auto layout (if resources)
-            WGPUBuffer uboBuffer = nullptr;             // global-UBO backing buffer (if any)
         };
 
         struct WgpuTexture {
@@ -113,6 +119,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         const WgpuPipeline* GetOrCreatePipeline(MG_State::GLState::ProgramObject& program,
                                                 const MG_State::GLState::VertexArrayObject& vao,
                                                 GLenum mode);
+        // Hash of everything WebGPU bakes into a render pipeline for the current GL
+        // state, so distinct states map to distinct cached pipelines.
+        Uint64 ComputePipelineKey(const MG_State::GLState::ProgramObject& program,
+                                  const MG_State::GLState::VertexArrayObject& vao, GLenum mode) const;
         WGPUBuffer GetOrCreateVertexBuffer(MG_State::GLState::BufferObject& buffer);
         WGPUBuffer GetOrCreateIndexBuffer(MG_State::GLState::BufferObject& buffer);
         const WgpuTexture* GetOrCreateTexture(MG_State::GLState::ITextureObject& texture);
@@ -140,7 +150,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
 
         // Caches (keyed by the MG_State object identity; minimal invalidation for now).
         UnorderedMap<const MG_State::GLState::ProgramObject*, WgpuProgram> m_programCache;
-        UnorderedMap<const MG_State::GLState::ProgramObject*, WgpuPipeline> m_pipelineCache;
+        // Keyed by a hash of (program, vertex layout, topology, depth/blend/cull/
+        // color-mask state, target formats): WebGPU bakes all of that into the
+        // pipeline, so each distinct render-state combination is its own variant.
+        UnorderedMap<Uint64, WgpuPipeline> m_pipelineCache;
         UnorderedMap<const MG_State::GLState::BufferObject*, WGPUBuffer> m_vertexBufferCache;
         UnorderedMap<const MG_State::GLState::BufferObject*, WGPUBuffer> m_indexBufferCache;
         UnorderedMap<const MG_State::GLState::ITextureObject*, WgpuTexture> m_textureCache;
@@ -149,6 +162,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // Bind groups reference runtime resources (textures/UBO contents), so they are
         // rebuilt each draw and released at frame end.
         Vector<WGPUBindGroup> m_frameBindGroups;
+        // Per-draw global-UBO buffers: each draw gets its own (queueWriteBuffer does not
+        // interleave with the recorded passes, so a shared buffer would make every pass
+        // in a frame read the last-written uniforms). Released at frame end.
+        Vector<WGPUBuffer> m_frameUboBuffers;
 
         // Persistent offscreen color target: all rendering goes here, then Present
         // copies it to the acquired swapchain texture. ReadPixels copies from it.
@@ -156,6 +173,11 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         WGPUTextureView m_offscreenView = nullptr;
         Uint32 m_offscreenWidth = 0;
         Uint32 m_offscreenHeight = 0;
+        // Companion depth target (always attached to draw passes so every pipeline can
+        // declare a matching depthStencil state; depth-only used for now, no stencil).
+        WGPUTexture m_depthTexture = nullptr;
+        WGPUTextureView m_depthView = nullptr;
+        static constexpr WGPUTextureFormat kDepthFormat = WGPUTextureFormat_Depth24Plus;
         // Guards against reentrant readback while a JSPI suspension is in flight.
         Bool m_readbackInFlight = false;
 

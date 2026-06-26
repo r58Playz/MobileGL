@@ -109,6 +109,69 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             default: return WGPUAddressMode_ClampToEdge;
             }
         }
+
+        WGPUCompareFunction ToCompareFunc(DepthTestFunc f) {
+            switch (f) {
+            case DepthTestFunc::Never: return WGPUCompareFunction_Never;
+            case DepthTestFunc::Less: return WGPUCompareFunction_Less;
+            case DepthTestFunc::Equal: return WGPUCompareFunction_Equal;
+            case DepthTestFunc::LessEqual: return WGPUCompareFunction_LessEqual;
+            case DepthTestFunc::Greater: return WGPUCompareFunction_Greater;
+            case DepthTestFunc::NotEqual: return WGPUCompareFunction_NotEqual;
+            case DepthTestFunc::GreaterEqual: return WGPUCompareFunction_GreaterEqual;
+            case DepthTestFunc::Always:
+            default: return WGPUCompareFunction_Always;
+            }
+        }
+
+        WGPUBlendFactor ToBlendFactor(BlendFactor f) {
+            switch (f) {
+            case BlendFactor::Zero: return WGPUBlendFactor_Zero;
+            case BlendFactor::One: return WGPUBlendFactor_One;
+            case BlendFactor::SrcColor: return WGPUBlendFactor_Src;
+            case BlendFactor::OneMinusSrcColor: return WGPUBlendFactor_OneMinusSrc;
+            case BlendFactor::DstColor: return WGPUBlendFactor_Dst;
+            case BlendFactor::OneMinusDstColor: return WGPUBlendFactor_OneMinusDst;
+            case BlendFactor::SrcAlpha: return WGPUBlendFactor_SrcAlpha;
+            case BlendFactor::OneMinusSrcAlpha: return WGPUBlendFactor_OneMinusSrcAlpha;
+            case BlendFactor::DstAlpha: return WGPUBlendFactor_DstAlpha;
+            case BlendFactor::OneMinusDstAlpha: return WGPUBlendFactor_OneMinusDstAlpha;
+            case BlendFactor::ConstantColor: return WGPUBlendFactor_Constant;
+            case BlendFactor::OneMinusConstantColor: return WGPUBlendFactor_OneMinusConstant;
+            // WebGPU has no separate constant-alpha factor; constant covers both.
+            case BlendFactor::ConstantAlpha: return WGPUBlendFactor_Constant;
+            case BlendFactor::OneMinusConstantAlpha: return WGPUBlendFactor_OneMinusConstant;
+            default: return WGPUBlendFactor_One;
+            }
+        }
+
+        WGPUBlendOperation ToBlendOp(BlendEquation e) {
+            switch (e) {
+            case BlendEquation::Add: return WGPUBlendOperation_Add;
+            case BlendEquation::Subtract: return WGPUBlendOperation_Subtract;
+            case BlendEquation::ReverseSubtract: return WGPUBlendOperation_ReverseSubtract;
+            case BlendEquation::Min: return WGPUBlendOperation_Min;
+            case BlendEquation::Max: return WGPUBlendOperation_Max;
+            default: return WGPUBlendOperation_Add;
+            }
+        }
+
+        // GL determines front-facing in window space (y-up); WebGPU does so in the
+        // framebuffer (y-down), so the winding is inverted (matching DirectVulkan).
+        WGPUFrontFace ToFrontFace(FrontFaceMode m) {
+            return m == FrontFaceMode::Clockwise ? WGPUFrontFace_CCW : WGPUFrontFace_CW;
+        }
+
+        WGPUCullMode ToCullMode(CullFaceMode m) {
+            switch (m) {
+            case CullFaceMode::Front: return WGPUCullMode_Front;
+            case CullFaceMode::Back: return WGPUCullMode_Back;
+            // FrontAndBack would cull everything; WebGPU can't express it in cullMode,
+            // so leave it to a (future) rasterizer-discard path — treat as Back here.
+            case CullFaceMode::FrontAndBack:
+            default: return WGPUCullMode_Back;
+            }
+        }
     } // namespace
 } // namespace MobileGL::MG_Backend::DirectWebGPU
 
@@ -180,7 +243,6 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         m_indexBufferCache.clear();
         for (auto& [k, p] : m_pipelineCache) {
             if (p.group0Layout) wgpuBindGroupLayoutRelease(p.group0Layout);
-            if (p.uboBuffer) wgpuBufferRelease(p.uboBuffer);
             if (p.pipeline) wgpuRenderPipelineRelease(p.pipeline);
         }
         m_pipelineCache.clear();
@@ -198,6 +260,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         m_programCache.clear();
         if (m_offscreenView) { wgpuTextureViewRelease(m_offscreenView); m_offscreenView = nullptr; }
         if (m_offscreenTexture) { wgpuTextureRelease(m_offscreenTexture); m_offscreenTexture = nullptr; }
+        if (m_depthView) { wgpuTextureViewRelease(m_depthView); m_depthView = nullptr; }
+        if (m_depthTexture) { wgpuTextureRelease(m_depthTexture); m_depthTexture = nullptr; }
         m_offscreenWidth = m_offscreenHeight = 0;
         if (m_surface) { wgpuSurfaceRelease(m_surface); m_surface = nullptr; }
         if (m_queue) { wgpuQueueRelease(m_queue); m_queue = nullptr; }
@@ -225,6 +289,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
         if (m_offscreenView) { wgpuTextureViewRelease(m_offscreenView); m_offscreenView = nullptr; }
         if (m_offscreenTexture) { wgpuTextureRelease(m_offscreenTexture); m_offscreenTexture = nullptr; }
+        if (m_depthView) { wgpuTextureViewRelease(m_depthView); m_depthView = nullptr; }
+        if (m_depthTexture) { wgpuTextureRelease(m_depthTexture); m_depthTexture = nullptr; }
         WGPUTextureDescriptor td{};
         td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc |
                    WGPUTextureUsage_TextureBinding;
@@ -235,6 +301,17 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         td.sampleCount = 1;
         m_offscreenTexture = wgpuDeviceCreateTexture(m_device, &td);
         m_offscreenView = m_offscreenTexture ? wgpuTextureCreateView(m_offscreenTexture, nullptr) : nullptr;
+
+        WGPUTextureDescriptor dd{};
+        dd.usage = WGPUTextureUsage_RenderAttachment;
+        dd.dimension = WGPUTextureDimension_2D;
+        dd.size = {m_width, m_height, 1};
+        dd.format = kDepthFormat;
+        dd.mipLevelCount = 1;
+        dd.sampleCount = 1;
+        m_depthTexture = wgpuDeviceCreateTexture(m_device, &dd);
+        m_depthView = m_depthTexture ? wgpuTextureCreateView(m_depthTexture, nullptr) : nullptr;
+
         m_offscreenWidth = m_width;
         m_offscreenHeight = m_height;
     }
@@ -259,18 +336,23 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         wgpuQueueSubmit(m_queue, 1, &cmd);
         wgpuCommandBufferRelease(cmd);
         wgpuCommandEncoderRelease(m_encoder);
-        // Per-frame bind groups were referenced by the just-submitted commands.
+        // Per-frame bind groups + UBO buffers were referenced by the just-submitted
+        // commands; safe to release now.
         for (WGPUBindGroup bg : m_frameBindGroups) { if (bg) wgpuBindGroupRelease(bg); }
         m_frameBindGroups.clear();
+        for (WGPUBuffer ub : m_frameUboBuffers) { if (ub) wgpuBufferRelease(ub); }
+        m_frameUboBuffers.clear();
         // Keep the frame active: open a fresh encoder so subsequent draws continue
         // accumulating into the (persistent) offscreen target.
         m_encoder = wgpuDeviceCreateCommandEncoder(m_device, nullptr);
     }
 
     void WebGPURenderer::EndFrame() {
-        // Bind groups were referenced by the just-submitted commands; safe to release now.
+        // Bind groups + UBO buffers were referenced by the just-submitted commands.
         for (WGPUBindGroup bg : m_frameBindGroups) { if (bg) wgpuBindGroupRelease(bg); }
         m_frameBindGroups.clear();
+        for (WGPUBuffer ub : m_frameUboBuffers) { if (ub) wgpuBufferRelease(ub); }
+        m_frameUboBuffers.clear();
         if (m_frameView) { wgpuTextureViewRelease(m_frameView); m_frameView = nullptr; }
         if (m_frameTexture) { wgpuTextureRelease(m_frameTexture); m_frameTexture = nullptr; }
         if (m_encoder) { wgpuCommandEncoderRelease(m_encoder); m_encoder = nullptr; }
@@ -281,28 +363,40 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (!m_device || !MG_State::pGLContext) {
             return;
         }
-        // M2a: default-framebuffer color clear only (depth/stencil added with the
-        // draw path in M2b). WebGPU clears via a render pass loadOp.
-        if ((mask & GL_COLOR_BUFFER_BIT) == 0) {
-            return;
+        const Bool clearColor = (mask & GL_COLOR_BUFFER_BIT) != 0;
+        const Bool clearDepth = (mask & GL_DEPTH_BUFFER_BIT) != 0;
+        if (!clearColor && !clearDepth) {
+            return; // stencil-only clear unsupported for now
         }
         BeginFrameIfNeeded();
         if (!m_frameActive) {
             return;
         }
+        auto* gl = MG_State::pGLContext.get();
 
-        const auto& c = MG_State::pGLContext->GetClearColor();
         WGPURenderPassColorAttachment color{};
-        color.view = m_offscreenView;
-        color.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
-        color.loadOp = WGPULoadOp_Clear;
-        color.storeOp = WGPUStoreOp_Store;
-        color.clearValue = {static_cast<double>(c[0]), static_cast<double>(c[1]),
-                            static_cast<double>(c[2]), static_cast<double>(c[3])};
+        if (clearColor) {
+            const auto& c = gl->GetClearColor();
+            color.view = m_offscreenView;
+            color.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
+            color.loadOp = WGPULoadOp_Clear;
+            color.storeOp = WGPUStoreOp_Store;
+            color.clearValue = {static_cast<double>(c[0]), static_cast<double>(c[1]),
+                                static_cast<double>(c[2]), static_cast<double>(c[3])};
+        }
+
+        WGPURenderPassDepthStencilAttachment depth{};
+        if (clearDepth) {
+            depth.view = m_depthView;
+            depth.depthLoadOp = WGPULoadOp_Clear;
+            depth.depthStoreOp = WGPUStoreOp_Store;
+            depth.depthClearValue = gl->GetClearDepth();
+        }
 
         WGPURenderPassDescriptor rp{};
-        rp.colorAttachmentCount = 1;
-        rp.colorAttachments = &color;
+        rp.colorAttachmentCount = clearColor ? 1 : 0;
+        rp.colorAttachments = clearColor ? &color : nullptr;
+        rp.depthStencilAttachment = clearDepth ? &depth : nullptr;
 
         WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(m_encoder, &rp);
         wgpuRenderPassEncoderEnd(pass);
@@ -418,10 +512,57 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         return &ins->second;
     }
 
+    Uint64 WebGPURenderer::ComputePipelineKey(const MG_State::GLState::ProgramObject& program,
+                                              const MG_State::GLState::VertexArrayObject& vao,
+                                              GLenum mode) const {
+        Uint64 key = 1469598103934665603ull; // FNV-1a
+        auto mix = [&key](Uint64 v) {
+            for (int i = 0; i < 8; ++i) {
+                key ^= static_cast<Uint8>(v >> (i * 8));
+                key *= 1099511628211ull;
+            }
+        };
+        mix(static_cast<Uint64>(reinterpret_cast<SizeT>(&program)));
+        mix(static_cast<Uint64>(mode));
+        // Vertex layout (per enabled attribute: index, format, stride, instance divisor>0).
+        for (Uint i = 0; i < 16; ++i) {
+            if (!vao.IsAttributeEnabled(i)) continue;
+            const auto& a = vao.GetAttribute(i);
+            mix((static_cast<Uint64>(i) << 40) ^ (static_cast<Uint64>(a.Stride) << 8) ^
+                (a.Divisor > 0 ? (Uint64(1) << 60) : 0) ^ static_cast<Uint64>(ToVertexFormat(a.Type, a.Size)));
+        }
+        // Render state WebGPU bakes into the pipeline.
+        auto* gl = MG_State::pGLContext.get();
+        const Bool depthTest = gl->IsCapabilityEnabled(CapabilityInput::DepthTest);
+        mix(depthTest ? 1 : 0);
+        mix(depthTest && gl->GetDepthMask() ? 1 : 0);
+        mix(static_cast<Uint64>(gl->GetDepthFunc()));
+        const Bool cull = gl->IsCapabilityEnabled(CapabilityInput::CullFace);
+        mix(cull ? 1 : 0);
+        mix(static_cast<Uint64>(gl->GetCullFaceMode()));
+        mix(static_cast<Uint64>(gl->GetFrontFaceMode()));
+        const auto cmask = gl->GetColorMask();
+        mix((cmask.r() ? 1u : 0u) | (cmask.g() ? 2u : 0u) | (cmask.b() ? 4u : 0u) | (cmask.a() ? 8u : 0u));
+        const Bool blend = gl->IsCapabilityEnabled(CapabilityInput::Blend);
+        mix(blend ? 1 : 0);
+        if (blend) {
+            BlendFactor sR, dR, sA, dA;
+            gl->GetBlendFunc(sR, dR, sA, dA);
+            BlendEquation eC, eA;
+            gl->GetBlendEquation(eC, eA);
+            mix(static_cast<Uint64>(sR) | (static_cast<Uint64>(dR) << 8) | (static_cast<Uint64>(sA) << 16) |
+                (static_cast<Uint64>(dA) << 24) | (static_cast<Uint64>(eC) << 32) |
+                (static_cast<Uint64>(eA) << 40));
+        }
+        mix(static_cast<Uint64>(m_format));
+        return key;
+    }
+
     const WebGPURenderer::WgpuPipeline*
     WebGPURenderer::GetOrCreatePipeline(MG_State::GLState::ProgramObject& program,
                                         const MG_State::GLState::VertexArrayObject& vao, GLenum mode) {
-        if (auto it = m_pipelineCache.find(&program); it != m_pipelineCache.end()) {
+        const Uint64 key = ComputePipelineKey(program, vao, mode);
+        if (auto it = m_pipelineCache.find(key); it != m_pipelineCache.end()) {
             return &it->second;
         }
         const WgpuProgram* prog = GetOrCreateProgram(program);
@@ -452,7 +593,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             const auto& a = vao.GetAttribute(i);
             if (ToVertexFormat(a.Type, a.Size) == WGPUVertexFormat_Force32) continue;
             WGPUVertexBufferLayout layout{};
-            layout.stepMode = WGPUVertexStepMode_Vertex;
+            // Divisor>0 -> per-instance attribute (glVertexAttribDivisor); 0 -> per-vertex.
+            layout.stepMode = a.Divisor > 0 ? WGPUVertexStepMode_Instance : WGPUVertexStepMode_Vertex;
             const uint64_t packed = static_cast<uint64_t>(4 * a.Size); // float components
             layout.arrayStride = a.Stride ? static_cast<uint64_t>(a.Stride) : packed;
             layout.attributeCount = 1;
@@ -460,9 +602,26 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             layouts.push_back(layout);
         }
 
+        auto* gl = MG_State::pGLContext.get();
+
+        // Color target: write mask + (optional) blend, from GL state.
+        const auto cmask = gl->GetColorMask();
         WGPUColorTargetState colorTarget{};
         colorTarget.format = m_format;
-        colorTarget.writeMask = WGPUColorWriteMask_All;
+        colorTarget.writeMask = (cmask.r() ? WGPUColorWriteMask_Red : 0u) |
+                                (cmask.g() ? WGPUColorWriteMask_Green : 0u) |
+                                (cmask.b() ? WGPUColorWriteMask_Blue : 0u) |
+                                (cmask.a() ? WGPUColorWriteMask_Alpha : 0u);
+        WGPUBlendState blend{};
+        if (gl->IsCapabilityEnabled(CapabilityInput::Blend)) {
+            BlendFactor sR, dR, sA, dA;
+            gl->GetBlendFunc(sR, dR, sA, dA);
+            BlendEquation eC, eA;
+            gl->GetBlendEquation(eC, eA);
+            blend.color = {ToBlendOp(eC), ToBlendFactor(sR), ToBlendFactor(dR)};
+            blend.alpha = {ToBlendOp(eA), ToBlendFactor(sA), ToBlendFactor(dA)};
+            colorTarget.blend = &blend;
+        }
 
         WGPUFragmentState fragment{};
         fragment.module = prog->fragment;
@@ -470,15 +629,30 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         fragment.targetCount = 1;
         fragment.targets = &colorTarget;
 
+        // Depth-stencil: a depth target is always attached, so always declare a state.
+        // depthWrite only when the test is on (GL doesn't write depth with the test off).
+        const Bool depthTest = gl->IsCapabilityEnabled(CapabilityInput::DepthTest);
+        WGPUDepthStencilState depthState{};
+        depthState.format = kDepthFormat;
+        depthState.depthWriteEnabled = (depthTest && gl->GetDepthMask())
+                                           ? WGPUOptionalBool_True
+                                           : WGPUOptionalBool_False;
+        depthState.depthCompare = depthTest ? ToCompareFunc(gl->GetDepthFunc()) : WGPUCompareFunction_Always;
+        depthState.stencilFront.compare = WGPUCompareFunction_Always;
+        depthState.stencilBack.compare = WGPUCompareFunction_Always;
+
         WGPURenderPipelineDescriptor desc{};
-        desc.layout = nullptr; // auto layout: no bind groups in the minimal path
+        desc.layout = nullptr; // auto layout; bind groups built from the pipeline's layout
         desc.vertex.module = prog->vertex;
         desc.vertex.entryPoint = Wgpu::View("main");
         desc.vertex.bufferCount = layouts.size();
         desc.vertex.buffers = layouts.empty() ? nullptr : layouts.data();
         desc.primitive.topology = ToTopology(mode);
-        desc.primitive.frontFace = WGPUFrontFace_CCW;
-        desc.primitive.cullMode = WGPUCullMode_None;
+        desc.primitive.frontFace = ToFrontFace(gl->GetFrontFaceMode());
+        desc.primitive.cullMode =
+            gl->IsCapabilityEnabled(CapabilityInput::CullFace) ? ToCullMode(gl->GetCullFaceMode())
+                                                               : WGPUCullMode_None;
+        desc.depthStencil = &depthState;
         desc.multisample.count = 1;
         desc.multisample.mask = 0xFFFFFFFFu;
         desc.fragment = &fragment;
@@ -489,18 +663,12 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
         WgpuPipeline entry;
         entry.pipeline = pipeline;
-        // Keep the auto-generated group-0 layout for building per-draw bind groups,
-        // and create the global-UBO backing buffer once.
+        // The auto-generated group-0 layout is shared by all state variants of this
+        // program (same shaders); keep it for building per-draw bind groups.
         if (prog->HasResources()) {
             entry.group0Layout = wgpuRenderPipelineGetBindGroupLayout(pipeline, 0);
-            if (prog->globalUboBinding >= 0 && prog->globalUboSize > 0) {
-                WGPUBufferDescriptor bd{};
-                bd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
-                bd.size = (static_cast<Uint64>(prog->globalUboSize) + 15u) & ~Uint64(15); // 16-byte aligned
-                entry.uboBuffer = wgpuDeviceCreateBuffer(m_device, &bd);
-            }
         }
-        auto [ins, ok] = m_pipelineCache.emplace(&program, entry);
+        auto [ins, ok] = m_pipelineCache.emplace(key, entry);
         return &ins->second;
     }
 
@@ -685,34 +853,72 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (!p) {
             return nullptr;
         }
-        // Draw into a Load render pass so a prior glClear is preserved.
+        // Draw into a Load render pass so a prior glClear is preserved. The depth
+        // target is always attached (every pipeline declares a depthStencil state);
+        // depthReadOnly when nothing writes it would require knowing every pipeline in
+        // the pass, so keep it writable and rely on per-pipeline depthWriteEnabled.
         WGPURenderPassColorAttachment color{};
         color.view = m_offscreenView;
         color.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
         color.loadOp = WGPULoadOp_Load;
         color.storeOp = WGPUStoreOp_Store;
+        WGPURenderPassDepthStencilAttachment depth{};
+        depth.view = m_depthView;
+        depth.depthLoadOp = WGPULoadOp_Load;
+        depth.depthStoreOp = WGPUStoreOp_Store;
         WGPURenderPassDescriptor rp{};
         rp.colorAttachmentCount = 1;
         rp.colorAttachments = &color;
+        rp.depthStencilAttachment = &depth;
 
         WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(m_encoder, &rp);
         wgpuRenderPassEncoderSetPipeline(pass, p->pipeline);
+
+        // Viewport (GL bottom-left origin -> WebGPU top-left). Only when the app set a
+        // non-empty viewport; otherwise WebGPU's default covers the whole target.
+        auto* gl = MG_State::pGLContext.get();
+        const auto& vp = gl->GetViewport();
+        if (vp.z() > 0 && vp.w() > 0) {
+            const float vy = static_cast<float>(m_height) - static_cast<float>(vp.y()) -
+                             static_cast<float>(vp.w());
+            wgpuRenderPassEncoderSetViewport(pass, static_cast<float>(vp.x()), vy,
+                                             static_cast<float>(vp.z()), static_cast<float>(vp.w()), 0.0f,
+                                             1.0f);
+        }
+        // Scissor (same Y flip) when the scissor test is enabled.
+        if (gl->IsCapabilityEnabled(CapabilityInput::ScissorTest)) {
+            const auto& sc = gl->GetScissorBox();
+            if (sc.z() > 0 && sc.w() > 0) {
+                Int32 sy = static_cast<Int32>(m_height) - sc.y() - sc.w();
+                if (sy < 0) sy = 0;
+                wgpuRenderPassEncoderSetScissorRect(pass, static_cast<Uint32>(sc.x() < 0 ? 0 : sc.x()),
+                                                    static_cast<Uint32>(sy), static_cast<Uint32>(sc.z()),
+                                                    static_cast<Uint32>(sc.w()));
+            }
+        }
 
         // Build the group-0 bind group from current state: global UBO + sampled
         // textures. Rebuilt per draw (textures/UBO contents are runtime state).
         const WgpuProgram* prog = GetOrCreateProgram(program);
         if (prog && prog->HasResources() && p->group0Layout) {
             std::vector<WGPUBindGroupEntry> entries;
-            if (prog->globalUboBinding >= 0 && p->uboBuffer) {
+            if (prog->globalUboBinding >= 0 && prog->globalUboSize > 0) {
+                // Fresh per-draw UBO buffer with this draw's uniforms (see m_frameUboBuffers).
+                const Uint64 uboSize = (static_cast<Uint64>(prog->globalUboSize) + 15u) & ~Uint64(15);
+                WGPUBufferDescriptor bd{};
+                bd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+                bd.size = uboSize;
+                WGPUBuffer ubo = wgpuDeviceCreateBuffer(m_device, &bd);
+                m_frameUboBuffers.push_back(ubo);
                 const void* uboData = program.GetUBOData();
                 const Uint sz = program.GetUBOSize();
-                if (uboData && sz > 0) {
-                    wgpuQueueWriteBuffer(m_queue, p->uboBuffer, 0, uboData, sz & ~Uint(3));
+                if (ubo && uboData && sz > 0) {
+                    wgpuQueueWriteBuffer(m_queue, ubo, 0, uboData, sz & ~Uint(3));
                 }
                 WGPUBindGroupEntry e{};
                 e.binding = static_cast<Uint32>(prog->globalUboBinding);
-                e.buffer = p->uboBuffer;
-                e.size = (static_cast<Uint64>(prog->globalUboSize) + 15u) & ~Uint64(15);
+                e.buffer = ubo;
+                e.size = uboSize;
                 entries.push_back(e);
             }
             for (const auto& s : prog->samplers) {
@@ -768,8 +974,17 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     }
 
     void WebGPURenderer::DrawArrays(GLenum mode, GLint first, GLsizei count) {
-        if (!m_device || !MG_State::pGLContext || count <= 0) {
+        DrawArraysInstanced(mode, first, count, 1, 0);
+    }
+
+    void WebGPURenderer::DrawArraysInstanced(GLenum mode, GLint first, GLsizei count,
+                                             GLsizei instanceCount, GLuint baseInstance) {
+        if (!m_device || !MG_State::pGLContext || count <= 0 || instanceCount <= 0) {
             return;
+        }
+        if (baseInstance != 0) {
+            MGLOG_W("DirectWebGPU: non-zero baseInstance (%u) unsupported (needs indirect-first-instance); "
+                    "using 0", baseInstance);
         }
         const auto& programPtr = MG_State::pGLContext->GetCurrentProgram();
         const auto& vaoPtr = MG_State::pGLContext->GetBoundVertexArray();
@@ -784,19 +999,29 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (!pass) {
             return;
         }
-        wgpuRenderPassEncoderDraw(pass, static_cast<Uint32>(count), 1, static_cast<Uint32>(first), 0);
+        wgpuRenderPassEncoderDraw(pass, static_cast<Uint32>(count), static_cast<Uint32>(instanceCount),
+                                  static_cast<Uint32>(first), 0);
         wgpuRenderPassEncoderEnd(pass);
         wgpuRenderPassEncoderRelease(pass);
     }
 
     void WebGPURenderer::DrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
-        if (!m_device || !MG_State::pGLContext || count <= 0) {
+        DrawElementsInstanced(mode, count, type, indices, 1, 0, 0);
+    }
+
+    void WebGPURenderer::DrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void* indices,
+                                               GLsizei instanceCount, GLint baseVertex, GLuint baseInstance) {
+        if (!m_device || !MG_State::pGLContext || count <= 0 || instanceCount <= 0) {
             return;
         }
         const WGPUIndexFormat indexFormat = ToIndexFormat(type);
         if (indexFormat == WGPUIndexFormat_Undefined) {
             MGLOG_E("DirectWebGPU: unsupported index type 0x%x (GL_UNSIGNED_BYTE not in WebGPU)", type);
             return;
+        }
+        if (baseInstance != 0) {
+            MGLOG_W("DirectWebGPU: non-zero baseInstance (%u) unsupported (needs indirect-first-instance); "
+                    "using 0", baseInstance);
         }
         const auto& programPtr = MG_State::pGLContext->GetCurrentProgram();
         const auto& vaoPtr = MG_State::pGLContext->GetBoundVertexArray();
@@ -820,10 +1045,13 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (!pass) {
             return;
         }
-        // `indices` is a byte offset into the bound element array buffer.
+        // `indices` is a byte offset into the bound element array buffer; baseVertex is
+        // added to every index by drawIndexed.
         const uint64_t byteOffset = reinterpret_cast<uintptr_t>(indices);
         wgpuRenderPassEncoderSetIndexBuffer(pass, indexBuffer, indexFormat, byteOffset, WGPU_WHOLE_SIZE);
-        wgpuRenderPassEncoderDrawIndexed(pass, static_cast<Uint32>(count), 1, 0, 0, 0);
+        wgpuRenderPassEncoderDrawIndexed(pass, static_cast<Uint32>(count),
+                                         static_cast<Uint32>(instanceCount), 0,
+                                         static_cast<int32_t>(baseVertex), 0);
         wgpuRenderPassEncoderEnd(pass);
         wgpuRenderPassEncoderRelease(pass);
     }

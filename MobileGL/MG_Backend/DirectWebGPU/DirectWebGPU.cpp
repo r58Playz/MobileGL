@@ -30,6 +30,49 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
     }
 
+    void DrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
+        if (pWebGPURenderer) {
+            pWebGPURenderer->DrawArraysInstanced(mode, first, count, instancecount, 0);
+        }
+    }
+
+    void DrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count, GLsizei instancecount,
+                                         GLuint baseinstance) {
+        if (pWebGPURenderer) {
+            pWebGPURenderer->DrawArraysInstanced(mode, first, count, instancecount, baseinstance);
+        }
+    }
+
+    void DrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void* indices,
+                               GLsizei instancecount) {
+        if (pWebGPURenderer) {
+            pWebGPURenderer->DrawElementsInstanced(mode, count, type, indices, instancecount, 0, 0);
+        }
+    }
+
+    void DrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type, const void* indices,
+                                         GLsizei instancecount, GLint basevertex) {
+        if (pWebGPURenderer) {
+            pWebGPURenderer->DrawElementsInstanced(mode, count, type, indices, instancecount, basevertex, 0);
+        }
+    }
+
+    void DrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type, const void* indices,
+                                           GLsizei instancecount, GLuint baseinstance) {
+        if (pWebGPURenderer) {
+            pWebGPURenderer->DrawElementsInstanced(mode, count, type, indices, instancecount, 0, baseinstance);
+        }
+    }
+
+    void DrawElementsInstancedBaseVertexBaseInstance(GLenum mode, GLsizei count, GLenum type,
+                                                     const void* indices, GLsizei instancecount,
+                                                     GLint basevertex, GLuint baseinstance) {
+        if (pWebGPURenderer) {
+            pWebGPURenderer->DrawElementsInstanced(mode, count, type, indices, instancecount, basevertex,
+                                                   baseinstance);
+        }
+    }
+
     void ReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type,
                     void* pixels) {
         if (pWebGPURenderer) {

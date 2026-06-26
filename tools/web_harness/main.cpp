@@ -16,6 +16,16 @@ static double g_t = 0.0;
 static GLuint g_tex = 0;
 static int g_frame = 0;
 
+static GLuint g_texProg = 0, g_texVAO = 0;
+
+// M5 render-state validation: a solid-color program + quads at known screen regions,
+// drawn with depth test / blending so readback can verify the results.
+static GLuint g_solidProg = 0, g_solidVAO = 0, g_colorLoc = 0;
+static GLuint g_nearVBO = 0, g_farVBO = 0, g_blendBgVBO = 0, g_blendFgVBO = 0;
+
+// M5 instancing validation: a small quad + a per-instance offset attribute (divisor 1).
+static GLuint g_instProg = 0, g_instVAO = 0, g_instColorLoc = 0, g_instQuadVBO = 0, g_instOffVBO = 0;
+
 // M4 validation: synchronous readback of the framebuffer via JSPI. glFinish and
 // glReadPixels suspend the wasm stack until the WebGPU copy/map completes; this is
 // only legal when reached from a WebAssembly.promising entry, so the scheduler below
@@ -36,6 +46,15 @@ extern "C" EMSCRIPTEN_KEEPALIVE void harness_readback() {
     glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, tex);
     printf("[harness] getteximage texels: (%d,%d,%d) (%d,%d,%d) (%d,%d,%d) (%d,%d,%d)\n", tex[0], tex[1],
            tex[2], tex[4], tex[5], tex[6], tex[8], tex[9], tex[10], tex[12], tex[13], tex[14]);
+    // M5: depth test — left strip center. Far green was drawn after near red; with
+    // GL_LESS it must be occluded, so this reads RED.
+    unsigned char depthPix[4] = {0};
+    glReadPixels(45, 256, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, depthPix);
+    // M5: blend — right strip center. 50%-alpha red over opaque blue -> ~(128,0,128).
+    unsigned char blendPix[4] = {0};
+    glReadPixels(467, 256, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, blendPix);
+    printf("[harness] depthtest pixel=(%d,%d,%d) [expect ~255,0,0]  blend pixel=(%d,%d,%d) [expect "
+           "~128,0,128]\n", depthPix[0], depthPix[1], depthPix[2], blendPix[0], blendPix[1], blendPix[2]);
 }
 
 // Wrap the export in WebAssembly.promising (needs module scope for wasmExports) and
@@ -72,6 +91,22 @@ static const char* kFrag =
     "out vec4 FragColor;\n"
     "void main() { FragColor = texture(uTex, vUV); }\n";
 
+static const char* kSolidVert =
+    "#version 330 core\n"
+    "layout(location=0) in vec3 aPos;\n"
+    "void main() { gl_Position = vec4(aPos, 1.0); }\n";
+static const char* kSolidFrag =
+    "#version 330 core\n"
+    "uniform vec4 uColor;\n"
+    "out vec4 FragColor;\n"
+    "void main() { FragColor = uColor; }\n";
+
+static const char* kInstVert =
+    "#version 330 core\n"
+    "layout(location=0) in vec2 aPos;\n"        // per-vertex (divisor 0)
+    "layout(location=1) in vec2 aOffset;\n"     // per-instance (divisor 1)
+    "void main() { gl_Position = vec4(aPos + aOffset, 0.05, 1.0); }\n";
+
 static GLuint CompileShader(GLenum type, const char* src) {
     GLuint s = glCreateShader(type);
     glShaderSource(s, 1, &src, nullptr);
@@ -87,7 +122,8 @@ static GLuint CompileShader(GLenum type, const char* src) {
 }
 
 static void SetupQuad() {
-    GLuint prog = glCreateProgram();
+    g_texProg = glCreateProgram();
+    GLuint prog = g_texProg;
     glAttachShader(prog, CompileShader(GL_VERTEX_SHADER, kVert));
     glAttachShader(prog, CompileShader(GL_FRAGMENT_SHADER, kFrag));
     glBindAttribLocation(prog, 0, "aPos");
@@ -109,9 +145,9 @@ static void SetupQuad() {
     };
     static const unsigned short indices[] = {0, 1, 2, 0, 2, 3};
 
-    GLuint vao = 0, vbo = 0, ebo = 0;
-    glGenVertexArrays(1, &vao);
-    glBindVertexArray(vao);
+    GLuint vbo = 0, ebo = 0;
+    glGenVertexArrays(1, &g_texVAO);
+    glBindVertexArray(g_texVAO);
     glGenBuffers(1, &vbo);
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
@@ -136,6 +172,102 @@ static void SetupQuad() {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 }
 
+static GLuint MakeQuadVBO(float x0, float y0, float x1, float y1, float z) {
+    const float v[] = {x0, y0, z, x1, y0, z, x1, y1, z, x0, y0, z, x1, y1, z, x0, y1, z};
+    GLuint b = 0;
+    glGenBuffers(1, &b);
+    glBindBuffer(GL_ARRAY_BUFFER, b);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(v), v, GL_STATIC_DRAW);
+    return b;
+}
+
+static void SetupSolids() {
+    g_solidProg = glCreateProgram();
+    glAttachShader(g_solidProg, CompileShader(GL_VERTEX_SHADER, kSolidVert));
+    glAttachShader(g_solidProg, CompileShader(GL_FRAGMENT_SHADER, kSolidFrag));
+    glBindAttribLocation(g_solidProg, 0, "aPos");
+    glLinkProgram(g_solidProg);
+    g_colorLoc = glGetUniformLocation(g_solidProg, "uColor");
+    glGenVertexArrays(1, &g_solidVAO);
+    // Left strip (depth test): near (z=0.2) + far (z=0.8) overlap the same region.
+    g_nearVBO = MakeQuadVBO(-0.95f, -0.3f, -0.70f, 0.3f, 0.2f);
+    g_farVBO = MakeQuadVBO(-0.95f, -0.3f, -0.70f, 0.3f, 0.8f);
+    // Right strip (blend): opaque blue bg + 50%-alpha red fg.
+    g_blendBgVBO = MakeQuadVBO(0.70f, -0.3f, 0.95f, 0.3f, 0.1f);
+    g_blendFgVBO = MakeQuadVBO(0.70f, -0.3f, 0.95f, 0.3f, 0.1f);
+}
+
+// Draws the M5 depth + blend test quads (called each frame, in fixed screen regions
+// that don't overlap the textured quad).
+static void DrawSolids() {
+    glUseProgram(g_solidProg);
+    glBindVertexArray(g_solidVAO);
+    auto bindQuad = [](GLuint vbo) {
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (const void*)0);
+        glEnableVertexAttribArray(0);
+    };
+    // Depth test: draw NEAR red first, then FAR green over it. GL_LESS must keep red.
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+    bindQuad(g_nearVBO);
+    glUniform4f(g_colorLoc, 1.0f, 0.0f, 0.0f, 1.0f);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    bindQuad(g_farVBO);
+    glUniform4f(g_colorLoc, 0.0f, 1.0f, 0.0f, 1.0f);
+    glDrawArrays(GL_TRIANGLES, 0, 6); // occluded where it overlaps the near red
+    glDisable(GL_DEPTH_TEST);
+    // Blend: opaque blue, then 50%-alpha red over it -> ~(128,0,128).
+    bindQuad(g_blendBgVBO);
+    glUniform4f(g_colorLoc, 0.0f, 0.0f, 1.0f, 1.0f);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    bindQuad(g_blendFgVBO);
+    glUniform4f(g_colorLoc, 1.0f, 0.0f, 0.0f, 0.5f);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glDisable(GL_BLEND);
+}
+
+static void SetupInstanced() {
+    g_instProg = glCreateProgram();
+    glAttachShader(g_instProg, CompileShader(GL_VERTEX_SHADER, kInstVert));
+    glAttachShader(g_instProg, CompileShader(GL_FRAGMENT_SHADER, kSolidFrag));
+    glBindAttribLocation(g_instProg, 0, "aPos");
+    glBindAttribLocation(g_instProg, 1, "aOffset");
+    glLinkProgram(g_instProg);
+    g_instColorLoc = glGetUniformLocation(g_instProg, "uColor");
+    glGenVertexArrays(1, &g_instVAO);
+    glBindVertexArray(g_instVAO);
+    // Small centered quad (per-vertex, vec2).
+    const float quad[] = {-0.06f, -0.06f, 0.06f, -0.06f, 0.06f, 0.06f,
+                          -0.06f, -0.06f, 0.06f, 0.06f, -0.06f, 0.06f};
+    glGenBuffers(1, &g_instQuadVBO);
+    glBindBuffer(GL_ARRAY_BUFFER, g_instQuadVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+    // Four per-instance offsets along a bottom row (NDC).
+    const float offsets[] = {-0.6f, -0.85f, -0.2f, -0.85f, 0.2f, -0.85f, 0.6f, -0.85f};
+    glGenBuffers(1, &g_instOffVBO);
+    glBindBuffer(GL_ARRAY_BUFFER, g_instOffVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(offsets), offsets, GL_STATIC_DRAW);
+}
+
+// M5 instancing: draw the small quad 4 times, each offset by a per-instance attribute.
+static void DrawInstanced() {
+    glUseProgram(g_instProg);
+    glBindVertexArray(g_instVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, g_instQuadVBO);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (const void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribDivisor(0, 0);
+    glBindBuffer(GL_ARRAY_BUFFER, g_instOffVBO);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (const void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribDivisor(1, 1); // advance once per instance
+    glUniform4f(g_instColorLoc, 0.0f, 1.0f, 1.0f, 1.0f); // cyan
+    glDrawArraysInstanced(GL_TRIANGLES, 0, 6, 4);
+}
+
 static void Frame() {
     g_t += 0.016;
     // Every ~40 frames, rotate the 2x2 texel colors via glTexSubImage2D to exercise
@@ -158,8 +290,16 @@ static void Frame() {
     }
     ++g_frame;
     glClearColor(0.1f, 0.2f, 0.3f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
+    glClearDepth(1.0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    // Textured quad (center): rebind its program/VAO since DrawSolids changes them.
+    glUseProgram(g_texProg);
+    glBindVertexArray(g_texVAO);
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, (const void*)0);
+    // M5: depth-test + blend validation quads (left/right strips).
+    DrawSolids();
+    // M5: instanced draw (bottom row of 4 cyan quads).
+    DrawInstanced();
     eglSwapBuffers(g_dpy, g_surf);
 }
 
@@ -184,6 +324,8 @@ int main() {
     eglMakeCurrent(g_dpy, g_surf, g_surf, ctx);
 
     SetupQuad();
+    SetupSolids();
+    SetupInstanced();
     printf("[harness] setup done; starting draw loop\n");
     harness_schedule_readback(); // M4: fire a JSPI readback after ~1.5s of frames
     emscripten_set_main_loop(Frame, 0, 1);
