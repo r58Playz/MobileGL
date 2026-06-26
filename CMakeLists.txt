@@ -129,6 +129,15 @@ if (EMSCRIPTEN)
     # WebGPU backend: fetch + patch the vendored emdawnwebgpu package (downloaded,
     # not committed). Sets EMDAWNWEBGPU_INCLUDE_DIRS / _WEBGPU_CPP / _JS_LIBRARIES.
     include(${CMAKE_SOURCE_DIR}/cmake/FetchEmdawnwebgpu.cmake)
+
+    # Prebuilt tint (SPIR-V -> WGSL), produced by tools/build-tint.sh (one combined
+    # libtint.a + a header bundle). Browser WebGPU accepts only WGSL.
+    set(MOBILEGL_TINT_DIR "${CMAKE_SOURCE_DIR}/tools/tint/out" CACHE PATH "Prebuilt tint output dir (tools/build-tint.sh)")
+    if (NOT EXISTS "${MOBILEGL_TINT_DIR}/libtint.a")
+        message(FATAL_ERROR "tint not built: '${MOBILEGL_TINT_DIR}/libtint.a' is missing. Run tools/build-tint.sh first (or set -DMOBILEGL_TINT_DIR).")
+    endif()
+    add_library(mobilegl_tint STATIC IMPORTED GLOBAL)
+    set_target_properties(mobilegl_tint PROPERTIES IMPORTED_LOCATION "${MOBILEGL_TINT_DIR}/libtint.a")
 endif()
 
 set(XXHASH_BUILD_XXHSUM OFF)
@@ -328,8 +337,18 @@ if (EMSCRIPTEN)
     )
     list(APPEND SOURCE_FILES
         MobileGL/MG_Backend/DirectWebGPU/BackendObject_DirectWebGPU.cpp
+        MobileGL/MG_Util/ShaderTranspiler/WgslTranspiler.cpp
         ${EMDAWNWEBGPU_WEBGPU_CPP}
     )
+
+    # WgslTranspiler.cpp is the only TU that includes tint; compile it with tint's
+    # ABI (C++20, no RTTI/exceptions) + the matching TINT_BUILD_* defines + the
+    # prebuilt header bundle. Isolated here so the rest of MobileGL stays C++23.
+    set_source_files_properties(MobileGL/MG_Util/ShaderTranspiler/WgslTranspiler.cpp
+        PROPERTIES
+        COMPILE_OPTIONS "-std=c++20;-fno-rtti;-fno-exceptions"
+        INCLUDE_DIRECTORIES "${MOBILEGL_TINT_DIR}/include"
+        COMPILE_DEFINITIONS "TINT_BUILD_SPV_READER=1;TINT_BUILD_WGSL_READER=1;TINT_BUILD_WGSL_WRITER=1;TINT_BUILD_SPV_WRITER=0;TINT_BUILD_GLSL_WRITER=0;TINT_BUILD_HLSL_WRITER=0;TINT_BUILD_MSL_WRITER=0;TINT_BUILD_IR_BINARY=0;TINT_BUILD_IS_LINUX=1;TINT_BUILD_IS_MAC=0;TINT_BUILD_IS_WIN=0")
 endif()
 
 set(MOBILEGL_LINK_LIBRARIES
@@ -345,6 +364,8 @@ if (NOT EMSCRIPTEN)
         GPUOpen::VulkanMemoryAllocator
         Vulkan::UtilityHeaders
     )
+else()
+    list(APPEND MOBILEGL_LINK_LIBRARIES mobilegl_tint)
 endif()
 
 set(MOBILEGL_COMPILE_DEF
