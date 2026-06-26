@@ -31,6 +31,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         m_backendFunctions.GL.Clear = &DirectWebGPU::Clear;
         m_backendFunctions.GL.DrawArrays = &DirectWebGPU::DrawArrays;
         m_backendFunctions.GL.DrawElements = &DirectWebGPU::DrawElements;
+        m_backendFunctions.GL.ReadPixels = &DirectWebGPU::ReadPixels;
+        m_backendFunctions.GL.GetTexImage = &DirectWebGPU::GetTexImage;
+        m_backendFunctions.GL.GetTextureImage = &DirectWebGPU::GetTextureImage;
+        m_backendFunctions.GL.Finish = &DirectWebGPU::Finish;
     }
 
     Bool BackendObject_DirectWebGPU::InitCapabilities() {

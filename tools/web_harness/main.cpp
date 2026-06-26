@@ -16,6 +16,49 @@ static double g_t = 0.0;
 static GLuint g_tex = 0;
 static int g_frame = 0;
 
+// M4 validation: synchronous readback of the framebuffer via JSPI. glFinish and
+// glReadPixels suspend the wasm stack until the WebGPU copy/map completes; this is
+// only legal when reached from a WebAssembly.promising entry, so the scheduler below
+// wraps this export before calling it.
+extern "C" EMSCRIPTEN_KEEPALIVE void harness_readback() {
+    glFinish();
+    unsigned char bg[4] = {0}, quad[4] = {0};
+    // (10,10): outside the quad -> the clear color (~26,51,77).
+    glReadPixels(10, 10, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, bg);
+    // (180,180): inside the quad -> a saturated texture color.
+    glReadPixels(180, 180, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, quad);
+    printf("[harness] readback bg=(%d,%d,%d,%d) quad=(%d,%d,%d,%d)\n", bg[0], bg[1], bg[2], bg[3],
+           quad[0], quad[1], quad[2], quad[3]);
+    // glGetTexImage: read back the 2x2 texture's four texels (a rotation of the
+    // red/green/blue/yellow palette).
+    unsigned char tex[16] = {0};
+    glBindTexture(GL_TEXTURE_2D, g_tex);
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, tex);
+    printf("[harness] getteximage texels: (%d,%d,%d) (%d,%d,%d) (%d,%d,%d) (%d,%d,%d)\n", tex[0], tex[1],
+           tex[2], tex[4], tex[5], tex[6], tex[8], tex[9], tex[10], tex[12], tex[13], tex[14]);
+}
+
+// Wrap the export in WebAssembly.promising (needs module scope for wasmExports) and
+// fire it once after a few frames have rendered.
+EM_JS(void, harness_schedule_readback, (), {
+    setTimeout(function() {
+        try {
+            if (typeof WebAssembly.promising !== 'function') {
+                out('[harness] WebAssembly.promising unavailable (JSPI off?)');
+                return;
+            }
+            // With WASM_ASYNC_COMPILATION=0, Module['_harness_readback'] is the raw
+            // WebAssembly export (no lazy JS wrapper), which WebAssembly.promising needs.
+            var fn = Module['_harness_readback'];
+            var promising = WebAssembly.promising(fn);
+            promising().then(function() { out('[harness] readback call returned'); })
+                       .catch(function(e) { err('[harness] readback threw: ' + e); });
+        } catch (e) {
+            err('[harness] schedule_readback failed: ' + e);
+        }
+    }, 1500);
+});
+
 static const char* kVert =
     "#version 330 core\n"
     "layout(location=0) in vec3 aPos;\n"
@@ -142,6 +185,7 @@ int main() {
 
     SetupQuad();
     printf("[harness] setup done; starting draw loop\n");
+    harness_schedule_readback(); // M4: fire a JSPI readback after ~1.5s of frames
     emscripten_set_main_loop(Frame, 0, 1);
     return 0;
 }

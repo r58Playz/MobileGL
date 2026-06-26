@@ -33,6 +33,13 @@ EM_JS(int, mobilegl_preferred_canvas_format, (), {
     }
 });
 
+// JSPI suspend primitive (defined in lib_mobilegl_webgpu.js). mobilegl_jspi_wait is
+// wrapped in WebAssembly.Suspending: calling it suspends the whole wasm stack (which
+// must have been entered via WebAssembly.promising) until mobilegl_jspi_signal()
+// resolves the pending promise from a WebGPU completion callback.
+extern "C" void mobilegl_jspi_wait();
+extern "C" void mobilegl_jspi_signal();
+
 namespace MobileGL::MG_Backend::DirectWebGPU {
     namespace {
         // Minimal GL-type -> WGPU vertex format (M2b supports float attributes).
@@ -153,7 +160,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         WGPUSurfaceConfiguration cfg{};
         cfg.device = m_device;
         cfg.format = m_format;
-        cfg.usage = WGPUTextureUsage_RenderAttachment;
+        // CopyDst so Present can copy the offscreen target onto the swapchain texture.
+        cfg.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopyDst;
         cfg.width = m_width;
         cfg.height = m_height;
         cfg.alphaMode = WGPUCompositeAlphaMode_Opaque;
@@ -188,6 +196,9 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             if (prog.fragment) wgpuShaderModuleRelease(prog.fragment);
         }
         m_programCache.clear();
+        if (m_offscreenView) { wgpuTextureViewRelease(m_offscreenView); m_offscreenView = nullptr; }
+        if (m_offscreenTexture) { wgpuTextureRelease(m_offscreenTexture); m_offscreenTexture = nullptr; }
+        m_offscreenWidth = m_offscreenHeight = 0;
         if (m_surface) { wgpuSurfaceRelease(m_surface); m_surface = nullptr; }
         if (m_queue) { wgpuQueueRelease(m_queue); m_queue = nullptr; }
         // m_device is owned by JS (emscripten_webgpu_get_device); do not destroy it.
@@ -208,15 +219,52 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         return m_frameView != nullptr;
     }
 
+    void WebGPURenderer::EnsureOffscreenTarget() {
+        if (m_offscreenTexture && m_offscreenWidth == m_width && m_offscreenHeight == m_height) {
+            return;
+        }
+        if (m_offscreenView) { wgpuTextureViewRelease(m_offscreenView); m_offscreenView = nullptr; }
+        if (m_offscreenTexture) { wgpuTextureRelease(m_offscreenTexture); m_offscreenTexture = nullptr; }
+        WGPUTextureDescriptor td{};
+        td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc |
+                   WGPUTextureUsage_TextureBinding;
+        td.dimension = WGPUTextureDimension_2D;
+        td.size = {m_width, m_height, 1};
+        td.format = m_format;
+        td.mipLevelCount = 1;
+        td.sampleCount = 1;
+        m_offscreenTexture = wgpuDeviceCreateTexture(m_device, &td);
+        m_offscreenView = m_offscreenTexture ? wgpuTextureCreateView(m_offscreenTexture, nullptr) : nullptr;
+        m_offscreenWidth = m_width;
+        m_offscreenHeight = m_height;
+    }
+
     void WebGPURenderer::BeginFrameIfNeeded() {
         if (m_frameActive) {
             return;
         }
-        if (!AcquireSurfaceView()) {
+        EnsureOffscreenTarget();
+        if (!m_offscreenView) {
             return;
         }
         m_encoder = wgpuDeviceCreateCommandEncoder(m_device, nullptr);
         m_frameActive = true;
+    }
+
+    void WebGPURenderer::FlushFrame() {
+        if (!m_frameActive || !m_encoder) {
+            return;
+        }
+        WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(m_encoder, nullptr);
+        wgpuQueueSubmit(m_queue, 1, &cmd);
+        wgpuCommandBufferRelease(cmd);
+        wgpuCommandEncoderRelease(m_encoder);
+        // Per-frame bind groups were referenced by the just-submitted commands.
+        for (WGPUBindGroup bg : m_frameBindGroups) { if (bg) wgpuBindGroupRelease(bg); }
+        m_frameBindGroups.clear();
+        // Keep the frame active: open a fresh encoder so subsequent draws continue
+        // accumulating into the (persistent) offscreen target.
+        m_encoder = wgpuDeviceCreateCommandEncoder(m_device, nullptr);
     }
 
     void WebGPURenderer::EndFrame() {
@@ -245,7 +293,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
 
         const auto& c = MG_State::pGLContext->GetClearColor();
         WGPURenderPassColorAttachment color{};
-        color.view = m_frameView;
+        color.view = m_offscreenView;
         color.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
         color.loadOp = WGPULoadOp_Clear;
         color.storeOp = WGPUStoreOp_Store;
@@ -265,6 +313,15 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (!m_frameActive) {
             // Nothing was recorded this frame; the browser keeps the last image.
             return;
+        }
+        // Copy the offscreen target onto the acquired swapchain texture, then submit.
+        if (AcquireSurfaceView()) {
+            WGPUTexelCopyTextureInfo src{};
+            src.texture = m_offscreenTexture;
+            WGPUTexelCopyTextureInfo dst{};
+            dst.texture = m_frameTexture;
+            WGPUExtent3D ext{m_width, m_height, 1};
+            wgpuCommandEncoderCopyTextureToTexture(m_encoder, &src, &dst, &ext);
         }
         WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(m_encoder, nullptr);
         wgpuQueueSubmit(m_queue, 1, &cmd);
@@ -529,7 +586,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
 
         WGPUTextureDescriptor td{};
-        td.usage = WGPUTextureUsage_CopyDst | WGPUTextureUsage_TextureBinding;
+        // CopySrc so glGetTexImage/glGetTextureImage can copy the texture out.
+        td.usage = WGPUTextureUsage_CopyDst | WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc;
         td.dimension = WGPUTextureDimension_2D;
         td.size = {w, h, 1};
         td.format = fmt;
@@ -629,7 +687,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
         // Draw into a Load render pass so a prior glClear is preserved.
         WGPURenderPassColorAttachment color{};
-        color.view = m_frameView;
+        color.view = m_offscreenView;
         color.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
         color.loadOp = WGPULoadOp_Load;
         color.storeOp = WGPUStoreOp_Store;
@@ -768,5 +826,193 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         wgpuRenderPassEncoderDrawIndexed(pass, static_cast<Uint32>(count), 1, 0, 0, 0);
         wgpuRenderPassEncoderEnd(pass);
         wgpuRenderPassEncoderRelease(pass);
+    }
+
+    namespace {
+        struct ReadbackState {
+            WGPUMapAsyncStatus status = static_cast<WGPUMapAsyncStatus>(0);
+        };
+        void OnBufferMapped(WGPUMapAsyncStatus status, WGPUStringView, void* ud1, void*) {
+            if (ud1) static_cast<ReadbackState*>(ud1)->status = status;
+            mobilegl_jspi_signal();
+        }
+        struct WorkDoneState {
+            WGPUQueueWorkDoneStatus status = static_cast<WGPUQueueWorkDoneStatus>(0);
+        };
+        void OnWorkDone(WGPUQueueWorkDoneStatus status, void* ud1, void*) {
+            if (ud1) static_cast<WorkDoneState*>(ud1)->status = status;
+            mobilegl_jspi_signal();
+        }
+        constexpr Uint32 AlignUp256(Uint32 v) { return (v + 255u) & ~255u; }
+    } // namespace
+
+    void WebGPURenderer::Finish() {
+        if (!m_device) {
+            return;
+        }
+        // Make sure any in-progress frame's commands are submitted, then wait.
+        if (m_frameActive) {
+            FlushFrame();
+        }
+        WorkDoneState st;
+        WGPUQueueWorkDoneCallbackInfo ci{};
+        ci.mode = WGPUCallbackMode_AllowSpontaneous;
+        ci.callback = &OnWorkDone;
+        ci.userdata1 = &st;
+        wgpuQueueOnSubmittedWorkDone(m_queue, ci);
+        mobilegl_jspi_wait(); // suspends until OnWorkDone signals
+    }
+
+    Bool WebGPURenderer::ReadTextureToCPU(WGPUTexture tex, Uint32 srcX, Uint32 srcY, Uint32 w, Uint32 h,
+                                          Bool srcIsBgra, GLenum dstFormat, Bool flipY, void* out) {
+        if (m_readbackInFlight) {
+            MGLOG_E("DirectWebGPU: reentrant readback while one is in flight; ignoring");
+            return false;
+        }
+        const Uint32 bytesPerRow = AlignUp256(w * 4u); // WebGPU requires 256B row alignment
+        const Uint64 bufSize = static_cast<Uint64>(bytesPerRow) * h;
+
+        WGPUBufferDescriptor bd{};
+        bd.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
+        bd.size = bufSize;
+        WGPUBuffer readback = wgpuDeviceCreateBuffer(m_device, &bd);
+        if (!readback) {
+            return false;
+        }
+
+        WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(m_device, nullptr);
+        WGPUTexelCopyTextureInfo src{};
+        src.texture = tex;
+        src.origin = {srcX, srcY, 0};
+        WGPUTexelCopyBufferInfo dst{};
+        dst.buffer = readback;
+        dst.layout.bytesPerRow = bytesPerRow;
+        dst.layout.rowsPerImage = h;
+        WGPUExtent3D ext{w, h, 1};
+        wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &ext);
+        WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, nullptr);
+        wgpuQueueSubmit(m_queue, 1, &cmd);
+        wgpuCommandBufferRelease(cmd);
+        wgpuCommandEncoderRelease(enc);
+
+        // Map asynchronously and block via JSPI until the callback signals.
+        ReadbackState st;
+        WGPUBufferMapCallbackInfo ci{};
+        ci.mode = WGPUCallbackMode_AllowSpontaneous;
+        ci.callback = &OnBufferMapped;
+        ci.userdata1 = &st;
+        m_readbackInFlight = true;
+        wgpuBufferMapAsync(readback, WGPUMapMode_Read, 0, bufSize, ci);
+        mobilegl_jspi_wait();
+        m_readbackInFlight = false;
+
+        Bool ok = false;
+        if (st.status == WGPUMapAsyncStatus_Success) {
+            const auto* mapped = static_cast<const Uint8*>(
+                wgpuBufferGetConstMappedRange(readback, 0, bufSize));
+            if (mapped) {
+                auto* dstBytes = static_cast<Uint8*>(out);
+                const Bool wantBgra = (dstFormat == GL_BGRA);
+                const Bool swapRB = (srcIsBgra != wantBgra);
+                for (Uint32 row = 0; row < h; ++row) {
+                    const Uint64 srcRowIdx = flipY ? (h - 1 - row) : row;
+                    const Uint8* srcRow = mapped + srcRowIdx * bytesPerRow;
+                    Uint8* dstRow = dstBytes + static_cast<Uint64>(row) * w * 4u;
+                    if (swapRB) {
+                        for (Uint32 px = 0; px < w; ++px) {
+                            dstRow[px * 4 + 0] = srcRow[px * 4 + 2];
+                            dstRow[px * 4 + 1] = srcRow[px * 4 + 1];
+                            dstRow[px * 4 + 2] = srcRow[px * 4 + 0];
+                            dstRow[px * 4 + 3] = srcRow[px * 4 + 3];
+                        }
+                    } else {
+                        std::memcpy(dstRow, srcRow, w * 4u);
+                    }
+                }
+                ok = true;
+            }
+            wgpuBufferUnmap(readback);
+        } else {
+            MGLOG_E("DirectWebGPU: buffer map failed (status=%d)", static_cast<int>(st.status));
+        }
+        wgpuBufferRelease(readback);
+        return ok;
+    }
+
+    void WebGPURenderer::ReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format,
+                                    GLenum type, void* pixels) {
+        if (!m_device || !pixels || width <= 0 || height <= 0) {
+            return;
+        }
+        if (type != GL_UNSIGNED_BYTE || (format != GL_RGBA && format != GL_BGRA)) {
+            MGLOG_E("DirectWebGPU: ReadPixels only supports GL_RGBA/GL_BGRA + GL_UNSIGNED_BYTE (got "
+                    "format=0x%x type=0x%x)", format, type);
+            return;
+        }
+        EnsureOffscreenTarget();
+        if (!m_offscreenTexture) {
+            return;
+        }
+        // Flush pending draws so the offscreen target reflects them before the copy.
+        if (m_frameActive) {
+            FlushFrame();
+        }
+        const Uint32 w = static_cast<Uint32>(width);
+        const Uint32 h = static_cast<Uint32>(height);
+        // GL's origin is bottom-left; WebGPU textures are top-left. The GL row range
+        // [y, y+h) maps to texel rows [m_height-y-h, m_height-y); rows are flipped on
+        // copy-out (flipY=true).
+        Int32 texY = static_cast<Int32>(m_height) - y - static_cast<Int32>(h);
+        if (texY < 0) texY = 0;
+        const Bool surfaceIsBgra = (m_format == WGPUTextureFormat_BGRA8Unorm ||
+                                    m_format == WGPUTextureFormat_BGRA8UnormSrgb);
+        ReadTextureToCPU(m_offscreenTexture, static_cast<Uint32>(x), static_cast<Uint32>(texY), w, h,
+                         surfaceIsBgra, format, /*flipY=*/true, pixels);
+    }
+
+    void WebGPURenderer::GetTextureImage(MG_State::GLState::ITextureObject& texture,
+                                         TextureUploadTarget uploadTarget, GLint level, GLenum format,
+                                         GLenum type, GLsizei bufSize, void* pixels) {
+        if (!m_device || !pixels) {
+            return;
+        }
+        if (type != GL_UNSIGNED_BYTE || (format != GL_RGBA && format != GL_BGRA)) {
+            MGLOG_E("DirectWebGPU: GetTextureImage only supports GL_RGBA/GL_BGRA + GL_UNSIGNED_BYTE");
+            return;
+        }
+        if (level != 0 || uploadTarget != TextureUploadTarget::Texture2D) {
+            MGLOG_E("DirectWebGPU: GetTextureImage only supports 2D level 0 for now");
+            return;
+        }
+        const WgpuTexture* wt = GetOrCreateTexture(texture);
+        if (!wt || !wt->texture) {
+            return;
+        }
+        const Uint32 w = wt->width, h = wt->height;
+        if (static_cast<Uint64>(w) * h * 4u > static_cast<Uint64>(bufSize > 0 ? bufSize : INT32_MAX)) {
+            MGLOG_E("DirectWebGPU: GetTextureImage bufSize too small (%d)", bufSize);
+            return;
+        }
+        // Texture data is returned in texture order (top-to-bottom): no flip. Our
+        // texture formats (RGBA8/SRGB8Alpha8) are RGBA-order, so srcIsBgra=false.
+        ReadTextureToCPU(wt->texture, 0, 0, w, h, /*srcIsBgra=*/false, format, /*flipY=*/false, pixels);
+    }
+
+    void WebGPURenderer::GetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void* pixels) {
+        if (!MG_State::pGLContext) {
+            return;
+        }
+        if (target != GL_TEXTURE_2D) {
+            MGLOG_E("DirectWebGPU: GetTexImage only supports GL_TEXTURE_2D for now (got 0x%x)", target);
+            return;
+        }
+        auto bound = MG_State::pGLContext->GetTextureUnitObject(MG_State::pGLContext->GetActiveTextureUnit())
+                         .GetBindingSlot(TextureTarget::Texture2D)
+                         .GetBoundObject();
+        if (!bound) {
+            MGLOG_E("DirectWebGPU: GetTexImage with no texture bound to GL_TEXTURE_2D");
+            return;
+        }
+        GetTextureImage(*bound, TextureUploadTarget::Texture2D, level, format, type, INT32_MAX, pixels);
     }
 } // namespace MobileGL::MG_Backend::DirectWebGPU

@@ -7,6 +7,7 @@
 // End of Source File Header
 
 #include <Includes.h>
+#include <MG_Backend/BackendObjects.h>
 #include "../Buffer/GL_Buffer.h"
 #include "../Getter/GL_Getter.h"
 #include "../Sampler/GL_Sampler.h"
@@ -105,7 +106,14 @@ DECLARE_GL_FUNCTION_HEAD(void, DrawArrays, GLenum mode, GLint first, GLsizei cou
 DECLARE_GL_FUNCTION_HEAD(void, DrawElements, GLenum mode, GLsizei count, GLenum type, const void* indices) DECLARE_GL_FUNCTION_END_NO_RETURN(void, DrawElements, mode, count, type, indices)
 DECLARE_GL_FUNCTION_HEAD(void, Enable, GLenum cap) DECLARE_GL_FUNCTION_END_NO_RETURN(void, Enable, cap)
 DECLARE_GL_FUNCTION_HEAD(void, EnableVertexAttribArray, GLuint index) DECLARE_GL_FUNCTION_END_NO_RETURN(void, EnableVertexAttribArray, index)
-MOBILEGL_GL_API void glFinish() { MGLOG_D("Implementing function: %s(...)", __FUNCTION__); }
+MOBILEGL_GL_API void glFinish() {
+    MGLOG_D("Implementing function: %s(...)", __FUNCTION__);
+    // Backends that need to synchronize (e.g. WebGPU readback) provide Finish;
+    // others leave it null and glFinish stays a no-op.
+    if (MobileGL::MG_Backend::gBackendFunctionsTable.GL.Finish) {
+        MobileGL::MG_Backend::gBackendFunctionsTable.GL.Finish();
+    }
+}
 MOBILEGL_GL_API void glFlush() { MGLOG_D("Implementing function: %s(...)", __FUNCTION__); }
 DECLARE_GL_FUNCTION_HEAD(void, FramebufferRenderbuffer, GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) DECLARE_GL_FUNCTION_END_NO_RETURN(void, FramebufferRenderbuffer, target, attachment, renderbuffertarget, renderbuffer)
 DECLARE_GL_FUNCTION_HEAD(void, FramebufferTexture2D, GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) DECLARE_GL_FUNCTION_END_NO_RETURN(void, FramebufferTexture2D, target, attachment, textarget, texture, level)

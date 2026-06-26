@@ -8,6 +8,7 @@
 
 #pragma once
 #include <Includes.h>
+#include <MG_State/GLState/TextureState/TextureEnum.h>
 #include "../WgpuApi.h"
 
 namespace MobileGL::MG_State::GLState {
@@ -39,6 +40,19 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         void DrawArrays(GLenum mode, GLint first, GLsizei count);
         void DrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices);
         void Present();
+        // Synchronous readback of the default framebuffer (the offscreen color
+        // target). Blocks the caller via JSPI until the GPU copy is mapped. Must be
+        // reached from a WebAssembly.promising entry (the host swapBuffers path, or
+        // the standalone harness' wrapped export).
+        void ReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type,
+                        void* pixels);
+        // Synchronous texture readback (glGetTexImage / glGetTextureImage). Same JSPI
+        // path as ReadPixels but reads a texture's own pixels (no framebuffer flip).
+        void GetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void* pixels);
+        void GetTextureImage(MG_State::GLState::ITextureObject& texture, TextureUploadTarget uploadTarget,
+                             GLint level, GLenum format, GLenum type, GLsizei bufSize, void* pixels);
+        // Blocks (via JSPI) until all submitted GPU work has completed.
+        void Finish();
 
         WGPUDevice GetDevice() const { return m_device; }
         Bool IsInitialized() const { return m_device != nullptr; }
@@ -80,6 +94,20 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         void BeginFrameIfNeeded();
         Bool AcquireSurfaceView();
         void EndFrame();
+        // (Re)creates the offscreen color target at the current canvas size. All
+        // clears/draws render here; Present copies it to the swapchain texture. This
+        // keeps a stable, copyable image for ReadPixels (canvas textures aren't
+        // readable after present).
+        void EnsureOffscreenTarget();
+        // Finishes + submits the in-progress command encoder and opens a fresh one,
+        // so already-recorded draws land in the offscreen target before a readback.
+        void FlushFrame();
+        // Shared readback core: copies an RGBA8-family region of `tex` into `out`
+        // (4 bytes/texel) via copyTextureToBuffer + an async map blocked on JSPI.
+        // `flipY` reverses rows (framebuffer origin); `srcIsBgra` vs `dstFormat`
+        // (GL_RGBA/GL_BGRA) decides an R/B swap. Returns false on failure.
+        Bool ReadTextureToCPU(WGPUTexture tex, Uint32 srcX, Uint32 srcY, Uint32 w, Uint32 h,
+                              Bool srcIsBgra, GLenum dstFormat, Bool flipY, void* out);
 
         const WgpuProgram* GetOrCreateProgram(MG_State::GLState::ProgramObject& program);
         const WgpuPipeline* GetOrCreatePipeline(MG_State::GLState::ProgramObject& program,
@@ -121,6 +149,15 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // Bind groups reference runtime resources (textures/UBO contents), so they are
         // rebuilt each draw and released at frame end.
         Vector<WGPUBindGroup> m_frameBindGroups;
+
+        // Persistent offscreen color target: all rendering goes here, then Present
+        // copies it to the acquired swapchain texture. ReadPixels copies from it.
+        WGPUTexture m_offscreenTexture = nullptr;
+        WGPUTextureView m_offscreenView = nullptr;
+        Uint32 m_offscreenWidth = 0;
+        Uint32 m_offscreenHeight = 0;
+        // Guards against reentrant readback while a JSPI suspension is in flight.
+        Bool m_readbackInFlight = false;
 
         // Per-frame transient state (valid only between BeginFrameIfNeeded and Present)
         WGPUCommandEncoder m_encoder = nullptr;

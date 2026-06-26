@@ -8,6 +8,11 @@
 
 #pragma once
 #include <Includes.h>
+#include "MG_State/GLState/TextureState/TextureEnum.h"
+
+namespace MobileGL::MG_State::GLState {
+    class ITextureObject;
+} // namespace MobileGL::MG_State::GLState
 
 namespace MobileGL::MG_Backend::DirectWebGPU {
     class WebGPURenderer;
@@ -20,5 +25,12 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     void Clear(GLbitfield mask);
     void DrawArrays(GLenum mode, GLint first, GLsizei count);
     void DrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices);
+    void ReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type,
+                    void* pixels);
+    void GetTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLvoid* pixels);
+    void GetTextureImage(const SharedPtr<MG_State::GLState::ITextureObject>& texture,
+                         TextureUploadTarget uploadTarget, GLint level, GLenum format, GLenum type,
+                         GLsizei bufSize, GLvoid* pixels);
+    void Finish();
     void Present();
 } // namespace MobileGL::MG_Backend::DirectWebGPU

@@ -136,6 +136,9 @@ namespace MobileGL {
             void (*GenerateMipmap)(GLenum target);
             void (*ReadPixels)(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type,
                                void* pixels);
+            // Optional: blocks until all submitted GPU work completes (glFinish).
+            // Null for backends that treat glFinish as a no-op.
+            void (*Finish)();
             void (*GetTexImage)(GLenum target, GLint level, GLenum format, GLenum type, GLvoid* pixels);
             void (*GetTextureImage)(const SharedPtr<MG_State::GLState::ITextureObject>& texture,
                                     TextureUploadTarget uploadTarget, GLint level, GLenum format, GLenum type,

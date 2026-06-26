@@ -574,8 +574,17 @@ if (EMSCRIPTEN)
         endforeach()
         target_link_options(mobilegl_web_harness PRIVATE
             ${_emdawn_js_flags}
+            # JSPI suspend shim for synchronous glReadPixels/glFinish (M4).
+            "--js-library=${CMAKE_SOURCE_DIR}/MobileGL/MG_Backend/DirectWebGPU/lib_mobilegl_webgpu.js"
             "-sWASM_BIGINT" "-sSTACK_SIZE=16MB" "-sALLOW_MEMORY_GROWTH=1" "-sEXIT_RUNTIME=0"
             "-sEXPORTED_RUNTIME_METHODS=addRunDependency,removeRunDependency"
+            # Keep main + the JSPI-wrapped readback entry in wasmExports so the shell
+            # can drive it through WebAssembly.promising.
+            "-sEXPORTED_FUNCTIONS=_main,_harness_readback"
+            # Synchronous instantiation assigns exports eagerly (no lazy JS wrapper),
+            # so Module['_harness_readback'] is the raw WebAssembly export that
+            # WebAssembly.promising requires.
+            "-sWASM_ASYNC_COMPILATION=0"
             "--shell-file=${CMAKE_SOURCE_DIR}/tools/web_harness/shell.html")
         set_target_properties(mobilegl_web_harness PROPERTIES SUFFIX ".html")
     endif()

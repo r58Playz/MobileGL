@@ -30,6 +30,33 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
     }
 
+    void ReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type,
+                    void* pixels) {
+        if (pWebGPURenderer) {
+            pWebGPURenderer->ReadPixels(x, y, width, height, format, type, pixels);
+        }
+    }
+
+    void GetTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLvoid* pixels) {
+        if (pWebGPURenderer) {
+            pWebGPURenderer->GetTexImage(target, level, format, type, pixels);
+        }
+    }
+
+    void GetTextureImage(const SharedPtr<MG_State::GLState::ITextureObject>& texture,
+                         TextureUploadTarget uploadTarget, GLint level, GLenum format, GLenum type,
+                         GLsizei bufSize, GLvoid* pixels) {
+        if (pWebGPURenderer && texture) {
+            pWebGPURenderer->GetTextureImage(*texture, uploadTarget, level, format, type, bufSize, pixels);
+        }
+    }
+
+    void Finish() {
+        if (pWebGPURenderer) {
+            pWebGPURenderer->Finish();
+        }
+    }
+
     void Present() {
         if (pWebGPURenderer) {
             pWebGPURenderer->Present();
