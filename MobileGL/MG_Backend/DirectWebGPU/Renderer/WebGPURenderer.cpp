@@ -16,6 +16,7 @@
 #include <MG_State/GLState/TextureState/TextureObject.h>
 #include <MG_State/GLState/TextureState/TextureEnum.h>
 #include <MG_State/GLState/SamplerState/SamplerObject.h>
+#include <MG_State/GLState/FramebufferState/FramebufferObject.h>
 #include "MG_Util/ShaderTranspiler/WgslTranspiler.h"
 #include <emscripten/html5.h>
 #include <spirv_reflect.h>
@@ -262,6 +263,11 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (m_offscreenTexture) { wgpuTextureRelease(m_offscreenTexture); m_offscreenTexture = nullptr; }
         if (m_depthView) { wgpuTextureViewRelease(m_depthView); m_depthView = nullptr; }
         if (m_depthTexture) { wgpuTextureRelease(m_depthTexture); m_depthTexture = nullptr; }
+        for (auto& [k, fd] : m_fboDepthCache) {
+            if (fd.view) wgpuTextureViewRelease(fd.view);
+            if (fd.texture) wgpuTextureRelease(fd.texture);
+        }
+        m_fboDepthCache.clear();
         m_offscreenWidth = m_offscreenHeight = 0;
         if (m_surface) { wgpuSurfaceRelease(m_surface); m_surface = nullptr; }
         if (m_queue) { wgpuQueueRelease(m_queue); m_queue = nullptr; }
@@ -314,6 +320,73 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
 
         m_offscreenWidth = m_width;
         m_offscreenHeight = m_height;
+    }
+
+    WGPUTextureView WebGPURenderer::GetOrCreateFboDepth(const MG_State::GLState::FramebufferObject& fbo,
+                                                        Uint32 w, Uint32 h) {
+        auto it = m_fboDepthCache.find(&fbo);
+        if (it != m_fboDepthCache.end()) {
+            if (it->second.width == w && it->second.height == h) {
+                return it->second.view;
+            }
+            if (it->second.view) wgpuTextureViewRelease(it->second.view);
+            if (it->second.texture) wgpuTextureRelease(it->second.texture);
+            m_fboDepthCache.erase(it);
+        }
+        WGPUTextureDescriptor dd{};
+        dd.usage = WGPUTextureUsage_RenderAttachment;
+        dd.dimension = WGPUTextureDimension_2D;
+        dd.size = {w, h, 1};
+        dd.format = kDepthFormat;
+        dd.mipLevelCount = 1;
+        dd.sampleCount = 1;
+        FboDepth fd;
+        fd.texture = wgpuDeviceCreateTexture(m_device, &dd);
+        fd.view = fd.texture ? wgpuTextureCreateView(fd.texture, nullptr) : nullptr;
+        fd.width = w;
+        fd.height = h;
+        auto [ins, ok] = m_fboDepthCache.emplace(&fbo, fd);
+        return ins->second.view;
+    }
+
+    Bool WebGPURenderer::ResolveDrawTarget() {
+        auto* gl = MG_State::pGLContext.get();
+        const auto& fbo = gl->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
+        if (!fbo || fbo->IsDefaultFramebuffer()) {
+            EnsureOffscreenTarget();
+            if (!m_offscreenView) {
+                return false;
+            }
+            m_curColorView = m_offscreenView;
+            m_curDepthView = m_depthView;
+            m_curColorFormat = m_format;
+            m_curWidth = m_width;
+            m_curHeight = m_height;
+            m_curIsDefault = true;
+            return true;
+        }
+        // User FBO: single texture color attachment 0 (renderbuffer/MRT not supported yet).
+        const auto& color0 = fbo->GetAttachment(FramebufferAttachmentType::Color0);
+        if (!color0.IsValid() || color0.IsEmpty() || !color0.IsTexture()) {
+            MGLOG_E("DirectWebGPU: FBO %u lacks a texture color attachment 0 (renderbuffer/MRT unsupported)",
+                    fbo->GetExternalIndex());
+            return false;
+        }
+        const WgpuTexture* wt = GetOrCreateTexture(*color0.GetTexture());
+        if (!wt || !wt->view) {
+            return false;
+        }
+        m_curColorView = wt->view;
+        m_curColorFormat = wt->format;
+        m_curWidth = wt->width;
+        m_curHeight = wt->height;
+        m_curIsDefault = false;
+        // Depth/stencil attachment -> a transient depth buffer (contents not sampled yet).
+        const auto& depthAtt = fbo->GetAttachment(FramebufferAttachmentType::Depth);
+        m_curDepthView = (depthAtt.IsValid() && !depthAtt.IsEmpty())
+                             ? GetOrCreateFboDepth(*fbo, wt->width, wt->height)
+                             : nullptr;
+        return true;
     }
 
     void WebGPURenderer::BeginFrameIfNeeded() {
@@ -373,11 +446,16 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             return;
         }
         auto* gl = MG_State::pGLContext.get();
+        if (!ResolveDrawTarget()) {
+            return;
+        }
+        // A depth clear only applies if the current target actually has depth.
+        const Bool doDepth = clearDepth && m_curDepthView != nullptr;
 
         WGPURenderPassColorAttachment color{};
         if (clearColor) {
             const auto& c = gl->GetClearColor();
-            color.view = m_offscreenView;
+            color.view = m_curColorView;
             color.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
             color.loadOp = WGPULoadOp_Clear;
             color.storeOp = WGPUStoreOp_Store;
@@ -386,8 +464,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
 
         WGPURenderPassDepthStencilAttachment depth{};
-        if (clearDepth) {
-            depth.view = m_depthView;
+        if (doDepth) {
+            depth.view = m_curDepthView;
             depth.depthLoadOp = WGPULoadOp_Clear;
             depth.depthStoreOp = WGPUStoreOp_Store;
             depth.depthClearValue = gl->GetClearDepth();
@@ -396,7 +474,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         WGPURenderPassDescriptor rp{};
         rp.colorAttachmentCount = clearColor ? 1 : 0;
         rp.colorAttachments = clearColor ? &color : nullptr;
-        rp.depthStencilAttachment = clearDepth ? &depth : nullptr;
+        rp.depthStencilAttachment = doDepth ? &depth : nullptr;
 
         WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(m_encoder, &rp);
         wgpuRenderPassEncoderEnd(pass);
@@ -554,7 +632,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                 (static_cast<Uint64>(dA) << 24) | (static_cast<Uint64>(eC) << 32) |
                 (static_cast<Uint64>(eA) << 40));
         }
-        mix(static_cast<Uint64>(m_format));
+        // Current draw target: color format + whether it has a depth attachment (both
+        // baked into the pipeline by WebGPU).
+        mix(static_cast<Uint64>(m_curColorFormat));
+        mix(m_curDepthView != nullptr ? 1 : 0);
         return key;
     }
 
@@ -607,7 +688,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // Color target: write mask + (optional) blend, from GL state.
         const auto cmask = gl->GetColorMask();
         WGPUColorTargetState colorTarget{};
-        colorTarget.format = m_format;
+        colorTarget.format = m_curColorFormat;
         colorTarget.writeMask = (cmask.r() ? WGPUColorWriteMask_Red : 0u) |
                                 (cmask.g() ? WGPUColorWriteMask_Green : 0u) |
                                 (cmask.b() ? WGPUColorWriteMask_Blue : 0u) |
@@ -629,8 +710,9 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         fragment.targetCount = 1;
         fragment.targets = &colorTarget;
 
-        // Depth-stencil: a depth target is always attached, so always declare a state.
+        // Depth-stencil: declared only if the current target has a depth attachment.
         // depthWrite only when the test is on (GL doesn't write depth with the test off).
+        const Bool hasDepth = (m_curDepthView != nullptr);
         const Bool depthTest = gl->IsCapabilityEnabled(CapabilityInput::DepthTest);
         WGPUDepthStencilState depthState{};
         depthState.format = kDepthFormat;
@@ -652,7 +734,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         desc.primitive.cullMode =
             gl->IsCapabilityEnabled(CapabilityInput::CullFace) ? ToCullMode(gl->GetCullFaceMode())
                                                                : WGPUCullMode_None;
-        desc.depthStencil = &depthState;
+        desc.depthStencil = hasDepth ? &depthState : nullptr;
         desc.multisample.count = 1;
         desc.multisample.mask = 0xFFFFFFFFu;
         desc.fragment = &fragment;
@@ -754,8 +836,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
 
         WGPUTextureDescriptor td{};
-        // CopySrc so glGetTexImage/glGetTextureImage can copy the texture out.
-        td.usage = WGPUTextureUsage_CopyDst | WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc;
+        // RenderAttachment so a texture can also be an FBO color attachment;
+        // CopySrc so glGetTexImage/glGetTextureImage can copy it out.
+        td.usage = WGPUTextureUsage_CopyDst | WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc |
+                   WGPUTextureUsage_RenderAttachment;
         td.dimension = WGPUTextureDimension_2D;
         td.size = {w, h, 1};
         td.format = fmt;
@@ -765,10 +849,9 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (!tex) {
             return nullptr;
         }
-        if (!UploadTextureLevel0(tex, *mip, w, h)) {
-            wgpuTextureRelease(tex);
-            return nullptr;
-        }
+        // Upload level-0 CPU data if present; FBO attachments allocated without data
+        // (glTexImage2D NULL) just stay zero-initialized and get rendered into.
+        UploadTextureLevel0(tex, *mip, w, h);
         mip->MarkStorageDirty(target, 0, false);
 
         WgpuTexture wt;
@@ -849,37 +932,45 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     WGPURenderPassEncoder WebGPURenderer::BeginDrawPass(MG_State::GLState::ProgramObject& program,
                                                         const MG_State::GLState::VertexArrayObject& vao,
                                                         GLenum mode) {
+        // Resolve the draw target first: the pipeline (color format + has-depth) and the
+        // pass attachments both depend on it.
+        if (!ResolveDrawTarget()) {
+            return nullptr;
+        }
         const WgpuPipeline* p = GetOrCreatePipeline(program, vao, mode);
         if (!p) {
             return nullptr;
         }
         // Draw into a Load render pass so a prior glClear is preserved. The depth
-        // target is always attached (every pipeline declares a depthStencil state);
-        // depthReadOnly when nothing writes it would require knowing every pipeline in
-        // the pass, so keep it writable and rely on per-pipeline depthWriteEnabled.
+        // attachment is present only if the current target has one (matching the
+        // pipeline's depthStencil state).
         WGPURenderPassColorAttachment color{};
-        color.view = m_offscreenView;
+        color.view = m_curColorView;
         color.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
         color.loadOp = WGPULoadOp_Load;
         color.storeOp = WGPUStoreOp_Store;
         WGPURenderPassDepthStencilAttachment depth{};
-        depth.view = m_depthView;
-        depth.depthLoadOp = WGPULoadOp_Load;
-        depth.depthStoreOp = WGPUStoreOp_Store;
+        const Bool hasDepth = (m_curDepthView != nullptr);
+        if (hasDepth) {
+            depth.view = m_curDepthView;
+            depth.depthLoadOp = WGPULoadOp_Load;
+            depth.depthStoreOp = WGPUStoreOp_Store;
+        }
         WGPURenderPassDescriptor rp{};
         rp.colorAttachmentCount = 1;
         rp.colorAttachments = &color;
-        rp.depthStencilAttachment = &depth;
+        rp.depthStencilAttachment = hasDepth ? &depth : nullptr;
 
         WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(m_encoder, &rp);
         wgpuRenderPassEncoderSetPipeline(pass, p->pipeline);
 
-        // Viewport (GL bottom-left origin -> WebGPU top-left). Only when the app set a
-        // non-empty viewport; otherwise WebGPU's default covers the whole target.
+        // Viewport (GL bottom-left origin -> WebGPU top-left, against the target height).
+        // Only when the app set a non-empty viewport; otherwise WebGPU's default covers
+        // the whole target.
         auto* gl = MG_State::pGLContext.get();
         const auto& vp = gl->GetViewport();
         if (vp.z() > 0 && vp.w() > 0) {
-            const float vy = static_cast<float>(m_height) - static_cast<float>(vp.y()) -
+            const float vy = static_cast<float>(m_curHeight) - static_cast<float>(vp.y()) -
                              static_cast<float>(vp.w());
             wgpuRenderPassEncoderSetViewport(pass, static_cast<float>(vp.x()), vy,
                                              static_cast<float>(vp.z()), static_cast<float>(vp.w()), 0.0f,
@@ -889,7 +980,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (gl->IsCapabilityEnabled(CapabilityInput::ScissorTest)) {
             const auto& sc = gl->GetScissorBox();
             if (sc.z() > 0 && sc.w() > 0) {
-                Int32 sy = static_cast<Int32>(m_height) - sc.y() - sc.w();
+                Int32 sy = static_cast<Int32>(m_curHeight) - sc.y() - sc.w();
                 if (sy < 0) sy = 0;
                 wgpuRenderPassEncoderSetScissorRect(pass, static_cast<Uint32>(sc.x() < 0 ? 0 : sc.x()),
                                                     static_cast<Uint32>(sy), static_cast<Uint32>(sc.z()),

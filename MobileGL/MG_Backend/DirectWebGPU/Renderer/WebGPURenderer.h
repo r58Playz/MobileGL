@@ -18,6 +18,7 @@ namespace MobileGL::MG_State::GLState {
     class ITextureObject;
     class TextureObjectMipmap;
     class SamplerObject;
+    class FramebufferObject;
 } // namespace MobileGL::MG_State::GLState
 
 namespace MobileGL::MG_Backend::DirectWebGPU {
@@ -108,6 +109,14 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // Finishes + submits the in-progress command encoder and opens a fresh one,
         // so already-recorded draws land in the offscreen target before a readback.
         void FlushFrame();
+        // Resolves the bound draw framebuffer into the current draw target (m_cur*).
+        // Default framebuffer -> the offscreen color+depth; a user FBO -> its color
+        // attachment texture (+ a transient depth texture if it has a depth attachment).
+        // Returns false if the target can't be resolved (e.g. incomplete FBO).
+        Bool ResolveDrawTarget();
+        // Transient depth buffer for a user FBO (cached, recreated on size change).
+        WGPUTextureView GetOrCreateFboDepth(const MG_State::GLState::FramebufferObject& fbo, Uint32 w,
+                                            Uint32 h);
         // Shared readback core: copies an RGBA8-family region of `tex` into `out`
         // (4 bytes/texel) via copyTextureToBuffer + an async map blocked on JSPI.
         // `flipY` reverses rows (framebuffer origin); `srcIsBgra` vs `dstFormat`
@@ -173,11 +182,30 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         WGPUTextureView m_offscreenView = nullptr;
         Uint32 m_offscreenWidth = 0;
         Uint32 m_offscreenHeight = 0;
-        // Companion depth target (always attached to draw passes so every pipeline can
-        // declare a matching depthStencil state; depth-only used for now, no stencil).
+        // Companion depth target for the default framebuffer (depth-only, no stencil).
         WGPUTexture m_depthTexture = nullptr;
         WGPUTextureView m_depthView = nullptr;
         static constexpr WGPUTextureFormat kDepthFormat = WGPUTextureFormat_Depth24Plus;
+
+        // Current draw target, resolved per Clear/draw from the bound draw FBO. For the
+        // default FB these alias the offscreen; for a user FBO they point at its
+        // attachments. Pipelines (color format + has-depth) are keyed off these.
+        WGPUTextureView m_curColorView = nullptr;
+        WGPUTextureView m_curDepthView = nullptr; // null => target has no depth
+        WGPUTextureFormat m_curColorFormat = WGPUTextureFormat_BGRA8Unorm;
+        Uint32 m_curWidth = 0;
+        Uint32 m_curHeight = 0;
+        Bool m_curIsDefault = true;
+
+        // Transient depth buffers for user FBOs that have a depth attachment (the depth
+        // contents themselves aren't sampled yet — shadow maps are a follow-up).
+        struct FboDepth {
+            WGPUTexture texture = nullptr;
+            WGPUTextureView view = nullptr;
+            Uint32 width = 0;
+            Uint32 height = 0;
+        };
+        UnorderedMap<const MG_State::GLState::FramebufferObject*, FboDepth> m_fboDepthCache;
         // Guards against reentrant readback while a JSPI suspension is in flight.
         Bool m_readbackInFlight = false;
 
