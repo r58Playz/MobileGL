@@ -337,6 +337,8 @@ if (EMSCRIPTEN)
     )
     list(APPEND SOURCE_FILES
         MobileGL/MG_Backend/DirectWebGPU/BackendObject_DirectWebGPU.cpp
+        MobileGL/MG_Backend/DirectWebGPU/DirectWebGPU.cpp
+        MobileGL/MG_Backend/DirectWebGPU/Renderer/WebGPURenderer.cpp
         MobileGL/MG_Util/ShaderTranspiler/WgslTranspiler.cpp
         ${EMDAWNWEBGPU_WEBGPU_CPP}
     )
@@ -557,5 +559,24 @@ if (NOT ANDROID)
     if (MOBILEGL_BUILD_TRACE_REPLAY)
         enable_testing()
         add_subdirectory(tools/trace_replay)
+    endif()
+endif()
+
+if (EMSCRIPTEN)
+    # Standalone DirectWebGPU web harness (drives the real GL/EGL frontend in-browser).
+    option(MOBILEGL_BUILD_WEB_HARNESS "Build the standalone DirectWebGPU web harness" OFF)
+    if (MOBILEGL_BUILD_WEB_HARNESS)
+        add_executable(mobilegl_web_harness ${CMAKE_SOURCE_DIR}/tools/web_harness/main.cpp)
+        target_link_libraries(mobilegl_web_harness PRIVATE ${CMAKE_PROJECT_NAME})
+        set(_emdawn_js_flags)
+        foreach(_js ${EMDAWNWEBGPU_JS_LIBRARIES})
+            list(APPEND _emdawn_js_flags "--js-library=${_js}")
+        endforeach()
+        target_link_options(mobilegl_web_harness PRIVATE
+            ${_emdawn_js_flags}
+            "-sWASM_BIGINT" "-sSTACK_SIZE=16MB" "-sALLOW_MEMORY_GROWTH=1" "-sEXIT_RUNTIME=0"
+            "-sEXPORTED_RUNTIME_METHODS=addRunDependency,removeRunDependency"
+            "--shell-file=${CMAKE_SOURCE_DIR}/tools/web_harness/shell.html")
+        set_target_properties(mobilegl_web_harness PROPERTIES SUFFIX ".html")
     endif()
 endif()

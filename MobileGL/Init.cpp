@@ -69,7 +69,7 @@ namespace MobileGL {
         DestroyImpl(true);
     }
 
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__) || defined(__EMSCRIPTEN__)
     __attribute__((constructor)) static void AutoInit() {
         Initialize();
     }

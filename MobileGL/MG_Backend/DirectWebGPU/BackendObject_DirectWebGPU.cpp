@@ -7,21 +7,28 @@
 // End of Source File Header
 
 #include "BackendObject_DirectWebGPU.h"
+#include "DirectWebGPU.h"
+#include "Renderer/WebGPURenderer.h"
 
 namespace MobileGL::MG_Backend::DirectWebGPU {
-    BackendObject_DirectWebGPU::~BackendObject_DirectWebGPU() = default;
+    BackendObject_DirectWebGPU::~BackendObject_DirectWebGPU() {
+        pWebGPURenderer.reset();
+    }
 
     void BackendObject_DirectWebGPU::Initialize() {
-        // M0 stub: no device/surface yet. Just populate identity strings so that
-        // LogBackendInfo() and GetProcAddress-driven queries have something sane.
-        m_rendererInfo.RendererName = "MobileGL (DirectWebGPU stub)";
+        m_rendererInfo.RendererName = "MobileGL (DirectWebGPU)";
         m_rendererInfo.BackendName = "WebGPU";
         m_rendererInfo.RendererGLInfo.TargetGLVersion.Major = 3;
         m_rendererInfo.RendererGLInfo.TargetGLVersion.Minor = 3;
         m_rendererInfo.RendererGLInfo.TargetGLSLVersion.Major = 3;
         m_rendererInfo.RendererGLInfo.TargetGLSLVersion.Minor = 30;
         m_rendererInfo.RendererGLInfo.IsCompatibilityProfile = false;
-        MGLOG_W("DirectWebGPU backend is a stub (M0); no rendering is performed yet");
+
+        // Wire the function table. M2a implements clear + present; the remaining
+        // GL entry points arrive with the draw path in M2b.
+        m_backendFunctions = {};
+        m_backendFunctions.Present = &DirectWebGPU::Present;
+        m_backendFunctions.GL.Clear = &DirectWebGPU::Clear;
     }
 
     Bool BackendObject_DirectWebGPU::InitCapabilities() {
@@ -29,6 +36,13 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     }
 
     Bool BackendObject_DirectWebGPU::InitWindowSurface() {
+        // TODO(M3): thread the canvas selector through WindowHandle; default for now.
+        pWebGPURenderer = MakeUnique<WebGPURenderer>();
+        if (!pWebGPURenderer->Initialize("#canvas")) {
+            MGLOG_E("DirectWebGPU: failed to initialize WebGPU renderer");
+            pWebGPURenderer.reset();
+            return false;
+        }
         return true;
     }
 
