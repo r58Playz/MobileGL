@@ -49,12 +49,18 @@ namespace MobileGL::MG_Backend {
         MGLOG_D("Initializing MobileGL Backend...");
 
         switch (MG_Config::ActiveBackendType) {
+#ifdef __EMSCRIPTEN__
+        case BackendType::DirectWebGPU:
+            pActiveBackendObject = MakeUnique<DirectWebGPU::BackendObject_DirectWebGPU>();
+            break;
+#else
         case BackendType::DirectGLES:
             pActiveBackendObject = MakeUnique<DirectGLES::BackendObject_DirectGLES>();
             break;
         case BackendType::DirectVulkan:
             pActiveBackendObject = MakeUnique<DirectVulkan::BackendObject_DirectVulkan>();
             break;
+#endif
         case BackendType::Unknown:
         default:
             MGLOG_W("Unknown backend type, defaulting to unknown backend");

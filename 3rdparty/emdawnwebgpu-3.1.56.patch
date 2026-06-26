@@ -1,0 +1,11 @@
+--- a/webgpu/src/library_webgpu.js
++++ b/webgpu/src/library_webgpu.js
+@@ -178,7 +178,7 @@
+     {{{ gpu.makeImportJsObject('TextureView') }}}
+ 
+     // TODO(crbug.com/42241415): Remove this after verifying that it's not used and/or updating users.
+-    errorCallback__deps: ['$stackSave', '$stackRestore', '$stringToUTF8OnStack'],
++    errorCallback__deps: ['stackSave', 'stackRestore', '$stringToUTF8OnStack'],
+     errorCallback: (callback, type, message, userdata) => {
+       var sp = stackSave();
+       var messagePtr = stringToUTF8OnStack(message);

@@ -62,7 +62,12 @@ namespace MobileGL::MG_ConfigLoader {
 
     inline void InitBackendType() {
         String backendTypeStr;
-        QueryEnvVariable("MOBILEGL_BACKEND_TYPE", backendTypeStr, "DirectGLES");
+#ifdef __EMSCRIPTEN__
+        constexpr const char* kDefaultBackend = "DirectWebGPU";
+#else
+        constexpr const char* kDefaultBackend = "DirectGLES";
+#endif
+        QueryEnvVariable("MOBILEGL_BACKEND_TYPE", backendTypeStr, kDefaultBackend);
 #define ENTRY(backendType)                                                                                             \
     if (backendTypeStr == #backendType) {                                                                              \
         MG_Config::ActiveBackendType = BackendType::backendType;                                                       \
@@ -71,6 +76,7 @@ namespace MobileGL::MG_ConfigLoader {
     }
         ENTRY(DirectGLES)
         ENTRY(DirectVulkan)
+        ENTRY(DirectWebGPU)
         ENTRY(Unknown)
         MG_Config::ActiveBackendType = BackendType::Unknown;
 #undef ENTRY

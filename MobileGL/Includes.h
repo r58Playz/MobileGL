@@ -104,6 +104,7 @@
 #include <android/native_window.h>
 #endif
 
+#ifndef __EMSCRIPTEN__
 #ifdef __ANDROID__
 #define VK_USE_PLATFORM_ANDROID_KHR
 #elif _WIN32
@@ -136,6 +137,14 @@ typedef unsigned long VisualID;
 #pragma pop_macro("None")
 #pragma pop_macro("Bool")
 #endif
+#else // __EMSCRIPTEN__
+// WebGPU backend: vendored emdawnwebgpu bindings (new standardized webgpu.h),
+// added to the include path via -isystem 3rdparty/emdawnwebgpu_pkg/webgpu/include.
+// Also declares emscripten_webgpu_get_device().
+#include <webgpu/webgpu.h>
+#include <emscripten.h>
+#include <emscripten/html5.h>
+#endif // __EMSCRIPTEN__
 
 #ifdef TRACY_ENABLE
 #include <tracy/Tracy.hpp>

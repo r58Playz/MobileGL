@@ -9,8 +9,12 @@
 #pragma once
 #include <Includes.h>
 #include "BackendObject.h"
+#ifdef __EMSCRIPTEN__
+#include "DirectWebGPU/BackendObject_DirectWebGPU.h"
+#else
 #include "DirectGLES/BackendObject_DirectGLES.h"
 #include "DirectVulkan/BackendObject_DirectVulkan.h"
+#endif
 
 namespace MobileGL::MG_Backend {
     extern UniquePtr<BackendObject> pActiveBackendObject;

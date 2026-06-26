@@ -118,10 +118,18 @@ set(SPIRV_REFLECT_INSTALL        OFF CACHE BOOL "Whether to install" FORCE)
 # add_subdirectory(3rdparty/DiligentCore)
 add_subdirectory(3rdparty/glslang)
 add_subdirectory(3rdparty/SPIRV-Cross)
-add_subdirectory(3rdparty/VulkanMemoryAllocator)
-add_subdirectory(3rdparty/Vulkan-Headers)
-add_subdirectory(3rdparty/Vulkan-Utility-Libraries)
+if (NOT EMSCRIPTEN)
+    add_subdirectory(3rdparty/VulkanMemoryAllocator)
+    add_subdirectory(3rdparty/Vulkan-Headers)
+    add_subdirectory(3rdparty/Vulkan-Utility-Libraries)
+endif()
 add_subdirectory(3rdparty/SPIRV-Reflect)
+
+if (EMSCRIPTEN)
+    # WebGPU backend: fetch + patch the vendored emdawnwebgpu package (downloaded,
+    # not committed). Sets EMDAWNWEBGPU_INCLUDE_DIRS / _WEBGPU_CPP / _JS_LIBRARIES.
+    include(${CMAKE_SOURCE_DIR}/cmake/FetchEmdawnwebgpu.cmake)
+endif()
 
 set(XXHASH_BUILD_XXHSUM OFF)
 option(BUILD_SHARED_LIBS OFF)
@@ -286,16 +294,58 @@ if (APPLE AND NOT MOBILEGL_IOS)
     )
 endif()
 
+if (EMSCRIPTEN)
+    # Emscripten/WebGPU build: drop the Vulkan + GLES backends and their loaders /
+    # Vulkan enum converters, and add the DirectWebGPU backend plus the vendored
+    # emdawnwebgpu C++ glue (webgpu.cpp).
+    list(REMOVE_ITEM SOURCE_FILES
+        MobileGL/MG_Util/BackendLoaders/OpenGL/Loader.cpp
+        MobileGL/MG_Util/BackendLoaders/Vulkan/Loader.cpp
+        MobileGL/MG_Util/Converters/MGToVk/RenderStateEnumConverter.cpp
+        MobileGL/MG_Util/Converters/MGToVk/TextureEnumConverter.cpp
+        MobileGL/MG_Backend/DirectGLES/DirectGLES.cpp
+        MobileGL/MG_Backend/DirectGLES/BackendObject_DirectGLES.cpp
+        MobileGL/MG_Backend/DirectGLES/Utils.cpp
+        MobileGL/MG_Backend/DirectGLES/Managers.cpp
+        MobileGL/MG_Backend/DirectVulkan/DirectVulkan.cpp
+        MobileGL/MG_Backend/DirectVulkan/BackendObject_DirectVulkan.cpp
+        MobileGL/MG_Backend/DirectVulkan/VmaImpl.cpp
+        MobileGL/MG_Backend/DirectVulkan/Renderer/VulkanRenderer.cpp
+        MobileGL/MG_Backend/DirectVulkan/Renderer/SwapchainObject.cpp
+        MobileGL/MG_Backend/DirectVulkan/Renderer/FrameContext.cpp
+        MobileGL/MG_Backend/DirectVulkan/Renderer/PipelineFactory.cpp
+        MobileGL/MG_Backend/DirectVulkan/Renderer/ProgramFactory.cpp
+        MobileGL/MG_Backend/DirectVulkan/Renderer/UniformManager.cpp
+        MobileGL/MG_Backend/DirectVulkan/Renderer/BufferArena.cpp
+        MobileGL/MG_Backend/DirectVulkan/Renderer/VkBufferManager.cpp
+        MobileGL/MG_Backend/DirectVulkan/Renderer/VertexInputStateBuilder.cpp
+        MobileGL/MG_Backend/DirectVulkan/Renderer/VertexInputStateFactory.cpp
+        MobileGL/MG_Backend/DirectVulkan/Renderer/VkBufferObject.cpp
+        MobileGL/MG_Backend/DirectVulkan/Renderer/VkTextureManager.cpp
+        MobileGL/MG_Backend/DirectVulkan/Renderer/VkSamplerManager.cpp
+        MobileGL/MG_Backend/DirectVulkan/Renderer/VkClearManager.cpp
+        MobileGL/MG_Backend/DirectVulkan/Renderer/VkRenderPassManager.cpp
+    )
+    list(APPEND SOURCE_FILES
+        MobileGL/MG_Backend/DirectWebGPU/BackendObject_DirectWebGPU.cpp
+        ${EMDAWNWEBGPU_WEBGPU_CPP}
+    )
+endif()
+
 set(MOBILEGL_LINK_LIBRARIES
         glslang::glslang
         spirv-cross-c
         SPIRV-Tools-opt
         SPIRV-Tools
         xxHash::xxhash
-        GPUOpen::VulkanMemoryAllocator
-        Vulkan::UtilityHeaders
         spirv-reflect-static
 )
+if (NOT EMSCRIPTEN)
+    list(APPEND MOBILEGL_LINK_LIBRARIES
+        GPUOpen::VulkanMemoryAllocator
+        Vulkan::UtilityHeaders
+    )
+endif()
 
 set(MOBILEGL_COMPILE_DEF
         -DVMA_STATIC_VULKAN_FUNCTIONS=0
@@ -313,10 +363,24 @@ set(MOBILEGL_INCLUDE_DIR
         ${spirv-tools_BINARY_DIR}
         ${SPIRV-Headers_SOURCE_DIR}/include
 )
+if (EMSCRIPTEN)
+    # Fetched emdawnwebgpu headers. Placed first so the new standardized
+    # <webgpu/webgpu.h> wins over Emscripten's built-in legacy copy in the sysroot.
+    list(PREPEND MOBILEGL_INCLUDE_DIR ${EMDAWNWEBGPU_INCLUDE_DIRS})
+endif()
 
-add_library(${CMAKE_PROJECT_NAME} SHARED 
-    ${SOURCE_FILES}
-)
+if (EMSCRIPTEN)
+    # Under Emscripten we want a static archive to link into the harness, not a
+    # wasm side module — build the primary target STATIC and skip the MobileGL_s
+    # duplicate below.
+    add_library(${CMAKE_PROJECT_NAME} STATIC
+        ${SOURCE_FILES}
+    )
+else()
+    add_library(${CMAKE_PROJECT_NAME} SHARED
+        ${SOURCE_FILES}
+    )
+endif()
 
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
     set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES
@@ -347,7 +411,7 @@ target_compile_definitions(${CMAKE_PROJECT_NAME}
         MOBILEGL_LOG_ACTIVE_LEVEL=${MOBILEGL_LOG_ACTIVE_LEVEL}
 )
 
-if(UNIX AND NOT APPLE AND NOT ANDROID)
+if(UNIX AND NOT APPLE AND NOT ANDROID AND NOT EMSCRIPTEN)
     foreach(MOBILEGL_LOADER_ALIAS
             libEGL.so libEGL.so.1)
         add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
@@ -359,8 +423,8 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
     endforeach()
 endif()
 
-if(NOT ANDROID)
-    add_library(${CMAKE_PROJECT_NAME}_s STATIC 
+if(NOT ANDROID AND NOT EMSCRIPTEN)
+    add_library(${CMAKE_PROJECT_NAME}_s STATIC
         ${SOURCE_FILES}
     )
 
@@ -450,7 +514,7 @@ if (APPLE AND MOBILEGL_IOS)
     endif()
 endif()
 
-if (NOT ANDROID AND NOT MOBILEGL_IOS)
+if (NOT ANDROID AND NOT MOBILEGL_IOS AND NOT EMSCRIPTEN)
     find_package(Vulkan)
     if (Vulkan_FOUND)
         target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC Vulkan::Vulkan Vulkan::Headers)
