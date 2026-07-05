@@ -139,6 +139,10 @@ namespace MobileGL {
             // Optional: blocks until all submitted GPU work completes (glFinish).
             // Null for backends that treat glFinish as a no-op.
             void (*Finish)();
+            // Optional: submits pending GPU commands without blocking (glFlush). Needed
+            // so a long stream of draws doesn't accumulate unbounded in one command
+            // buffer. Null for backends that treat glFlush as a no-op.
+            void (*Flush)();
             void (*GetTexImage)(GLenum target, GLint level, GLenum format, GLenum type, GLvoid* pixels);
             void (*GetTextureImage)(const SharedPtr<MG_State::GLState::ITextureObject>& texture,
                                     TextureUploadTarget uploadTarget, GLint level, GLenum format, GLenum type,

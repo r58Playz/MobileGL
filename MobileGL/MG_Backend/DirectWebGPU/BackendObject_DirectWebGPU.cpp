@@ -46,6 +46,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         m_backendFunctions.GL.GetTexImage = &DirectWebGPU::GetTexImage;
         m_backendFunctions.GL.GetTextureImage = &DirectWebGPU::GetTextureImage;
         m_backendFunctions.GL.Finish = &DirectWebGPU::Finish;
+        m_backendFunctions.GL.Flush = &DirectWebGPU::Flush;
     }
 
     Bool BackendObject_DirectWebGPU::InitCapabilities() {

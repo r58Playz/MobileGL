@@ -51,5 +51,6 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                          TextureUploadTarget uploadTarget, GLint level, GLenum format, GLenum type,
                          GLsizei bufSize, GLvoid* pixels);
     void Finish();
+    void Flush();
     void Present();
 } // namespace MobileGL::MG_Backend::DirectWebGPU

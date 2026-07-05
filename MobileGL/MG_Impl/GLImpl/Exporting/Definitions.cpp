@@ -114,7 +114,14 @@ MOBILEGL_GL_API void glFinish() {
         MobileGL::MG_Backend::gBackendFunctionsTable.GL.Finish();
     }
 }
-MOBILEGL_GL_API void glFlush() { MGLOG_D("Implementing function: %s(...)", __FUNCTION__); }
+MOBILEGL_GL_API void glFlush() {
+    MGLOG_D("Implementing function: %s(...)", __FUNCTION__);
+    // Backends that batch GPU commands (e.g. WebGPU) provide Flush to submit pending
+    // work so the command buffer doesn't grow unbounded; others leave it a no-op.
+    if (MobileGL::MG_Backend::gBackendFunctionsTable.GL.Flush) {
+        MobileGL::MG_Backend::gBackendFunctionsTable.GL.Flush();
+    }
+}
 DECLARE_GL_FUNCTION_HEAD(void, FramebufferRenderbuffer, GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer) DECLARE_GL_FUNCTION_END_NO_RETURN(void, FramebufferRenderbuffer, target, attachment, renderbuffertarget, renderbuffer)
 DECLARE_GL_FUNCTION_HEAD(void, FramebufferTexture2D, GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level) DECLARE_GL_FUNCTION_END_NO_RETURN(void, FramebufferTexture2D, target, attachment, textarget, texture, level)
 DECLARE_GL_FUNCTION_HEAD(void, FrontFace, GLenum mode) DECLARE_GL_FUNCTION_END_NO_RETURN(void, FrontFace, mode)

@@ -583,7 +583,9 @@ if (EMSCRIPTEN)
             "-sEXPORTED_FUNCTIONS=_main,_harness_readback"
             # Synchronous instantiation assigns exports eagerly (no lazy JS wrapper),
             # so Module['_harness_readback'] is the raw WebAssembly export that
-            # WebAssembly.promising requires.
+            # WebAssembly.promising requires. Note: Chrome refuses synchronous wasm
+            # compile above 8MB, so debug/name-section builds must go async (and then
+            # the JSPI capture entry cannot be wrapped — replay-only debugging).
             "-sWASM_ASYNC_COMPILATION=0"
             "--shell-file=${CMAKE_SOURCE_DIR}/tools/web_harness/shell.html")
         set_target_properties(mobilegl_web_harness PROPERTIES SUFFIX ".html")
@@ -642,6 +644,11 @@ if (EMSCRIPTEN)
             "-sWASM_BIGINT" "-sSTACK_SIZE=32MB" "-sALLOW_MEMORY_GROWTH=1" "-sEXIT_RUNTIME=0"
             "-sEXPORTED_RUNTIME_METHODS=addRunDependency,removeRunDependency,HEAPU8"
             "-sEXPORTED_FUNCTIONS=_main,_replay_run,_replay_capture,_replay_done,_replay_pixels,_replay_width,_replay_height"
+            # Synchronous instantiation assigns exports eagerly (no lazy JS wrapper),
+            # so Module['_replay_capture'] is the raw WebAssembly export that
+            # WebAssembly.promising requires. Note: Chrome refuses synchronous wasm
+            # compile above 8MB, so debug/name-section builds must go async (and then
+            # the JSPI capture entry cannot be wrapped — replay-only debugging).
             "-sWASM_ASYNC_COMPILATION=0" "-fexceptions"
             ${_preload}
             "--shell-file=${CMAKE_SOURCE_DIR}/tools/web_harness/replay_shell.html")

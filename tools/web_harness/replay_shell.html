@@ -2,11 +2,40 @@
 <html>
 <head><meta charset="utf-8"><title>MobileGL apitrace replayer</title></head>
 <body style="margin:0;background:#111">
-  <canvas id="canvas" width="854" height="480" style="display:block;margin:8px auto;background:#000"></canvas>
+  <!-- The WebGPU device owns #canvas, so it can't also be drawn to with a 2D context
+       (and the replayer never Presents). The captured frame is painted to #result. -->
+  <canvas id="canvas" width="854" height="480" style="display:none"></canvas>
+  <canvas id="result" width="854" height="480" style="display:block;margin:8px auto;background:#000"></canvas>
   <pre id="log" style="color:#0f0;font:12px monospace;padding:8px;white-space:pre-wrap"></pre>
   <script>
+    // Resize the canvas before the module starts when ?w=/?h= override the surface
+    // size (the WebGPU surface is configured from the canvas element size).
+    (function() {
+      var q = new URLSearchParams(location.search);
+      var w = parseInt(q.get('w') || '0', 10), h = parseInt(q.get('h') || '0', 10);
+      if (w > 0 && h > 0) {
+        var c = document.getElementById('canvas');
+        c.width = w; c.height = h;
+      }
+    })();
     var Module = {
       canvas: document.getElementById('canvas'),
+      // ?target=N replays only to call N (bisecting hangs/mismatches);
+      // ?dumpprog=N dumps trace program N's GLSL on first glUseProgram.
+      targetCall: parseInt(new URLSearchParams(location.search).get('target') || '0', 10) || 0,
+      dumpProg: parseInt(new URLSearchParams(location.search).get('dumpprog') || '0', 10) || 0,
+      // ?nomap=1 skips replaying mapped-buffer memcpy writes (corruption bisection).
+      noMap: new URLSearchParams(location.search).get('nomap') === '1',
+      // ?nogolden=1 skips the golden compare (partial replays don't match the final
+      // image); ?capw=/?caph= override the capture size (small mid-frame FBOs).
+      noGolden: new URLSearchParams(location.search).get('nogolden') === '1',
+      // ?dumpwgsl=N dumps the final WGSL of replay program N (GL name).
+      dumpWgsl: parseInt(new URLSearchParams(location.search).get('dumpwgsl') || '0', 10) || 0,
+      // ?w=/?h= override the surface size (fixtures not captured at 854x480).
+      surfW: parseInt(new URLSearchParams(location.search).get('w') || '0', 10) || 0,
+      surfH: parseInt(new URLSearchParams(location.search).get('h') || '0', 10) || 0,
+      capW: parseInt(new URLSearchParams(location.search).get('capw') || '0', 10) || 0,
+      capH: parseInt(new URLSearchParams(location.search).get('caph') || '0', 10) || 0,
       print: (t)    => { document.getElementById('log').textContent += t + "\n"; console.log(t); },
       printErr: (t) => { document.getElementById('log').textContent += "ERR: " + t + "\n"; console.error(t); },
       preRun: [function() {
@@ -31,6 +60,17 @@
         const w = Module._replay_width(), h = Module._replay_height();
         const ptr = Module._replay_pixels();
         const px = Module.HEAPU8.subarray(ptr, ptr + w * h * 4); // RGBA, GL bottom-up
+        // Always paint the capture (top-down flip) into #result so it can be pulled
+        // out via toDataURL; skip the golden compare when ?nogolden=1.
+        const rc = document.getElementById('result');
+        rc.width = w; rc.height = h;
+        const out = rc.getContext('2d');
+        const id = out.createImageData(w, h);
+        for (let y = 0; y < h; y++) for (let x = 0; x < w*4; x++) id.data[y*w*4+x] = px[(h-1-y)*w*4+x];
+        for (let i = 3; i < id.data.length; i += 4) id.data[i] = 255; // force opaque
+        out.putImageData(id, 0, 0);
+        Module.print("[capture] painted " + w + "x" + h);
+        if (Module.noGolden) { Module.print("[compare] skipped (nogolden)"); return; }
         const img = new Image();
         img.onload = function() {
           const c = document.createElement('canvas'); c.width = w; c.height = h;
@@ -49,16 +89,9 @@
           }
           Module.print("[compare] mismatch=" + mismatch + " / " + (w*h) +
                        " (tolerance " + TOL + ") -> " + (mismatch <= TOL ? "PASS" : "FAIL"));
-          // Also paint the replay result so it's visible.
-          const out = Module.canvas.getContext('2d');
-          if (out) {
-            const id = out.createImageData(w, h);
-            for (let y = 0; y < h; y++) for (let x = 0; x < w*4; x++) id.data[y*w*4+x] = px[(h-1-y)*w*4+x];
-            out.putImageData(id, 0, 0);
-          }
         };
         img.onerror = function() { Module.printErr("[compare] failed to load golden.png"); };
-        img.src = "golden.png";
+        img.src = "golden.png?ts=" + Date.now(); // cache-bust: golden changes per fixture
       },
     };
   </script>

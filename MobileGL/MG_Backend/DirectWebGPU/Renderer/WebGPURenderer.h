@@ -18,6 +18,7 @@ namespace MobileGL {
 namespace MobileGL::MG_State::GLState {
     class ProgramObject;
     class VertexArrayObject;
+    struct VertexAttribute;
     class BufferObject;
     class ITextureObject;
     class TextureObjectMipmap;
@@ -57,6 +58,9 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                                          const void* const* indices, GLsizei drawcount,
                                          const GLint* basevertex);
         void Present();
+        // glFlush: submit pending GPU commands without blocking, so a long stream of
+        // draws doesn't accumulate unbounded in one command buffer.
+        void Flush() { FlushFrame(); }
         // Synchronous readback of the default framebuffer (the offscreen color
         // target). Blocks the caller via JSPI until the GPU copy is mapped. Must be
         // reached from a WebAssembly.promising entry (the host swapBuffers path, or
@@ -79,44 +83,80 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         Bool IsInitialized() const { return m_device != nullptr; }
 
     private:
-        // A GLSL combined sampler2D at SPIR-V binding N: tint splits it into a
-        // texture at @binding(N) and a sampler at @binding(N+1) (group 0).
-        struct SamplerRef {
-            Uint32 textureBinding = 0;
-            Uint32 samplerBinding = 0;
-            String name; // sampler uniform name, e.g. "tex0"
+        // One texture or sampler binding, parsed from tint's WGSL output (the exact
+        // module interface). A GLSL combined sampler2D becomes a texture var and -
+        // only if the shader actually samples it (vs texelFetch-only) - a separate
+        // sampler var; tint drops the sampler for texelFetch-only textures, so we
+        // must read what it really emitted rather than assume N/N+1. Bindings are
+        // already stage-offset (see StageBindingOffset). glName is the original GL
+        // uniform name (tint's "<name>_image"/"<name>_sampler" with the suffix
+        // stripped), used to resolve the bound texture unit.
+        struct ResourceRef {
+            Uint32 binding = 0;
+            enum class Kind { Texture, Sampler } kind = Kind::Texture;
+            String glName;
+        };
+
+        // A vertex shader input (@location(N) ... : TYPE), parsed from tint's WGSL.
+        // The pipeline must declare every one of these, even when the GL VAO has the
+        // attribute disabled / in an unsupported format (else CreateRenderPipeline fails
+        // and the invalid pipeline poisons the whole command buffer).
+        struct VertexInput {
+            Uint32 location = 0;
+            Bool isInt = false; // shader reads it as u32/i32 (vs f32)
         };
 
         struct WgpuProgram {
             WGPUShaderModule vertex = nullptr;
             WGPUShaderModule fragment = nullptr;
-            // Resource bindings reflected (SPIRV-Reflect) from the SPIR-V, matching
-            // the @group(0)/@binding(...) that tint emits.
-            Int globalUboBinding = -1; // >=0 if the default-block "MGL_GLOBAL_UBO" exists
+            // Bindings parsed from tint's WGSL. WebGPU merges all stages into one
+            // @group(0), but glslang numbers each stage's resources from 0, so we
+            // offset each stage into a disjoint binding range (StageBindingOffset).
+            // The shared default-block UBO appears once per stage that uses it -> one
+            // binding each, all pointing at the same per-draw buffer.
+            Vector<Uint32> uboBindings;
             Uint globalUboSize = 0;
-            Vector<SamplerRef> samplers;
-            Bool HasResources() const { return globalUboBinding >= 0 || !samplers.empty(); }
+            Vector<ResourceRef> resources;
+            Vector<VertexInput> vertexLocations;
+            Bool HasResources() const { return !uboBindings.empty() || !resources.empty(); }
         };
 
         struct WgpuPipeline {
             WGPURenderPipeline pipeline = nullptr;
             WGPUBindGroupLayout group0Layout = nullptr; // pipeline auto layout (if resources)
+            Uint dummyVertexSlots = 0; // # of constant zero vertex buffers bound after the real ones
         };
 
         struct WgpuTexture {
             WGPUTexture texture = nullptr;
-            WGPUTextureView view = nullptr;
+            WGPUTextureView view = nullptr; // sampled view (respects texture level range)
+            WGPUTextureView attachmentView = nullptr; // linear render-target view
+            WGPUTextureView attachmentSrgbView = nullptr; // sRGB render-target view when enabled
             Uint32 width = 0;
             Uint32 height = 0;
+            Uint32 mipLevelCount = 1;
+            Uint32 viewBaseMipLevel = 0;
+            Uint32 viewMipLevelCount = 1;
+            Uint16 textureParamsVersion = 0;
             WGPUTextureFormat format = WGPUTextureFormat_Undefined;
+            // See WgpuBuffer::lastUseSerial — same submit-ordering hazard for
+            // queueWriteTexture re-uploads of a texture recorded draws sample or
+            // render into.
+            Uint64 lastUseSerial = 0;
         };
 
         // GPU copy of a GL buffer; re-uploaded when the buffer's change serial advances
         // (glBufferData/glBufferSubData/map-flush all bump it), recreated if it grows.
+        // lastUseSerial: the m_flushSerial value when this buffer was last handed to a
+        // draw. queueWrite* executes at submit time (before the whole pending command
+        // buffer), so re-uploading a buffer that already-recorded draws reference must
+        // submit those draws first — else they would read the NEW contents (e.g.
+        // Minecraft re-fills one dynamic VB between GUI draws every frame).
         struct WgpuBuffer {
             WGPUBuffer buffer = nullptr;
             Uint64 serial = ~Uint64(0);
             Uint64 size = 0;
+            Uint64 lastUseSerial = 0;
         };
 
         void BeginFrameIfNeeded();
@@ -159,13 +199,13 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                                   const MG_State::GLState::VertexArrayObject& vao, GLenum mode) const;
         WGPUBuffer GetOrCreateVertexBuffer(MG_State::GLState::BufferObject& buffer);
         WGPUBuffer GetOrCreateIndexBuffer(MG_State::GLState::BufferObject& buffer);
+        WGPUBuffer GetDummyVertexBuffer();
         WGPUBuffer GetOrCreateBuffer(UnorderedMap<const MG_State::GLState::BufferObject*, WgpuBuffer>& cache,
                                      MG_State::GLState::BufferObject& buffer, WGPUBufferUsage usage);
         const WgpuTexture* GetOrCreateTexture(MG_State::GLState::ITextureObject& texture);
-        // Uploads mip level 0 (RGBA8) of `mip` into `tex` via the queue. Returns false
-        // if the source pixels aren't available.
-        Bool UploadTextureLevel0(WGPUTexture tex, MG_State::GLState::TextureObjectMipmap& mip,
-                                 Uint32 w, Uint32 h);
+        // Uploads every valid 2D mip level stored in `mip` into `tex` via the queue.
+        // Levels with no CPU pixels are left zero-initialized.
+        void UploadTextureLevels(WGPUTexture tex, MG_State::GLState::TextureObjectMipmap& mip);
         // Builds (or reuses) a WGPUSampler matching the GL sampler params
         // (glTexParameter / glBindSampler). Cached by the resolved param values.
         WGPUSampler GetOrCreateSampler(const MG_State::GLState::SamplerObject& sampler);
@@ -192,6 +232,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         UnorderedMap<Uint64, WgpuPipeline> m_pipelineCache;
         UnorderedMap<const MG_State::GLState::BufferObject*, WgpuBuffer> m_vertexBufferCache;
         UnorderedMap<const MG_State::GLState::BufferObject*, WgpuBuffer> m_indexBufferCache;
+        WGPUBuffer m_dummyVertexBuffer = nullptr; // shared constant-zero VB (see GetDummyVertexBuffer)
         UnorderedMap<const MG_State::GLState::ITextureObject*, WgpuTexture> m_textureCache;
         // WGPUSamplers keyed by a hash of their resolved descriptor (GL sampler params).
         UnorderedMap<Uint64, WGPUSampler> m_samplerCache;
@@ -207,6 +248,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // copies it to the acquired swapchain texture. ReadPixels copies from it.
         WGPUTexture m_offscreenTexture = nullptr;
         WGPUTextureView m_offscreenView = nullptr;
+        WGPUTextureView m_offscreenSrgbView = nullptr;
         Uint32 m_offscreenWidth = 0;
         Uint32 m_offscreenHeight = 0;
         // Companion depth target for the default framebuffer (depth-only, no stencil).
@@ -241,5 +283,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         WGPUTexture m_frameTexture = nullptr;
         WGPUTextureView m_frameView = nullptr;
         Bool m_frameActive = false;
+        // Bumped by every FlushFrame (submit). Resources whose lastUseSerial equals
+        // the current value have been used by commands not yet submitted.
+        Uint64 m_flushSerial = 1;
     };
 } // namespace MobileGL::MG_Backend::DirectWebGPU

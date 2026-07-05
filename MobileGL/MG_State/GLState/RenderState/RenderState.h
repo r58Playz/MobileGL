@@ -255,6 +255,7 @@ namespace MobileGL {
         Bool DebugOutputEnabled = false;
         Bool DebugOutputSynchronousEnabled = false;
         Bool DitherEnabled = true;
+        Bool FramebufferSrgbEnabled = false;
         Bool LineSmoothEnabled = false;
         Bool MultisampleEnabled = true;
         Bool PolygonOffsetFillEnabled = false;

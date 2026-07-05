@@ -102,6 +102,7 @@ namespace MobileGL {
                     SET_CAPABILITY(DepthTest, enabled);
                     SET_CAPABILITY(CullFace, enabled);
                     SET_CAPABILITY(Dither, enabled);
+                    SET_CAPABILITY(FramebufferSrgb, enabled);
                     SET_CAPABILITY(LineSmooth, enabled);
                     SET_CAPABILITY(Multisample, enabled);
                     SET_CAPABILITY(PolygonOffsetFill, enabled);
@@ -145,6 +146,7 @@ namespace MobileGL {
                     RETURN_CAPABILITY(DepthTest);
                     RETURN_CAPABILITY(CullFace);
                     RETURN_CAPABILITY(Dither);
+                    RETURN_CAPABILITY(FramebufferSrgb);
                     RETURN_CAPABILITY(LineSmooth);
                     RETURN_CAPABILITY(Multisample);
                     RETURN_CAPABILITY(PolygonOffsetFill);

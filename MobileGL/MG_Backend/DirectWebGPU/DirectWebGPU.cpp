@@ -123,6 +123,12 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
     }
 
+    void Flush() {
+        if (pWebGPURenderer) {
+            pWebGPURenderer->Flush();
+        }
+    }
+
     void Present() {
         if (pWebGPURenderer) {
             pWebGPURenderer->Present();
