@@ -26,8 +26,6 @@
       dumpProg: parseInt(new URLSearchParams(location.search).get('dumpprog') || '0', 10) || 0,
       // ?showtex=N reads back trace texture N (an intermediate colortex) instead of the FB.
       showTex: parseInt(new URLSearchParams(location.search).get('showtex') || '0', 10) || 0,
-      // ?vdbgfrom=N opens the backend verbose-draw log from call N to the end of the trace.
-      vdbgFrom: parseInt(new URLSearchParams(location.search).get('vdbgfrom') || '0', 10) || 0,
       // ?nomap=1 skips replaying mapped-buffer memcpy writes (corruption bisection).
       noMap: new URLSearchParams(location.search).get('nomap') === '1',
       // ?nogolden=1 skips the golden compare (partial replays don't match the final

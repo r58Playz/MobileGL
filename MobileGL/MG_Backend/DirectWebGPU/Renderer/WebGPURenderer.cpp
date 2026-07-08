@@ -44,10 +44,6 @@ EM_JS(int, mobilegl_preferred_canvas_format, (), {
 extern "C" void mobilegl_jspi_wait();
 extern "C" void mobilegl_jspi_signal();
 
-// TEMP DIAG: the trace harness sets this to 1 near the target call so BeginDrawPass
-// logs each draw's program id + resource resolution + drew/skipped verdict.
-int g_wgpuVerboseDraw = 0;
-
 namespace MobileGL::MG_Backend::DirectWebGPU {
     namespace {
         // Component byte size of a vertex attribute element.
@@ -1189,7 +1185,6 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (auto it = m_programCache.find(&program); it != m_programCache.end()) {
             return &it->second;
         }
-        const int vdbg = g_wgpuVerboseDraw ? (int)program.GetExternalIndex() : -1;
         // SPIR-V is produced at link time, one blob per attached shader (parallel
         // to GetAttachedShaders). Transpile each stage to WGSL via tint.
         auto& spirv = program.GetGeneratedSpirv();
@@ -1203,8 +1198,6 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             auto wgsl = MG_Util::ShaderTranspiler::SpirvToWgsl(spv);
             if (!wgsl.success) {
                 MGLOG_E("DirectWebGPU: SPIR-V -> WGSL failed: %s", wgsl.error.c_str());
-                if (vdbg >= 0) std::printf("[vdbg] prog=%d SpirvToWgsl FAILED stage=%d: %s\n", vdbg,
-                                           (int)shaders[i]->GetShaderStage(), wgsl.error.c_str());
                 return nullptr;
             }
             // Offset this stage's bindings into a disjoint range so vertex/fragment
@@ -1278,8 +1271,6 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
         if (!prog.vertex || !prog.fragment) {
             MGLOG_E("DirectWebGPU: program missing vertex or fragment WGSL module");
-            if (vdbg >= 0) std::printf("[vdbg] prog=%d missing module: vertex=%d fragment=%d nShaders=%zu nSpirv=%zu\n",
-                                       vdbg, prog.vertex ? 1 : 0, prog.fragment ? 1 : 0, shaders.size(), spirv.size());
             if (prog.vertex) wgpuShaderModuleRelease(prog.vertex);
             if (prog.fragment) wgpuShaderModuleRelease(prog.fragment);
             return nullptr;
@@ -1354,13 +1345,99 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         return key;
     }
 
+    // A vertex-buffer group: one bound WebGPU vertex buffer feeding one or more attributes.
+    // Attributes that share a GL buffer + array stride + step mode and are 4-aligned are
+    // interleaved into a single group (one bound buffer, attributes at their real offsets);
+    // int->float-converted and non-4-aligned (deinterleaved) attributes each get their own
+    // group. Grouping keeps the vertex-buffer count within WebGPU's 8-slot cap for shaders
+    // that declare many attributes (which would otherwise be skipped).
+    struct VGroupAttr {
+        Uint32 location;
+        WGPUVertexFormat format;
+        uint64_t offset; // byte offset within arrayStride
+    };
+    struct VGroup {
+        enum Kind { Aligned, Convert, Deinterleave } kind = Aligned;
+        WGPUVertexStepMode stepMode = WGPUVertexStepMode_Vertex;
+        uint64_t arrayStride = 0;
+        std::vector<VGroupAttr> attrs;
+        MG_State::GLState::BufferObject* buffer = nullptr; // GL source buffer (identity + whole-bind)
+        // Buffer-build params for Convert / Deinterleave singletons:
+        Uint32 srcOffset = 0, glStride = 0, compByteSize = 0, size = 0, attrBytes = 0;
+        Bool isSigned = false;
+    };
+
+    // Shared by GetOrCreatePipeline (builds layouts) and BeginDrawPass (binds buffers) so
+    // the two stay 1:1 in count and order. Mirrors the attribute filtering / interleave /
+    // convert / deinterleave decisions exactly once. shaderExpects(loc) returns the shader's
+    // base type at a @location (-1 none, 0 float, 1 i32, 2 u32).
+    template <typename ShaderExpects>
+    static std::vector<VGroup> ComputeVertexGroups(const MG_State::GLState::VertexArrayObject& vao,
+                                                   ShaderExpects&& shaderExpects) {
+        std::vector<VGroup> groups;
+        for (Uint i = 0; i < 16; ++i) {
+            if (!vao.IsAttributeEnabled(i)) continue;
+            const auto& a = vao.GetAttribute(i);
+            const WGPUVertexFormat vf = ToVertexFormat(a.Type, a.Size, a.Normalized, a.IsInteger);
+            if (!a.Buffer || vf == WGPUVertexFormat_Force32) continue;
+            const int exp = shaderExpects(i);
+            const int baseVf = VertexFormatBaseType(vf);
+            const Bool convert = (exp == 0 && baseVf != 0 && a.Size >= 1 && a.Size <= 4);
+            if (exp >= 0 && baseVf != exp && !convert) continue; // base-type mismatch -> dummy
+            const Uint32 attrBytes = ComponentByteSize(a.Type) * a.Size;
+            const Uint32 glStride = a.Stride ? static_cast<Uint32>(a.Stride) : attrBytes;
+            const WGPUVertexStepMode stepMode =
+                a.Divisor > 0 ? WGPUVertexStepMode_Instance : WGPUVertexStepMode_Vertex;
+            // Interleave into a shared group only when 4-aligned AND the attribute fits
+            // within the stride (WebGPU needs offset%4==0, stride%4==0, offset+size<=stride).
+            const Bool aligned = !convert && (a.Offset % 4u == 0u) && (glStride % 4u == 0u) &&
+                                 (static_cast<Uint32>(a.Offset) + attrBytes <= glStride);
+            if (aligned) {
+                VGroup* dst = nullptr;
+                for (auto& g : groups) {
+                    if (g.kind == VGroup::Aligned && g.buffer == a.Buffer.get() &&
+                        g.arrayStride == glStride && g.stepMode == stepMode) { dst = &g; break; }
+                }
+                if (!dst) {
+                    groups.emplace_back();
+                    dst = &groups.back();
+                    dst->kind = VGroup::Aligned;
+                    dst->stepMode = stepMode;
+                    dst->arrayStride = glStride;
+                    dst->buffer = a.Buffer.get();
+                }
+                dst->attrs.push_back(VGroupAttr{i, vf, static_cast<uint64_t>(a.Offset)});
+                continue;
+            }
+            VGroup g;
+            g.stepMode = stepMode;
+            g.buffer = a.Buffer.get();
+            g.srcOffset = static_cast<Uint32>(a.Offset);
+            g.glStride = glStride;
+            g.compByteSize = ComponentByteSize(a.Type);
+            g.size = static_cast<Uint32>(a.Size);
+            g.attrBytes = attrBytes;
+            g.isSigned = (a.Type == DataType::Int8 || a.Type == DataType::Int16 ||
+                          a.Type == DataType::Int32);
+            if (convert) {
+                g.kind = VGroup::Convert;
+                g.arrayStride = static_cast<uint64_t>(a.Size) * 4u; // tight Float32x{size}
+                g.attrs.push_back(VGroupAttr{i, FloatFormatForSize(a.Size), 0});
+            } else {
+                g.kind = VGroup::Deinterleave;
+                g.arrayStride = static_cast<uint64_t>((attrBytes + 3u) & ~3u);
+                g.attrs.push_back(VGroupAttr{i, vf, 0});
+            }
+            groups.push_back(std::move(g));
+        }
+        return groups;
+    }
+
     const WebGPURenderer::WgpuPipeline*
     WebGPURenderer::GetOrCreatePipeline(MG_State::GLState::ProgramObject& program,
                                         const MG_State::GLState::VertexArrayObject& vao, GLenum mode) {
-        const int vdbg = g_wgpuVerboseDraw ? (int)program.GetExternalIndex() : -1;
         const WgpuProgram* prog = GetOrCreateProgram(program);
         if (!prog) {
-            if (vdbg >= 0) std::printf("[vdbg] prog=%d pipeline: GetOrCreateProgram null\n", vdbg);
             return nullptr;
         }
         const Uint64 key = ComputePipelineKey(program, vao, mode, prog);
@@ -1368,50 +1445,39 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             return &it->second;
         }
 
-        // One vertex buffer layout per enabled+supported attribute, in ascending
-        // attribute order (the draw path binds vertex buffers in the same order),
-        // followed by dummy layouts for any shader @location the VAO doesn't supply.
-        constexpr Uint kMaxAttribs = 16;
         // The shader's base type at a @location (-1 none, 0 float, 1 i32, 2 u32). A VAO
-        // attribute whose WGPU format base type doesn't match (e.g. a GL non-normalized
-        // integer attribute the shader reads as float — no WebGPU format widens int->float)
-        // is dropped to a dummy of the shader's type, keeping the pipeline valid.
+        // attribute whose WGPU format base type doesn't match is dropped to a dummy of the
+        // shader's type (no WebGPU format widens int->float without a converted buffer).
         auto shaderExpects = [&](Uint loc) -> int {
             for (const auto& vi : prog->vertexLocations) {
                 if (vi.location == loc) return !vi.isInt ? 0 : (vi.isUnsigned ? 2 : 1);
             }
             return -1;
         };
+        // Vertex-buffer groups (see ComputeVertexGroups): interleaved attributes sharing a
+        // buffer collapse into one bound buffer, so many-attribute shaders stay within
+        // WebGPU's 8-slot cap. The draw path walks the same groups in the same order.
+        const std::vector<VGroup> groups = ComputeVertexGroups(vao, shaderExpects);
+
+        // Flatten each group's attributes into one contiguous array (each layout points at
+        // its group's slice), then append dummy attributes for shader @locations the VAO
+        // doesn't supply — WebGPU requires every @location present in the vertex state, or
+        // CreateRenderPipeline fails and the invalid pipeline poisons the command buffer.
         std::vector<WGPUVertexAttribute> attrs;
-        attrs.reserve(kMaxAttribs + prog->vertexLocations.size());
+        attrs.reserve(prog->vertexLocations.size() + 4);
         Bool covered[64] = {};
-        for (Uint i = 0; i < kMaxAttribs; ++i) {
-            if (!vao.IsAttributeEnabled(i)) continue;
-            const auto& a = vao.GetAttribute(i);
-            const WGPUVertexFormat vf = ToVertexFormat(a.Type, a.Size, a.Normalized, a.IsInteger);
-            if (!a.Buffer || vf == WGPUVertexFormat_Force32) continue;
-            const int exp = shaderExpects(i);
-            const int baseVf = VertexFormatBaseType(vf);
-            // Shader wants float but the VAO gives a (non-normalized) integer format: GL
-            // widens int->float, so present it as Float32x{size} via a converted buffer.
-            const Bool convert = (exp == 0 && baseVf != 0 && a.Size >= 1 && a.Size <= 4);
-            if (exp >= 0 && baseVf != exp && !convert) continue; // other base-type mismatch -> dummy
-            WGPUVertexAttribute va{};
-            va.format = convert ? FloatFormatForSize(a.Size) : vf;
-            // Offset 0 in the layout: an aligned attribute is bound at its (4-aligned)
-            // byte offset; a non-aligned / converted one gets its own buffer bound at 0.
-            // Either way the attribute sits at the start of each arrayStride step.
-            va.offset = 0;
-            va.shaderLocation = i;
-            attrs.push_back(va);
-            if (i < 64) covered[i] = true;
+        for (const auto& g : groups) {
+            for (const auto& ga : g.attrs) {
+                WGPUVertexAttribute va{};
+                va.format = ga.format;
+                va.offset = ga.offset;
+                va.shaderLocation = ga.location;
+                attrs.push_back(va);
+                if (ga.location < 64) covered[ga.location] = true;
+            }
         }
-        // Dummy attributes for shader inputs the VAO doesn't supply (disabled / unsupported
-        // format). WebGPU requires every shader @location to be present in the vertex state;
-        // a missing one makes the pipeline invalid and poisons the whole command buffer.
-        // The dummy format must match the shader's base type (float/i32/u32) exactly, or
-        // the pipeline is invalid. All dummies share one buffer (see the layout below);
-        // each gets a distinct 16-byte slot so their attribute ranges don't overlap.
+        // Dummy attributes (float/i32/u32 to match the shader's declared type) share one
+        // constant-zero buffer; each gets a distinct 16-byte slot so ranges don't overlap.
         const SizeT firstDummy = attrs.size();
         Uint dummyCount = 0;
         for (const auto& vi : prog->vertexLocations) {
@@ -1425,39 +1491,21 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             ++dummyCount;
             if (vi.location < 64) covered[vi.location] = true;
         }
+
+        // One layout per group (each with its group's attributes), plus one shared layout
+        // for all dummies (arrayStride 0 -> every vertex reads the same constant region).
         std::vector<WGPUVertexBufferLayout> layouts;
-        layouts.reserve(attrs.size());
-        SizeT ai = 0;
-        for (Uint i = 0; i < kMaxAttribs; ++i) {
-            if (!vao.IsAttributeEnabled(i)) continue;
-            const auto& a = vao.GetAttribute(i);
-            const WGPUVertexFormat vf = ToVertexFormat(a.Type, a.Size, a.Normalized, a.IsInteger);
-            if (!a.Buffer || vf == WGPUVertexFormat_Force32) continue;
-            const int exp = shaderExpects(i);
-            const int baseVf = VertexFormatBaseType(vf);
-            const Bool convert = (exp == 0 && baseVf != 0 && a.Size >= 1 && a.Size <= 4);
-            if (exp >= 0 && baseVf != exp && !convert) continue; // matches the attr loop's skip
+        layouts.reserve(groups.size() + 1);
+        SizeT attrCursor = 0;
+        for (const auto& g : groups) {
             WGPUVertexBufferLayout layout{};
-            // Divisor>0 -> per-instance attribute (glVertexAttribDivisor); 0 -> per-vertex.
-            layout.stepMode = a.Divisor > 0 ? WGPUVertexStepMode_Instance : WGPUVertexStepMode_Vertex;
-            const Uint32 attrBytes = ComponentByteSize(a.Type) * a.Size;
-            const Uint32 glStride = a.Stride ? static_cast<Uint32>(a.Stride) : attrBytes;
-            // WebGPU requires bind offset, attribute offset, and arrayStride all be
-            // multiples of 4. Interleaved when the GL offset+stride already satisfy that;
-            // a converted attribute is tight Float32x{size} (stride size*4); otherwise the
-            // attribute is deinterleaved to a tight (round4(attrBytes)) buffer.
-            const Bool aligned = !convert && (a.Offset % 4u == 0u) && (glStride % 4u == 0u);
-            layout.arrayStride = convert ? static_cast<uint64_t>(a.Size) * 4u
-                                 : aligned ? static_cast<uint64_t>(glStride)
-                                           : static_cast<uint64_t>((attrBytes + 3u) & ~3u);
-            layout.attributeCount = 1;
-            layout.attributes = &attrs[ai++];
+            layout.stepMode = g.stepMode;
+            layout.arrayStride = g.arrayStride;
+            layout.attributeCount = g.attrs.size();
+            layout.attributes = &attrs[attrCursor];
+            attrCursor += g.attrs.size();
             layouts.push_back(layout);
         }
-        // All dummy attributes share ONE layout backed by the constant zero buffer
-        // (arrayStride 0 -> every vertex reads the same region). Collapsing them into a
-        // single buffer keeps the total vertex-buffer count within WebGPU's limit for
-        // shaders that declare many @location inputs the VAO doesn't supply.
         if (dummyCount > 0) {
             WGPUVertexBufferLayout layout{};
             layout.stepMode = WGPUVertexStepMode_Vertex;
@@ -1467,9 +1515,9 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             layouts.push_back(layout);
         }
 
-        // WebGPU caps vertex buffers at 8 and attributes at 16; a pipeline exceeding
-        // either becomes an error object that poisons the whole command buffer. Skip the
-        // draw instead (rare — only shaders with very many distinct attributes).
+        // WebGPU caps vertex buffers at 8 and attributes at 16; a pipeline exceeding either
+        // becomes an error object that poisons the whole command buffer. Skip the draw
+        // instead (now rare — only shaders with >16 distinct attributes or >8 buffers).
         if (layouts.size() > 8 || attrs.size() > 16) {
             static Bool warned = false;
             if (!warned) {
@@ -1477,8 +1525,6 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                 MGLOG_W("DirectWebGPU: draw skipped: %zu vertex buffers / %zu attributes exceed WebGPU "
                         "limits (8/16)", layouts.size(), attrs.size());
             }
-            if (vdbg >= 0) std::printf("[vdbg] prog=%d pipeline: %zu layouts / %zu attrs exceed 8/16 (dummies=%u)\n",
-                                       vdbg, layouts.size(), attrs.size(), dummyCount);
             return nullptr;
         }
 
@@ -1524,10 +1570,6 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                 m_curColor[i].format == WGPUTextureFormat_Undefined) {
                 MGLOG_E("DirectWebGPU: fragment writes location %u but draw buffer %u is "
                         "unbound/unsupported; skipping draw", i, i);
-                if (vdbg >= 0) std::printf("[vdbg] prog=%d pipeline: frag writes loc %u but curColorCount=%u "
-                                           "view=%p fmt=0x%x\n", vdbg, i, m_curColorCount,
-                                           i < m_curColorCount ? (void*)m_curColor[i].view : nullptr,
-                                           i < m_curColorCount ? (unsigned)m_curColor[i].format : 0u);
                 return nullptr;
             }
             ct.format = m_curColor[i].format;
@@ -1538,7 +1580,6 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
         // A render pipeline needs at least one color target or a depth-stencil target.
         if (targetCount == 0 && m_curDepthView == nullptr) {
-            if (vdbg >= 0) std::printf("[vdbg] prog=%d pipeline: no color targets and no depth\n", vdbg);
             return nullptr;
         }
 
@@ -1634,12 +1675,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         desc.multisample.mask = 0xFFFFFFFFu;
         desc.fragment = &fragment;
 
-        if (vdbg >= 0) std::printf("[vdbg] prog=%d pipeline: creating targetCount=%u hasDepth=%d depthFmt=0x%x "
-                                   "layouts=%zu attrs=%zu needsExplicit=%d\n", vdbg, targetCount, hasDepth ? 1 : 0,
-                                   (unsigned)m_curDepthFormat, layouts.size(), attrs.size(), needsExplicit ? 1 : 0);
         WGPURenderPipeline pipeline = wgpuDeviceCreateRenderPipeline(m_device, &desc);
         if (!pipeline) {
-            if (vdbg >= 0) std::printf("[vdbg] prog=%d pipeline: wgpuDeviceCreateRenderPipeline null\n", vdbg);
             if (explicitPl) wgpuPipelineLayoutRelease(explicitPl);
             if (explicitBgl) wgpuBindGroupLayoutRelease(explicitBgl);
             return nullptr;
@@ -2242,16 +2279,13 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     WGPURenderPassEncoder WebGPURenderer::BeginDrawPass(MG_State::GLState::ProgramObject& program,
                                                         const MG_State::GLState::VertexArrayObject& vao,
                                                         GLenum mode) {
-        const int vdbg = g_wgpuVerboseDraw ? (int)program.GetExternalIndex() : -1;
         // Resolve the draw target first: the pipeline (color format + has-depth) and the
         // pass attachments both depend on it.
         if (!ResolveDrawTarget()) {
-            if (vdbg >= 0) std::printf("[vdbg] prog=%d SKIP: ResolveDrawTarget failed\n", vdbg);
             return nullptr;
         }
         const WgpuPipeline* p = GetOrCreatePipeline(program, vao, mode);
         if (!p) {
-            if (vdbg >= 0) std::printf("[vdbg] prog=%d SKIP: pipeline null\n", vdbg);
             return nullptr;
         }
 
@@ -2266,8 +2300,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (!prog) {
             return nullptr;
         }
-        // Same shader-base-type check as GetOrCreatePipeline, so the bound vertex buffers
-        // stay 1:1 with the pipeline's real (non-dummy) vertex layouts.
+        // Same shader-base-type resolution as GetOrCreatePipeline, so the bound vertex
+        // buffers stay 1:1 with the pipeline's vertex layouts.
         auto shaderExpects = [&](Uint loc) -> int {
             for (const auto& vi : prog->vertexLocations) {
                 if (vi.location == loc) return !vi.isInt ? 0 : (vi.isUnsigned ? 2 : 1);
@@ -2275,38 +2309,24 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             return -1;
         };
 
-        // Vertex buffers (ascending attribute order, matching the pipeline layouts).
+        // Vertex buffers, one per group (see ComputeVertexGroups) — same groups and order as
+        // the pipeline's layouts, so slots stay 1:1. An interleaved (Aligned) group binds its
+        // shared GL buffer once at offset 0 (each attribute carries its real byte offset);
+        // Convert / Deinterleave groups get their own repacked buffer.
         std::vector<std::pair<WGPUBuffer, uint64_t>> vertexBuffers;
-        for (Uint i = 0; i < 16; ++i) {
-            if (!vao.IsAttributeEnabled(i)) continue;
-            const auto& a = vao.GetAttribute(i);
-            const WGPUVertexFormat vf = ToVertexFormat(a.Type, a.Size, a.Normalized, a.IsInteger);
-            if (!a.Buffer || vf == WGPUVertexFormat_Force32) continue;
-            const int exp = shaderExpects(i);
-            const int baseVf = VertexFormatBaseType(vf);
-            const Bool convert = (exp == 0 && baseVf != 0 && a.Size >= 1 && a.Size <= 4);
-            if (exp >= 0 && baseVf != exp && !convert) continue; // dropped to a dummy in the pipeline
-            // Mirror the pipeline builder's interleaved / deinterleaved / converted choice.
-            const Uint32 attrBytes = ComponentByteSize(a.Type) * a.Size;
-            const Uint32 glStride = a.Stride ? static_cast<Uint32>(a.Stride) : attrBytes;
-            const Bool aligned = !convert && (a.Offset % 4u == 0u) && (glStride % 4u == 0u);
+        for (const auto& g : ComputeVertexGroups(vao, shaderExpects)) {
             WGPUBuffer vb = nullptr;
-            uint64_t bindOffset = 0;
-            if (convert) {
-                const Bool isSigned = (a.Type == DataType::Int8 || a.Type == DataType::Int16 ||
-                                       a.Type == DataType::Int32);
-                vb = GetOrCreateFloatConvertedBuffer(*a.Buffer, static_cast<Uint32>(a.Offset), glStride,
-                                                     ComponentByteSize(a.Type), isSigned, a.Size);
-            } else if (aligned) {
-                vb = GetOrCreateVertexBuffer(*a.Buffer);
-                bindOffset = static_cast<uint64_t>(a.Offset);
+            if (g.kind == VGroup::Convert) {
+                vb = GetOrCreateFloatConvertedBuffer(*g.buffer, g.srcOffset, g.glStride, g.compByteSize,
+                                                     g.isSigned, static_cast<int>(g.size));
+            } else if (g.kind == VGroup::Deinterleave) {
+                vb = GetOrCreateDeinterleavedBuffer(*g.buffer, g.srcOffset, g.glStride, g.attrBytes,
+                                                    static_cast<Uint32>(g.arrayStride));
             } else {
-                const Uint32 alignedStride = (attrBytes + 3u) & ~3u;
-                vb = GetOrCreateDeinterleavedBuffer(*a.Buffer, static_cast<Uint32>(a.Offset), glStride,
-                                                    attrBytes, alignedStride);
+                vb = GetOrCreateVertexBuffer(*g.buffer);
             }
             if (!vb) continue;
-            vertexBuffers.emplace_back(vb, bindOffset);
+            vertexBuffers.emplace_back(vb, 0);
         }
 
         // Sampled textures + samplers, resolved to texture units by uniform name.
@@ -2344,11 +2364,6 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                         break;
                     }
                     const WgpuTexture* wt = GetOrCreateTexture(*texObj);
-                    if (vdbg >= 0) {
-                        std::printf("[vdbg] prog=%d texture '%s' bind=%u unit=%d fmt=0x%x -> %s\n", vdbg,
-                                    r.glName.c_str(), r.binding, unit, (unsigned)texObj->GetFormat(),
-                                    wt ? "ok" : "NULL");
-                    }
                     if (!wt) { resourcesOk = false; break; }
                     WGPUBindGroupEntry te{};
                     te.binding = r.binding;
@@ -2369,11 +2384,6 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                                               ? GetOrCreateSampler(*effectiveSampler, comparison,
                                                                    depthPaired && !comparison)
                                               : nullptr;
-                    if (vdbg >= 0) {
-                        std::printf("[vdbg] prog=%d sampler '%s' bind=%u unit=%d cmp=%d depthPaired=%d hasEff=%d -> %s\n",
-                                    vdbg, r.glName.c_str(), r.binding, unit, comparison ? 1 : 0,
-                                    depthPaired ? 1 : 0, effectiveSampler ? 1 : 0, sampler ? "ok" : "NULL");
-                    }
                     if (!sampler) { resourcesOk = false; break; }
                     WGPUBindGroupEntry se{};
                     se.binding = r.binding;
@@ -2388,12 +2398,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // rest of the frame still renders). Common while backend format/depth support is
         // incomplete (e.g. an Iris pass sampling a depth/shadow or unsupported-format tex).
         if (wantResources && !resourcesOk) {
-            if (vdbg >= 0) std::printf("[vdbg] prog=%d SKIP: resources not ok\n", vdbg);
             return nullptr;
-        }
-        if (vdbg >= 0) {
-            std::printf("[vdbg] prog=%d DREW: wantResources=%d entries=%zu targetColors=%u\n", vdbg,
-                        wantResources ? 1 : 0, entries.size(), m_curColorCount);
         }
 
         // ---- Phase 2: fresh per-draw UBO + bind group (no flushes past here). ----

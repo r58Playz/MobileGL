@@ -414,13 +414,7 @@ static void dispatch(trace::Call* c) {
     }
     if (!strcmp(n, "glUniformMatrix4fv")) {
         std::vector<float> s; const float* p = floatPtrSanitized(c->arg(3), s, (size_t)AS(1) * 16);
-        if (p) {
-            std::string value = "mat4[";
-            for (int i = 0; i < 16; ++i) { if (i) value += " "; value += std::to_string(p[i]); }
-            value += "]";
-            g_uniformValueByTraceLoc[traceLocKey()] = value;
-            glUniformMatrix4fv(loc(), AS(1), (GLboolean)c->arg(2).toBool(), p);
-        }
+        if (p) glUniformMatrix4fv(loc(), AS(1), (GLboolean)c->arg(2).toBool(), p);
         return;
     }
     if (!strcmp(n, "glUniformMatrix3fv")) {
@@ -1014,10 +1008,7 @@ static void dumpTraceProgramSources(unsigned traceProgram) {
 }
 
 static void printTailDrawState(const char* kind, long long callNo, GLenum mode, GLsizei count, GLsizei draws) {
-    static const long long vdbgFrom = (long long)EM_ASM_INT({ return Module['vdbgFrom'] || 0; });
-    const bool inNarrow = (callNo + 256 >= g_targetCall);
-    const bool inWide = (vdbgFrom > 0 && callNo >= vdbgFrom);
-    if (!inNarrow && !inWide) {
+    if (callNo + 256 < g_targetCall) {
         return;
     }
     const unsigned fboColor0 = g_fboColor0TraceTex.count(g_boundDrawFbo) ? g_fboColor0TraceTex[g_boundDrawFbo] : 0u;
@@ -1026,11 +1017,6 @@ static void printTailDrawState(const char* kind, long long callNo, GLenum mode, 
                 g_blendEnabled ? 1 : 0, static_cast<unsigned>(g_blendSrcRgb), static_cast<unsigned>(g_blendSrcAlpha),
                 static_cast<unsigned>(g_blendDstRgb), static_cast<unsigned>(g_blendDstAlpha),
                 static_cast<unsigned>(g_blendEqRgb), static_cast<unsigned>(g_blendEqAlpha));
-    // Outside the narrow near-target window, emit only the compact one-liner (buffer-flow
-    // trace); skip the verbose per-attrib / per-uniform dump to keep the log readable.
-    if (!inNarrow) {
-        return;
-    }
     const auto vaoIt = g_traceVaoAttribs.find(g_curTraceVao);
     const std::array<TraceAttribInfo, 16> emptyAttribs{};
     const auto& attribs = vaoIt != g_traceVaoAttribs.end() ? vaoIt->second : emptyAttribs;
@@ -1098,11 +1084,6 @@ extern "C" EMSCRIPTEN_KEEPALIVE void replay_run() {
     while ((call = parser.parse_call())) {
         const long long no = (long long)call->no;
         if (g_callsReplayed % 10000 == 0) printf("[replay] %lld calls (at #%lld)...\n", g_callsReplayed, no);
-        extern int g_wgpuVerboseDraw;
-        // ?vdbgfrom=N opens the verbose-draw window from call N to the end; otherwise the
-        // default window is the 300 calls before the target.
-        static const long long vdbgFrom = (long long)EM_ASM_INT({ return Module['vdbgFrom'] || 0; });
-        g_wgpuVerboseDraw = ((vdbgFrom > 0 && no >= vdbgFrom) || (no + 300 >= g_targetCall)) ? 1 : 0;
         dispatch(call);
         // Submit pending GPU commands periodically so the backend's single command
         // buffer doesn't grow unbounded over ~900K calls (which fails to submit).
