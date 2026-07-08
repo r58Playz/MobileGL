@@ -209,6 +209,50 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             }
         }
 
+        // --- GL texture swizzle (GL_TEXTURE_SWIZZLE_R/G/B/A) ----------------------------
+        // WebGPU has no component swizzle on texture views (unlike Vulkan's
+        // VkComponentMapping), so a non-identity GL swizzle is baked into the uploaded
+        // texels for 8-bit unorm color textures: we store, per texel, swizzle(baseExpand
+        // (src)) as RGBA8 and sample it with identity. This is what makes single-channel
+        // font atlases (Modern UI uploads an R8 atlas with swizzle (1,1,1,R)) render
+        // white instead of red. Non-8-bit / depth formats keep their native format and
+        // ignore swizzle (unchanged behavior).
+
+        // 3 bits per channel; identity = R,G,B,A. 0xFFFF => no materialization.
+        constexpr Uint32 kNoSwizzle = 0xFFFF;
+        Uint32 PackSwizzle(const Vec4<TextureSwizzleParam>& sw) {
+            return static_cast<Uint32>(sw[0]) | (static_cast<Uint32>(sw[1]) << 3) |
+                   (static_cast<Uint32>(sw[2]) << 6) | (static_cast<Uint32>(sw[3]) << 9);
+        }
+        Bool IsIdentitySwizzle(const Vec4<TextureSwizzleParam>& sw) {
+            return sw[0] == TextureSwizzleParam::Red && sw[1] == TextureSwizzleParam::Green &&
+                   sw[2] == TextureSwizzleParam::Blue && sw[3] == TextureSwizzleParam::Alpha;
+        }
+        // Source channel count for an 8-bit unorm color format that we can materialize a
+        // swizzle into; 0 => not materializable (non-8-bit / non-color), keep native.
+        Uint32 SwizzleMaterializeSrcChannels(WGPUTextureFormat fmt) {
+            switch (fmt) {
+            case WGPUTextureFormat_R8Unorm:         return 1;
+            case WGPUTextureFormat_RG8Unorm:        return 2;
+            case WGPUTextureFormat_RGBA8Unorm:      return 4;
+            case WGPUTextureFormat_RGBA8UnormSrgb:  return 4;
+            default:                                return 0;
+            }
+        }
+        // One channel of swizzle(baseExpand(src)): base expand fills missing colour with
+        // 0 and missing alpha with 0xFF (GL sampling semantics), then selects per swizzle.
+        Uint8 ApplySwizzleChannel(const Uint8* src, Uint32 srcChannels, TextureSwizzleParam s) {
+            switch (s) {
+            case TextureSwizzleParam::Red:   return srcChannels > 0 ? src[0] : 0;
+            case TextureSwizzleParam::Green: return srcChannels > 1 ? src[1] : 0;
+            case TextureSwizzleParam::Blue:  return srcChannels > 2 ? src[2] : 0;
+            case TextureSwizzleParam::Alpha: return srcChannels > 3 ? src[3] : 0xFF;
+            case TextureSwizzleParam::Zero:  return 0;
+            case TextureSwizzleParam::One:   return 0xFF;
+            default:                         return 0;
+            }
+        }
+
         // WebGPU forbids setting a blend state on a non-blendable color target. 8-bit
         // unorm, rgb10a2unorm, 16-bit float and rg11b10ufloat are blendable in core;
         // 32-bit float needs the float32-blendable feature (absent in this toolchain),
@@ -1942,12 +1986,29 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             depthFmt != WGPUTextureFormat_Undefined) {
             return GetOrCreateDepthTexture(texture, depthFmt);
         }
-        const ColorFormatInfo info = ToColorFormat(texture.GetFormat());
-        const WGPUTextureFormat fmt = info.format;
+        ColorFormatInfo info = ToColorFormat(texture.GetFormat());
+        WGPUTextureFormat fmt = info.format;
         if (fmt == WGPUTextureFormat_Undefined) {
             std::printf("[webgpu] unsupported sampled texture format enum=%d\n", static_cast<int>(texture.GetFormat()));
             MGLOG_E("DirectWebGPU: unsupported texture internal format for sampling");
             return nullptr;
+        }
+        // GL texture swizzle: WebGPU has no view swizzle, so bake a non-identity swizzle
+        // of an 8-bit unorm color texture into an RGBA8 upload (font atlases rely on it).
+        Uint32 swizzleSrcChannels = 0, swizzlePacked = 0, swizzleKey = kNoSwizzle;
+        {
+            const Vec4<TextureSwizzleParam>& sw = texture.GetAllSwizzleParams();
+            const Uint32 srcCh = SwizzleMaterializeSrcChannels(fmt);
+            if (srcCh != 0 && !IsIdentitySwizzle(sw)) {
+                swizzleSrcChannels = srcCh;
+                swizzlePacked = PackSwizzle(sw);
+                swizzleKey = swizzlePacked;
+                info.srcBytesPerTexel = srcCh;   // source keeps its native channel count
+                info.format = (fmt == WGPUTextureFormat_RGBA8UnormSrgb) ? WGPUTextureFormat_RGBA8UnormSrgb
+                                                                        : WGPUTextureFormat_RGBA8Unorm;
+                info.bytesPerTexel = 4;          // materialized RGBA8
+                fmt = info.format;
+            }
         }
         auto* mip = dynamic_cast<MG_State::GLState::TextureObjectMipmap*>(&texture);
         if (!mip) {
@@ -1989,7 +2050,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                 cached.lastUseSerial = m_flushSerial;
                 return &cached; // up to date
             }
-            if (cached.width != w || cached.height != h || cached.format != fmt || cached.mipLevelCount != mipLevelCount) {
+            if (cached.width != w || cached.height != h || cached.format != fmt ||
+                cached.mipLevelCount != mipLevelCount || cached.swizzleKey != swizzleKey) {
                 if (cached.attachmentSrgbView) wgpuTextureViewRelease(cached.attachmentSrgbView);
                 if (cached.attachmentView) wgpuTextureViewRelease(cached.attachmentView);
                 if (cached.view) wgpuTextureViewRelease(cached.view);
@@ -2004,7 +2066,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                         FlushFrame();
                     }
                     UploadTextureLevels(cached.texture, *mip, info.bytesPerTexel,
-                                        info.srcBytesPerTexel ? info.srcBytesPerTexel : info.bytesPerTexel);
+                                        info.srcBytesPerTexel ? info.srcBytesPerTexel : info.bytesPerTexel,
+                                        swizzleSrcChannels, swizzlePacked);
                 }
                 if (viewDirty) {
                     if (cached.view) {
@@ -2054,7 +2117,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // Upload level-0 CPU data if present; FBO attachments allocated without data
         // (glTexImage2D NULL) just stay zero-initialized and get rendered into.
         UploadTextureLevels(tex, *mip, info.bytesPerTexel,
-                            info.srcBytesPerTexel ? info.srcBytesPerTexel : info.bytesPerTexel);
+                            info.srcBytesPerTexel ? info.srcBytesPerTexel : info.bytesPerTexel,
+                            swizzleSrcChannels, swizzlePacked);
 
         WgpuTexture wt;
         wt.texture = tex;
@@ -2084,6 +2148,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         wt.viewBaseMipLevel = baseMipLevel;
         wt.viewMipLevelCount = viewMipLevelCount;
         wt.textureParamsVersion = textureParamsVersion;
+        wt.swizzleKey = swizzleKey;
         wt.format = fmt;
         wt.lastUseSerial = m_flushSerial;
         auto [ins, ok] = m_textureCache.emplace(&texture, wt);
@@ -2155,10 +2220,18 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     }
 
     void WebGPURenderer::UploadTextureLevels(WGPUTexture tex, MG_State::GLState::TextureObjectMipmap& mip,
-                                             Uint32 bytesPerTexel, Uint32 srcBytesPerTexel) {
+                                             Uint32 bytesPerTexel, Uint32 srcBytesPerTexel,
+                                             Uint32 swizzleSrcChannels, Uint32 swizzlePacked) {
         const auto target = TextureUploadTarget::Texture2D;
         const Uint32 levelCount = CountValidMipLevels(mip, target);
         std::vector<Uint8> expandScratch;
+        // Unpack the 4 swizzle selectors (3 bits each) once; only used when materializing.
+        const TextureSwizzleParam swz[4] = {
+            static_cast<TextureSwizzleParam>(swizzlePacked & 0x7),
+            static_cast<TextureSwizzleParam>((swizzlePacked >> 3) & 0x7),
+            static_cast<TextureSwizzleParam>((swizzlePacked >> 6) & 0x7),
+            static_cast<TextureSwizzleParam>((swizzlePacked >> 9) & 0x7),
+        };
         for (Uint32 level = 0; level < levelCount; ++level) {
             const IntVec3 dim = mip.GetMipmapTexelSize(target, level);
             const Uint32 w = static_cast<Uint32>(dim.x());
@@ -2168,12 +2241,25 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             if (pixels && byteSize > 0) {
                 const void* src = pixels;
                 SizeT srcSize = byteSize;
-                // WebGPU has no 3-channel format: expand an RGB(8) source into the RGBA8
-                // texture, filling alpha with 0xFF. Only when the source really carries a
-                // level's worth of 3-byte texels (render-target attachments have none).
-                if (srcBytesPerTexel != 0 && srcBytesPerTexel != bytesPerTexel &&
+                // GL texture swizzle baked into an RGBA8 upload: for each texel store
+                // swizzle(baseExpand(src)). Takes precedence over the RGB expansion below.
+                if (swizzleSrcChannels != 0 &&
+                    byteSize >= static_cast<SizeT>(w) * h * swizzleSrcChannels) {
+                    expandScratch.assign(static_cast<SizeT>(w) * h * 4, 0);
+                    const Uint8* s = static_cast<const Uint8*>(pixels);
+                    for (SizeT px = 0; px < static_cast<SizeT>(w) * h; ++px) {
+                        const Uint8* sp = s + px * swizzleSrcChannels;
+                        for (Uint32 ch = 0; ch < 4; ++ch)
+                            expandScratch[px * 4 + ch] = ApplySwizzleChannel(sp, swizzleSrcChannels, swz[ch]);
+                    }
+                    src = expandScratch.data();
+                    srcSize = expandScratch.size();
+                } else if (srcBytesPerTexel != 0 && srcBytesPerTexel != bytesPerTexel &&
                     srcBytesPerTexel == 3 && bytesPerTexel == 4 &&
                     byteSize >= static_cast<SizeT>(w) * h * 3) {
+                    // WebGPU has no 3-channel format: expand an RGB(8) source into the RGBA8
+                    // texture, filling alpha with 0xFF. Only when the source really carries a
+                    // level's worth of 3-byte texels (render-target attachments have none).
                     expandScratch.assign(static_cast<SizeT>(w) * h * 4, 0xFF);
                     const Uint8* s = static_cast<const Uint8*>(pixels);
                     for (SizeT px = 0; px < static_cast<SizeT>(w) * h; ++px) {

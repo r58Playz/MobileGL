@@ -560,6 +560,9 @@ static void dispatch(trace::Call* c) {
             g_texMinFilterCounts[AS(2)]++;
         } else if (AE(1) == GL_TEXTURE_BASE_LEVEL || AE(1) == GL_TEXTURE_MAX_LEVEL) {
             g_texLevelParamCounts[AE(1)]++;
+        } else if (AE(1) == GL_TEXTURE_SWIZZLE_R || AE(1) == GL_TEXTURE_SWIZZLE_G ||
+                   AE(1) == GL_TEXTURE_SWIZZLE_B || AE(1) == GL_TEXTURE_SWIZZLE_A) {
+            g_texSwizzleParamCounts[AE(1)]++; // scalar swizzle (Modern UI font atlas uses this)
         }
         glTexParameteri(AE(0), AE(1), AS(2));
         return;
@@ -631,6 +634,8 @@ static void dispatch(trace::Call* c) {
         else if (AE(1) == GL_TEXTURE_WRAP_T) info.wrapT = AS(2);
         if (AE(1) == GL_TEXTURE_MIN_FILTER) g_texMinFilterCounts[AS(2)]++;
         else if (AE(1) == GL_TEXTURE_BASE_LEVEL || AE(1) == GL_TEXTURE_MAX_LEVEL) g_texLevelParamCounts[AE(1)]++;
+        else if (AE(1) == GL_TEXTURE_SWIZZLE_R || AE(1) == GL_TEXTURE_SWIZZLE_G ||
+                 AE(1) == GL_TEXTURE_SWIZZLE_B || AE(1) == GL_TEXTURE_SWIZZLE_A) g_texSwizzleParamCounts[AE(1)]++;
         glTextureParameteri(remap(g_tex, AU(0)), AE(1), AS(2));
         return;
     }

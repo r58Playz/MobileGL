@@ -156,6 +156,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             Uint32 viewBaseMipLevel = 0;
             Uint32 viewMipLevelCount = 1;
             Uint16 textureParamsVersion = 0;
+            Uint32 swizzleKey = 0xFFFF; // baked GL swizzle (PackSwizzle); 0xFFFF => none. A
+                                        // change forces a re-materialize (full recreate).
             WGPUTextureFormat format = WGPUTextureFormat_Undefined;
             Bool isDepth = false; // depth-format texture (sampled via depth/unfilterable-float)
             // See WgpuBuffer::lastUseSerial — same submit-ordering hazard for
@@ -247,8 +249,12 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // Uploads every valid 2D mip level stored in `mip` into `tex` via the queue.
         // Levels with no CPU pixels are left zero-initialized. bytesPerTexel comes from
         // the resolved WGPU format (RGBA8=4, RGBA16F=8, ...); it sizes the row pitch.
+        // When swizzleSrcChannels != 0, a non-identity GL texture swizzle is baked into
+        // the RGBA8 output: each texel becomes swizzle(baseExpand(src)) (see the .cpp).
+        // swizzlePacked holds the 4 TextureSwizzleParam values (3 bits each).
         void UploadTextureLevels(WGPUTexture tex, MG_State::GLState::TextureObjectMipmap& mip,
-                                 Uint32 bytesPerTexel, Uint32 srcBytesPerTexel);
+                                 Uint32 bytesPerTexel, Uint32 srcBytesPerTexel,
+                                 Uint32 swizzleSrcChannels = 0, Uint32 swizzlePacked = 0);
         // Builds (or reuses) a WGPUSampler matching the GL sampler params
         // (glTexParameter / glBindSampler). Cached by the resolved param values.
         // comparison: emit a compare sampler (for sampler2DShadow / sampler_comparison).

@@ -642,7 +642,8 @@ if (EMSCRIPTEN)
             ${_rep_js_flags}
             "--js-library=${CMAKE_SOURCE_DIR}/MobileGL/MG_Backend/DirectWebGPU/lib_mobilegl_webgpu.js"
             "-sWASM_BIGINT" "-sSTACK_SIZE=32MB" "-sALLOW_MEMORY_GROWTH=1" "-sEXIT_RUNTIME=0"
-            "-sEXPORTED_RUNTIME_METHODS=addRunDependency,removeRunDependency,HEAPU8"
+            "-sFORCE_FILESYSTEM=1"
+            "-sEXPORTED_RUNTIME_METHODS=addRunDependency,removeRunDependency,HEAPU8,FS"
             "-sEXPORTED_FUNCTIONS=_main,_replay_run,_replay_capture,_replay_done,_replay_pixels,_replay_width,_replay_height"
             # Synchronous instantiation assigns exports eagerly (no lazy JS wrapper),
             # so Module['_replay_capture'] is the raw WebAssembly export that

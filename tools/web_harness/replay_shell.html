@@ -38,9 +38,33 @@
       surfH: parseInt(new URLSearchParams(location.search).get('h') || '0', 10) || 0,
       capW: parseInt(new URLSearchParams(location.search).get('capw') || '0', 10) || 0,
       capH: parseInt(new URLSearchParams(location.search).get('caph') || '0', 10) || 0,
-      print: (t)    => { document.getElementById('log').textContent += t + "\n"; console.log(t); },
-      printErr: (t) => { document.getElementById('log').textContent += "ERR: " + t + "\n"; console.error(t); },
+      // The full log is kept in _fullLog (readable via evaluate_script for debugging);
+      // only the tail is rendered to #log so the DOM/a11y snapshot stays small.
+      _fullLog: "",
+      _render: function(s) {
+        Module._fullLog += s;
+        var el = document.getElementById('log');
+        var max = 3500;
+        el.textContent = Module._fullLog.length > max ? Module._fullLog.slice(-max) : Module._fullLog;
+      },
+      print: (t)    => { Module._render(t + "\n"); console.log(t); },
+      printErr: (t) => { Module._render("ERR: " + t + "\n"); console.error(t); },
       preRun: [function() {
+        // ?trace=NAME fetches the trace at runtime and writes it to /trace.trace,
+        // so one build can replay any fixture (no per-fixture preload rebuild).
+        // Falls back to the preloaded /trace.trace when ?trace= is absent.
+        var traceName = new URLSearchParams(location.search).get('trace') || '';
+        if (traceName) {
+          addRunDependency('trace-file');
+          fetch(traceName).then((r) => {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.arrayBuffer();
+          }).then((buf) => {
+            FS.writeFile('/trace.trace', new Uint8Array(buf));
+            Module.print("[shell] trace fetched: " + traceName + " (" + buf.byteLength + " bytes)");
+          }).catch((e) => Module.printErr("trace fetch failed (" + traceName + "): " + e))
+            .finally(() => removeRunDependency('trace-file'));
+        }
         if (!navigator.gpu) { Module.printErr("WebGPU not available"); return; }
         addRunDependency('webgpu-device');
         (async () => {
@@ -97,8 +121,10 @@
           Module.print("[compare] mismatch=" + mismatch + " / " + (w*h) +
                        " (tolerance " + TOL + ") -> " + (mismatch <= TOL ? "PASS" : "FAIL"));
         };
-        img.onerror = function() { Module.printErr("[compare] failed to load golden.png"); };
-        img.src = "golden.png?ts=" + Date.now(); // cache-bust: golden changes per fixture
+        img.onerror = function() { Module.printErr("[compare] failed to load golden"); };
+        // ?golden=NAME overrides the golden path (batch mode serves one per fixture).
+        var goldenName = new URLSearchParams(location.search).get('golden') || 'golden.png';
+        img.src = goldenName + (goldenName.indexOf('?') < 0 ? "?ts=" : "&ts=") + Date.now();
       },
     };
   </script>
