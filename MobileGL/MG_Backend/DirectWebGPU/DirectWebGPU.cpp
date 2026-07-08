@@ -117,18 +117,17 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
     }
 
-    // Safe no-ops for backend entry points the frontend calls WITHOUT a null guard
-    // (GenerateMipmap_Backend / CopyTex*_Backend). Leaving these null crashes the replay
-    // the first time an Iris trace hits them. Real implementations are follow-ups:
-    // GenerateMipmap needs a GPU downsample chain; CopyTex* need framebuffer->texture copies.
+    // Populates mip levels 1+ of the bound texture via a GPU downsample chain (the
+    // frontend routes both glGenerateMipmap and glGenerateTextureMipmap here with the
+    // target bound). Without it, minified sampling of mipmapped textures (e.g. the block
+    // atlas at grazing angles) blends real mip 0 with zero-initialized higher mips.
     void GenerateMipmap(GLenum target) {
-        (void)target;
-        static Bool warned = false;
-        if (!warned) {
-            warned = true;
-            MGLOG_W("DirectWebGPU: glGenerateMipmap not implemented yet (mip levels 1+ left unpopulated)");
+        if (pWebGPURenderer) {
+            pWebGPURenderer->GenerateMipmaps(target);
         }
     }
+
+    // CopyTex* still need framebuffer->texture copies; left as no-ops for now.
 
     void CopyTexSubImage2D(GLenum, GLint, GLint, GLint, GLint, GLint, GLsizei, GLsizei) {
         static Bool warned = false;

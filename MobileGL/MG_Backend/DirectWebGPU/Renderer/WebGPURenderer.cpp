@@ -2276,6 +2276,145 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         return s;
     }
 
+    WGPURenderPipeline WebGPURenderer::GetOrCreateMipPipeline(WGPUTextureFormat format) {
+        if (auto it = m_mipPipelines.find(static_cast<Uint32>(format)); it != m_mipPipelines.end()) {
+            return it->second;
+        }
+        if (!m_mipShaderModule) {
+            // Fullscreen triangle that samples the previous mip level (explicit LOD, so no
+            // uniformity requirement) with a linear filter -> a 2x2 box downsample. uv
+            // follows framebuffer orientation so mip L keeps mip L-1's row order.
+            static const char* kMipWgsl =
+                "@group(0) @binding(0) var mipSrc : texture_2d<f32>;\n"
+                "@group(0) @binding(1) var mipSmp : sampler;\n"
+                "struct MipVary { @builtin(position) pos : vec4<f32>, @location(0) uv : vec2<f32> };\n"
+                "@vertex fn main_vs(@builtin(vertex_index) vid : u32) -> MipVary {\n"
+                "  var o : MipVary;\n"
+                "  let x = f32((vid << 1u) & 2u);\n"
+                "  let y = f32(vid & 2u);\n"
+                "  o.uv = vec2<f32>(x, y);\n"
+                "  o.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);\n"
+                "  return o;\n"
+                "}\n"
+                "@fragment fn main_fs(v : MipVary) -> @location(0) vec4<f32> {\n"
+                "  return textureSampleLevel(mipSrc, mipSmp, v.uv, 0.0);\n"
+                "}\n";
+            m_mipShaderModule = MakeShaderModule(kMipWgsl);
+        }
+        if (!m_mipShaderModule) {
+            return nullptr;
+        }
+        WGPURenderPipelineDescriptor desc{};
+        desc.layout = nullptr; // auto layout (texture + sampler at group 0)
+        desc.vertex.module = m_mipShaderModule;
+        desc.vertex.entryPoint = Wgpu::View("main_vs");
+        desc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+        desc.multisample.count = 1;
+        desc.multisample.mask = 0xFFFFFFFFu;
+        WGPUColorTargetState ct{};
+        ct.format = format;
+        ct.writeMask = WGPUColorWriteMask_All;
+        WGPUFragmentState fragment{};
+        fragment.module = m_mipShaderModule;
+        fragment.entryPoint = Wgpu::View("main_fs");
+        fragment.targetCount = 1;
+        fragment.targets = &ct;
+        desc.fragment = &fragment;
+        WGPURenderPipeline pipe = wgpuDeviceCreateRenderPipeline(m_device, &desc);
+        m_mipPipelines.emplace(static_cast<Uint32>(format), pipe);
+        return pipe;
+    }
+
+    void WebGPURenderer::GenerateMipmaps(GLenum target) {
+        if (!m_device || !MG_State::pGLContext || target != GL_TEXTURE_2D) {
+            return;
+        }
+        auto texObj = MG_State::pGLContext->GetTextureUnitObject(MG_State::pGLContext->GetActiveTextureUnit())
+                          .GetBindingSlot(TextureTarget::Texture2D)
+                          .GetBoundObject();
+        if (!texObj) {
+            return;
+        }
+        // Resolve/upload the texture first (may FlushFrame); after this the encoder is fresh.
+        const WgpuTexture* wt = GetOrCreateTexture(*texObj);
+        // Only textures allocated with a mip chain (glTexStorage2D levels>1) can be filled
+        // here. A mutable texture created via glTexImage2D level 0 has a single WGPU level
+        // (mip count is fixed at creation), so glGenerateMipmap on it is still a no-op —
+        // honoring that would require recreating the texture with a full chain (follow-up).
+        if (!wt || wt->isDepth || !wt->texture || wt->mipLevelCount <= 1) {
+            return;
+        }
+        WGPUTexture tex = wt->texture;
+        const WGPUTextureFormat fmt = wt->format;
+        const Uint32 levels = wt->mipLevelCount;
+        WGPURenderPipeline pipe = GetOrCreateMipPipeline(fmt);
+        if (!pipe) {
+            return;
+        }
+        if (!m_mipSampler) {
+            WGPUSamplerDescriptor msd{};
+            msd.addressModeU = msd.addressModeV = msd.addressModeW = WGPUAddressMode_ClampToEdge;
+            msd.magFilter = msd.minFilter = WGPUFilterMode_Linear;
+            msd.mipmapFilter = WGPUMipmapFilterMode_Nearest;
+            msd.lodMinClamp = 0.0f;
+            msd.lodMaxClamp = 32.0f;
+            msd.maxAnisotropy = 1;
+            m_mipSampler = wgpuDeviceCreateSampler(m_device, &msd);
+        }
+        BeginFrameIfNeeded();
+        if (!m_frameActive || !m_encoder) {
+            return;
+        }
+        WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(pipe, 0);
+        // Each level L is rendered from the single-level view of L-1. Recorded on the frame
+        // encoder in order, so these complete before any later draw samples the texture.
+        for (Uint32 level = 1; level < levels; ++level) {
+            WGPUTextureViewDescriptor svd{};
+            svd.format = fmt;
+            svd.dimension = WGPUTextureViewDimension_2D;
+            svd.baseMipLevel = level - 1;
+            svd.mipLevelCount = 1;
+            svd.baseArrayLayer = 0;
+            svd.arrayLayerCount = 1;
+            svd.aspect = WGPUTextureAspect_All;
+            WGPUTextureView srcView = wgpuTextureCreateView(tex, &svd);
+            WGPUTextureViewDescriptor dvd = svd;
+            dvd.baseMipLevel = level;
+            WGPUTextureView dstView = wgpuTextureCreateView(tex, &dvd);
+
+            WGPUBindGroupEntry entries[2]{};
+            entries[0].binding = 0;
+            entries[0].textureView = srcView;
+            entries[1].binding = 1;
+            entries[1].sampler = m_mipSampler;
+            WGPUBindGroupDescriptor bgd{};
+            bgd.layout = bgl;
+            bgd.entryCount = 2;
+            bgd.entries = entries;
+            WGPUBindGroup bg = wgpuDeviceCreateBindGroup(m_device, &bgd);
+
+            WGPURenderPassColorAttachment ca{};
+            ca.view = dstView;
+            ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
+            ca.loadOp = WGPULoadOp_Clear;
+            ca.storeOp = WGPUStoreOp_Store;
+            ca.clearValue = {0.0, 0.0, 0.0, 0.0};
+            WGPURenderPassDescriptor rp{};
+            rp.colorAttachmentCount = 1;
+            rp.colorAttachments = &ca;
+            WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(m_encoder, &rp);
+            wgpuRenderPassEncoderSetPipeline(pass, pipe);
+            wgpuRenderPassEncoderSetBindGroup(pass, 0, bg, 0, nullptr);
+            wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+            wgpuRenderPassEncoderEnd(pass);
+            wgpuRenderPassEncoderRelease(pass);
+            wgpuBindGroupRelease(bg);
+            wgpuTextureViewRelease(srcView);
+            wgpuTextureViewRelease(dstView);
+        }
+        wgpuBindGroupLayoutRelease(bgl);
+    }
+
     WGPURenderPassEncoder WebGPURenderer::BeginDrawPass(MG_State::GLState::ProgramObject& program,
                                                         const MG_State::GLState::VertexArrayObject& vao,
                                                         GLenum mode) {

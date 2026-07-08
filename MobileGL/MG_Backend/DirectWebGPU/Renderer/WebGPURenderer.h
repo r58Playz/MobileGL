@@ -76,6 +76,9 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // Scaling/format-convert and depth/stencil blits aren't supported yet.
         void BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0,
                              GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter);
+        // glGenerateMipmap / glGenerateTextureMipmap: fill mip levels 1+ of the bound
+        // 2D texture by rendering each level from the previous (linear 2x2 downsample).
+        void GenerateMipmaps(GLenum target);
         // Blocks (via JSPI) until all submitted GPU work has completed.
         void Finish();
 
@@ -254,6 +257,9 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         WGPUSampler GetOrCreateSampler(const MG_State::GLState::SamplerObject& sampler, Bool comparison = false,
                                        Bool forceNonFiltering = false);
         WGPUShaderModule MakeShaderModule(const char* wgsl);
+        // Blit pipeline for the mipmap downsample, cached per color format (the render
+        // target format must match the texture's).
+        WGPURenderPipeline GetOrCreateMipPipeline(WGPUTextureFormat format);
         // Begins a Load render pass, binds the pipeline + vertex buffers for the
         // current program/VAO. Returns the pass (caller draws + ends) or nullptr.
         WGPURenderPassEncoder BeginDrawPass(MG_State::GLState::ProgramObject& program,
@@ -282,6 +288,11 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         UnorderedMap<const MG_State::GLState::ITextureObject*, WgpuTexture> m_textureCache;
         // WGPUSamplers keyed by a hash of their resolved descriptor (GL sampler params).
         UnorderedMap<Uint64, WGPUSampler> m_samplerCache;
+        // Mipmap-downsample blit: one shader module + a linear-clamp sampler, and a
+        // render pipeline cached per color format (GenerateMipmaps).
+        WGPUShaderModule m_mipShaderModule = nullptr;
+        WGPUSampler m_mipSampler = nullptr;
+        UnorderedMap<Uint32, WGPURenderPipeline> m_mipPipelines;
         // Bind groups reference runtime resources (textures/UBO contents), so they are
         // rebuilt each draw and released at frame end.
         Vector<WGPUBindGroup> m_frameBindGroups;
