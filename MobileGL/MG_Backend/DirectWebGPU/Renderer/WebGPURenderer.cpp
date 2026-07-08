@@ -205,6 +205,16 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             case F::RG32F:                      return {WGPUTextureFormat_RG32Float, 8};
             case F::RGBA32F:                    return {WGPUTextureFormat_RGBA32Float, 16};
             case F::R11FG11FB10F:               return {WGPUTextureFormat_RG11B10Ufloat, 4};
+            // WebGPU has no 3-channel float and forbids snorm render targets, but Iris
+            // uses RGB16F / *_SNORM gbuffers (e.g. normals in [-1,1]). Map them to float
+            // variants that are renderable/filterable and hold the range (same rationale
+            // as the 16-bit unorm cases above). These are render targets (no CPU data).
+            case F::RGB16F:                     return {WGPUTextureFormat_RGBA16Float, 8};
+            case F::RGB16:                      return {WGPUTextureFormat_RGBA16Float, 8};
+            case F::R8Snorm: case F::R16Snorm:  return {WGPUTextureFormat_R16Float, 2};
+            case F::RG8Snorm: case F::RG16Snorm: return {WGPUTextureFormat_RG16Float, 4};
+            case F::RGB8Snorm: case F::RGB16Snorm:
+            case F::RGBA8Snorm: case F::RGBA16Snorm: return {WGPUTextureFormat_RGBA16Float, 8};
             default:                            return {WGPUTextureFormat_Undefined, 0};
             }
         }
