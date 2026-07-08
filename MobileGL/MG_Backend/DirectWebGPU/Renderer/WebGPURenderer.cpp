@@ -1197,6 +1197,376 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
     }
 
+    // --- Inter-stage varying packing ------------------------------------------------
+    // WebGPU caps inter-stage variables at 16 locations (maxInterStageShaderVariables),
+    // but Iris gbuffer shaders declare more (some 21). Desktop GL packs varyings by
+    // component; tint gives each GLSL varying its own @location, so the count overflows
+    // and CreateRenderPipeline fails -> invalid pipeline -> draws skipped -> black scene.
+    // We pack smooth f32-scalar varyings 4-to-a-vec4 so the count fits. Runs on a
+    // program's vertex+fragment WGSL together (both key off the same @location numbers)
+    // and only when the vertex output overflows, so in-limit shaders are untouched. Any
+    // parse surprise bails (returns false), leaving the WGSL unchanged.
+
+    // Split a comma list respecting (), <>, [] nesting; trims and drops empty items.
+    static std::vector<std::string> SplitTopLevelCommas(const std::string& s) {
+        std::vector<std::string> out;
+        int depth = 0;
+        size_t start = 0;
+        auto flush = [&](size_t end) {
+            size_t a = start, b = end;
+            while (a < b && std::isspace((unsigned char)s[a])) ++a;
+            while (b > a && std::isspace((unsigned char)s[b - 1])) --b;
+            if (b > a) out.push_back(s.substr(a, b - a));
+        };
+        for (size_t i = 0; i < s.size(); ++i) {
+            char c = s[i];
+            if (c == '(' || c == '<' || c == '[') ++depth;
+            else if (c == ')' || c == '>' || c == ']') --depth;
+            else if (c == ',' && depth == 0) { flush(i); start = i + 1; }
+        }
+        flush(s.size());
+        return out;
+    }
+
+    struct WgslVarying {
+        std::string attrs;  // e.g. "@location(9)" / "@location(1) @interpolate(flat)" / "@builtin(position)"
+        std::string name;   // struct field or fn param identifier
+        std::string type;   // "f32", "vec4f", "vec3i", ...
+        int location = -1;  // -1 => @builtin
+        bool flat = false;
+    };
+    // Parse one "attrs name : type" fragment (from a struct member or fn param).
+    static bool ParseVaryingChunk(const std::string& chunk, WgslVarying& v) {
+        const size_t colon = chunk.find(':');
+        if (colon == std::string::npos) return false;
+        size_t te = chunk.size();
+        v.type = chunk.substr(colon + 1);
+        // trim type
+        size_t ta = 0, tb = v.type.size();
+        while (ta < tb && std::isspace((unsigned char)v.type[ta])) ++ta;
+        while (tb > ta && std::isspace((unsigned char)v.type[tb - 1])) --tb;
+        v.type = v.type.substr(ta, tb - ta);
+        std::string before = chunk.substr(0, colon);
+        size_t e = before.size();
+        while (e > 0 && std::isspace((unsigned char)before[e - 1])) --e;
+        size_t nb = e;
+        while (nb > 0 && (std::isalnum((unsigned char)before[nb - 1]) || before[nb - 1] == '_')) --nb;
+        v.name = before.substr(nb, e - nb);
+        v.attrs = before.substr(0, nb);
+        if (v.name.empty()) return false;
+        v.flat = v.attrs.find("@interpolate(flat)") != std::string::npos;
+        const size_t lp = v.attrs.find("@location(");
+        if (lp != std::string::npos) {
+            v.location = std::atoi(v.attrs.c_str() + lp + 10);
+        } else {
+            v.location = -1; // @builtin
+        }
+        (void)te;
+        return true;
+    }
+    // Pack a vertex/fragment WGSL pair so inter-stage variables fit in 16 locations.
+    static bool PackInterStageVaryings(std::string& vs, std::string& fs) {
+        // 1) Locate the vertex output struct (the one carrying @builtin(position)).
+        size_t bpos = vs.find("@builtin(position)");
+        if (bpos == std::string::npos) return false;
+        size_t sdecl = vs.rfind("struct ", bpos);
+        if (sdecl == std::string::npos) return false;
+        size_t nameStart = sdecl + 7;
+        size_t nameEnd = vs.find_first_of(" \t\n{", nameStart);
+        if (nameEnd == std::string::npos) return false;
+        std::string structName = vs.substr(nameStart, nameEnd - nameStart);
+        size_t open = vs.find('{', nameEnd);
+        size_t close = (open == std::string::npos) ? std::string::npos : vs.find('}', open);
+        if (open == std::string::npos || close == std::string::npos || bpos > close) return false;
+        std::string body = vs.substr(open + 1, close - open - 1);
+
+        std::vector<WgslVarying> members;
+        int locCount = 0;
+        for (const auto& chunk : SplitTopLevelCommas(body)) {
+            WgslVarying v;
+            if (!ParseVaryingChunk(chunk, v)) return false;
+            if (v.location >= 0) ++locCount;
+            members.push_back(v);
+        }
+        if (locCount <= 16) return false; // in-limit: nothing to do
+
+        // 2) Component bin-pack smooth float varyings (f32/vec2f/vec3f) into vec4 slots
+        //    (vec4f / flat / integer varyings keep their own location, renumbered). This
+        //    is what fits Iris gbuffer shaders (some 21-24 varyings, but <=64 components)
+        //    into the 16-location cap.
+        auto typeSize = [](const std::string& t) -> int {
+            if (t == "f32" || t == "float") return 1;
+            if (t == "vec2f" || t == "vec2<f32>") return 2;
+            if (t == "vec3f" || t == "vec3<f32>") return 3;
+            if (t == "vec4f" || t == "vec4<f32>") return 4;
+            return 4; // int / unknown / array -> treat as a full slot (kept, not packed)
+        };
+        auto packable = [&](const WgslVarying& v) {
+            if (v.location < 0 || v.flat) return false;
+            const int s = typeSize(v.type);
+            return s >= 1 && s <= 3;
+        };
+        int keepCount = 0;
+        std::vector<int> packOrder; // member indices, packable
+        for (size_t i = 0; i < members.size(); ++i) {
+            const WgslVarying& v = members[i];
+            if (v.location < 0) continue;
+            if (packable(v)) packOrder.push_back((int)i); else ++keepCount;
+        }
+        // First-fit-decreasing bin packing into capacity-4 slots.
+        std::stable_sort(packOrder.begin(), packOrder.end(),
+                         [&](int a, int b) { return typeSize(members[a].type) > typeSize(members[b].type); });
+        struct PackInfo { int slot; int offset; int size; };
+        std::unordered_map<int, PackInfo> packMap; // old location -> pack placement
+        std::vector<int> slotRemaining;            // free components per slot
+        for (int idx : packOrder) {
+            const int sz = typeSize(members[idx].type);
+            int chosen = -1;
+            for (size_t s = 0; s < slotRemaining.size(); ++s) {
+                if (slotRemaining[s] >= sz) { chosen = (int)s; break; }
+            }
+            if (chosen < 0) { chosen = (int)slotRemaining.size(); slotRemaining.push_back(4); }
+            const int offset = 4 - slotRemaining[chosen];
+            slotRemaining[chosen] -= sz;
+            packMap[members[idx].location] = {chosen, offset, sz};
+        }
+        const int slots = (int)slotRemaining.size();
+        if (slots == 0 || keepCount + slots > 16) return false; // nothing to pack, or still over
+
+        std::unordered_map<int, int> keepNewLoc; // old location -> new location (kept members)
+        int nextKeep = 0;
+        for (const auto& v : members) {
+            if (v.location < 0 || packable(v)) continue;
+            keepNewLoc[v.location] = nextKeep++;
+        }
+        const int slotBase = keepCount; // slot s -> location keepCount + s
+
+        // 3) Rebuild the vertex output struct + its positional constructor together.
+        size_t ctorOpen = vs.find(structName + "(");
+        if (ctorOpen == std::string::npos) return false;
+        ctorOpen += structName.size();
+        int d = 0; size_t ctorClose = std::string::npos;
+        for (size_t i = ctorOpen; i < vs.size(); ++i) {
+            if (vs[i] == '(') ++d; else if (vs[i] == ')') { if (--d == 0) { ctorClose = i; break; } }
+        }
+        if (ctorClose == std::string::npos) return false;
+        std::vector<std::string> args = SplitTopLevelCommas(vs.substr(ctorOpen + 1, ctorClose - ctorOpen - 1));
+        if (args.size() != members.size()) return false; // ctor must be positional over members
+
+        std::string newStruct = "struct " + structName + " {\n";
+        std::vector<std::string> keepArgs;
+        // Per slot, the (offset,size,argExpr) items to assemble into a vec4.
+        std::vector<std::vector<std::tuple<int, int, std::string>>> slotItems(slots);
+        for (size_t i = 0; i < members.size(); ++i) {
+            const WgslVarying& v = members[i];
+            if (v.location < 0) { // builtin: keep verbatim
+                newStruct += "  " + v.attrs + v.name + " : " + v.type + ",\n";
+                keepArgs.push_back(args[i]);
+            } else if (packable(v)) {
+                const PackInfo& pi = packMap[v.location];
+                slotItems[pi.slot].push_back({pi.offset, pi.size, args[i]});
+            } else {
+                newStruct += "  @location(" + std::to_string(keepNewLoc[v.location]) + ") " +
+                             (v.flat ? "@interpolate(flat) " : "") + v.name + " : " + v.type + ",\n";
+                keepArgs.push_back(args[i]);
+            }
+        }
+        for (int s = 0; s < slots; ++s) {
+            newStruct += "  @location(" + std::to_string(slotBase + s) + ") mgpk" + std::to_string(s) +
+                         " : vec4<f32>,\n";
+        }
+        newStruct += "}";
+        std::vector<std::string> finalArgs = keepArgs;
+        for (int s = 0; s < slots; ++s) {
+            auto& items = slotItems[s];
+            std::sort(items.begin(), items.end(),
+                      [](const auto& a, const auto& b) { return std::get<0>(a) < std::get<0>(b); });
+            std::string v4 = "vec4<f32>(";
+            int filled = 0;
+            bool firstc = true;
+            for (const auto& it : items) {
+                if (!firstc) v4 += ", ";
+                firstc = false;
+                v4 += std::get<2>(it);
+                filled += std::get<1>(it);
+            }
+            for (; filled < 4; ++filled) { if (!firstc) v4 += ", "; firstc = false; v4 += "0.0"; }
+            v4 += ")";
+            finalArgs.push_back(v4);
+        }
+        std::string newCtorArgs;
+        for (size_t i = 0; i < finalArgs.size(); ++i) { newCtorArgs += finalArgs[i]; if (i + 1 < finalArgs.size()) newCtorArgs += ", "; }
+        vs = vs.substr(0, sdecl) + newStruct + vs.substr(close + 1);
+        // constructor position shifted by the struct-length delta; re-find it.
+        size_t c2p = vs.find(structName + "(");
+        if (c2p == std::string::npos) return false;
+        size_t c2 = c2p + structName.size(); // at '('
+        d = 0; size_t c2close = std::string::npos;
+        for (size_t i = c2; i < vs.size(); ++i) {
+            if (vs[i] == '(') ++d; else if (vs[i] == ')') { if (--d == 0) { c2close = i; break; } }
+        }
+        if (c2close == std::string::npos) return false;
+        vs = vs.substr(0, c2) + "(" + newCtorArgs + ")" + vs.substr(c2close + 1);
+
+        // 4) Fragment inputs are the entry's parameters. Rewrite the param list and every
+        //    body use of a packed param identifier to read from its packed vec4 param.
+        size_t fnpos = fs.find("fn main(");
+        // The fragment entry (there may be helper fn main_1); pick the one taking @location/@builtin params.
+        while (fnpos != std::string::npos) {
+            size_t p = fs.find('(', fnpos);
+            size_t q = p + 1; int dd = 1;
+            for (; q < fs.size() && dd; ++q) { if (fs[q] == '(') ++dd; else if (fs[q] == ')') --dd; }
+            std::string params = fs.substr(p + 1, q - 1 - (p + 1));
+            if (params.find("@location(") == std::string::npos && params.find("@builtin(position)") == std::string::npos) {
+                fnpos = fs.find("fn main(", fnpos + 1);
+                continue;
+            }
+            std::string newParams;
+            std::vector<std::string> replaceFrom, replaceTo; // identifier rewrites for the body
+            std::vector<bool> slotUsed(slots, false);
+            std::string slotDecls;
+            bool first = true;
+            for (const auto& pc : SplitTopLevelCommas(params)) {
+                WgslVarying v;
+                if (!ParseVaryingChunk(pc, v)) return false;
+                if (v.location < 0) { // builtin param: keep
+                    if (!first) newParams += ", "; first = false;
+                    newParams += v.attrs + v.name + " : " + v.type;
+                    continue;
+                }
+                auto pk = packMap.find(v.location);
+                if (pk != packMap.end()) {
+                    const int slotIdx = pk->second.slot, off = pk->second.offset, sz = pk->second.size;
+                    static const char* kXYZW = "xyzw";
+                    replaceFrom.push_back(v.name);
+                    replaceTo.push_back("mgpk" + std::to_string(slotIdx) + "_param." +
+                                        std::string(kXYZW + off, sz));
+                    if (slotIdx >= 0 && slotIdx < slots && !slotUsed[slotIdx]) {
+                        slotUsed[slotIdx] = true;
+                        if (!slotDecls.empty()) slotDecls += ", ";
+                        slotDecls += "@location(" + std::to_string(slotBase + slotIdx) + ") mgpk" +
+                                     std::to_string(slotIdx) + "_param : vec4<f32>";
+                    }
+                } else {
+                    auto kn = keepNewLoc.find(v.location);
+                    if (kn == keepNewLoc.end()) return false;
+                    if (!first) newParams += ", "; first = false;
+                    newParams += "@location(" + std::to_string(kn->second) + ") " +
+                                 (v.flat ? "@interpolate(flat) " : "") + v.name + " : " + v.type;
+                }
+            }
+            if (!slotDecls.empty()) { if (!first) newParams += ", "; newParams += slotDecls; }
+            std::string head = fs.substr(0, p + 1);
+            std::string tail = fs.substr(q - 1); // from the ')' onward
+            std::string body2 = head + newParams + tail;
+            // Rewrite packed param identifiers in the body (word-boundary).
+            for (size_t r = 0; r < replaceFrom.size(); ++r) {
+                const std::string& from = replaceFrom[r];
+                const std::string& to = replaceTo[r];
+                size_t at = 0;
+                while ((at = body2.find(from, at)) != std::string::npos) {
+                    bool lok = (at == 0) || (!std::isalnum((unsigned char)body2[at - 1]) && body2[at - 1] != '_');
+                    size_t end = at + from.size();
+                    bool rok = (end >= body2.size()) || (!std::isalnum((unsigned char)body2[end]) && body2[end] != '_');
+                    if (lok && rok) { body2.replace(at, from.size(), to); at += to.size(); }
+                    else at = end;
+                }
+            }
+            fs = body2;
+            return true;
+        }
+        return false;
+    }
+
+    // WebGPU requires a fragment output to have >= the color format's component count.
+    // Iris shaders write `out vec3 colortexN;` to RGBA(16F) targets (legal in GL, where
+    // the missing alpha is undefined); WebGPU rejects it -> invalid pipeline -> black.
+    // Widen every non-vec4 fragment output to vec4<f32> (alpha padded 1.0) so it is valid
+    // against any <=4-component target. No-op when all outputs are already vec4.
+    static bool WidenFragmentOutputs(std::string& fs) {
+        const size_t fp = fs.find("@fragment");
+        if (fp == std::string::npos) return false;
+        const size_t arrow = fs.find("->", fp);
+        const size_t brace = fs.find('{', fp);
+        if (arrow == std::string::npos || brace == std::string::npos || arrow > brace) return false;
+        size_t rs = arrow + 2;
+        while (rs < brace && std::isspace((unsigned char)fs[rs])) ++rs;
+        size_t re = rs;
+        while (re < brace && (std::isalnum((unsigned char)fs[re]) || fs[re] == '_')) ++re;
+        const std::string retType = fs.substr(rs, re - rs);
+        if (retType.empty() || retType == "vec4") return false; // struct return only
+        const size_t sp = fs.find("struct " + retType);
+        if (sp == std::string::npos) return false;
+        const size_t open = fs.find('{', sp);
+        const size_t close = (open == std::string::npos) ? std::string::npos : fs.find('}', open);
+        if (open == std::string::npos || close == std::string::npos) return false;
+
+        std::vector<WgslVarying> members;
+        for (const auto& chunk : SplitTopLevelCommas(fs.substr(open + 1, close - open - 1))) {
+            WgslVarying v;
+            if (!ParseVaryingChunk(chunk, v)) return false;
+            members.push_back(v);
+        }
+        auto compCount = [](const std::string& t) -> int {
+            if (t == "f32") return 1;
+            if (t == "vec2f" || t == "vec2<f32>") return 2;
+            if (t == "vec3f" || t == "vec3<f32>") return 3;
+            return 4; // vec4f / other -> already wide enough
+        };
+        bool any = false;
+        for (const auto& v : members) {
+            if (v.location >= 0 && compCount(v.type) < 4) { any = true; break; }
+        }
+        if (!any) return false;
+
+        // Rebuild the struct with widened members.
+        std::string newStruct = "struct " + retType + " {\n";
+        for (const auto& v : members) {
+            std::string t = v.type;
+            if (v.location >= 0 && compCount(v.type) < 4) t = "vec4<f32>";
+            newStruct += "  " + v.attrs + v.name + " : " + t + ",\n";
+        }
+        newStruct += "}";
+
+        // Rebuild the positional constructor, wrapping widened args as vec4<f32>(arg, 1.0...).
+        const size_t ctorAt = fs.find(retType + "(");
+        if (ctorAt == std::string::npos) return false;
+        size_t co = ctorAt + retType.size(); // at '('
+        int d = 0; size_t cc = std::string::npos;
+        for (size_t i = co; i < fs.size(); ++i) {
+            if (fs[i] == '(') ++d; else if (fs[i] == ')') { if (--d == 0) { cc = i; break; } }
+        }
+        if (cc == std::string::npos) return false;
+        std::vector<std::string> args = SplitTopLevelCommas(fs.substr(co + 1, cc - co - 1));
+        if (args.size() != members.size()) return false;
+        std::string newArgs;
+        for (size_t i = 0; i < members.size(); ++i) {
+            std::string a = args[i];
+            const int cn = compCount(members[i].type);
+            if (members[i].location >= 0 && cn < 4) {
+                std::string wrapped = "vec4<f32>(" + a;
+                for (int k = cn; k < 4; ++k) wrapped += ", 1.0";
+                wrapped += ")";
+                a = wrapped;
+            }
+            newArgs += a;
+            if (i + 1 < members.size()) newArgs += ", ";
+        }
+        // Struct first (earlier in the file), then constructor — splice from the later one
+        // first would shift the other; do struct, then re-find constructor.
+        fs = fs.substr(0, sp) + newStruct + fs.substr(close + 1);
+        const size_t ca2 = fs.find(retType + "(");
+        if (ca2 == std::string::npos) return false;
+        size_t co2 = ca2 + retType.size();
+        d = 0; size_t cc2 = std::string::npos;
+        for (size_t i = co2; i < fs.size(); ++i) {
+            if (fs[i] == '(') ++d; else if (fs[i] == ')') { if (--d == 0) { cc2 = i; break; } }
+        }
+        if (cc2 == std::string::npos) return false;
+        fs = fs.substr(0, co2) + "(" + newArgs + ")" + fs.substr(cc2 + 1);
+        return true;
+    }
+
     // Texture unit a sampler uniform resolves to (its glUniform1i value); 0 if unknown.
     static Int ResolveSamplerUnit(const MG_State::GLState::ProgramObject& program, const String& glName) {
         const Int loc = program.GetUniformLocation(glName);
@@ -1234,6 +1604,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         auto& spirv = program.GetGeneratedSpirv();
         auto& shaders = program.GetAttachedShaders();
         WgpuProgram prog;
+        std::string vsWgsl, fsWgsl; // buffered per-stage WGSL (post binding/clip rewrites)
         for (SizeT i = 0; i < shaders.size() && i < spirv.size(); ++i) {
             if (spirv[i].empty()) {
                 continue;
@@ -1304,15 +1675,32 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                     prog.resources.push_back(ref);
                 }
             }
-            WGPUShaderModule module = MakeShaderModule(code2.c_str());
+            // Defer module creation until both stages are transpiled: inter-stage
+            // varying packing (below) needs the vertex+fragment WGSL together.
             switch (shaders[i]->GetShaderStage()) {
-            case ShaderStage::Vertex: prog.vertex = module; break;
-            case ShaderStage::Fragment: prog.fragment = module; break;
-            default:
-                wgpuShaderModuleRelease(module);
-                break;
+            case ShaderStage::Vertex: vsWgsl = code2; break;
+            case ShaderStage::Fragment: fsWgsl = code2; break;
+            default: break;
             }
         }
+        // Pack inter-stage varyings when the vertex output exceeds WebGPU's 16-location
+        // cap (Iris gbuffer shaders); no-op for in-limit shaders. Must run before module
+        // creation so both stages share the repacked interface.
+        if (!vsWgsl.empty() && !fsWgsl.empty()) {
+            if (PackInterStageVaryings(vsWgsl, fsWgsl)) {
+                MGLOG_D("DirectWebGPU: packed inter-stage varyings for program %u",
+                        program.GetExternalIndex());
+            }
+        }
+        // WebGPU rejects a fragment output narrower than its color target (GL allows it).
+        // Widen vec3/vec2/f32 outputs to vec4 so Iris gbuffer shaders validate.
+        if (!fsWgsl.empty()) {
+            if (WidenFragmentOutputs(fsWgsl)) {
+                MGLOG_D("DirectWebGPU: widened fragment outputs for program %u", program.GetExternalIndex());
+            }
+        }
+        if (!vsWgsl.empty()) prog.vertex = MakeShaderModule(vsWgsl.c_str());
+        if (!fsWgsl.empty()) prog.fragment = MakeShaderModule(fsWgsl.c_str());
         if (!prog.vertex || !prog.fragment) {
             MGLOG_E("DirectWebGPU: program missing vertex or fragment WGSL module");
             if (prog.vertex) wgpuShaderModuleRelease(prog.vertex);
