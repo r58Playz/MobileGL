@@ -480,6 +480,20 @@ static void dispatch(trace::Call* c) {
         }
         return;
     }
+    // Whole-buffer map (older API). Xaero streams world-map region tiles through a
+    // pixel-unpack buffer this way: glMapBuffer -> memcpy writes -> glUnmapBuffer ->
+    // glTexSubImage2D(PBO). Without tracking the map, those writes are dropped and the
+    // tiles upload as zeros (black map). Range = the whole bound buffer's size.
+    if (!strcmp(n, "glMapBuffer")) {
+        GLint size = 0;
+        glGetBufferParameteriv(AE(0), GL_BUFFER_SIZE, &size);
+        void* real = glMapBuffer(AE(0), AE(1));
+        const unsigned long long traceRet = c->ret ? c->ret->toUIntPtr() : 0;
+        if (real && traceRet && size > 0) {
+            g_mappings.push_back({traceRet, (uintptr_t)real, (unsigned long long)size});
+        }
+        return;
+    }
     if (!strcmp(n, "memcpy")) {
         // ?nomap=1 disables replaying mapped-memory writes (corruption bisection aid).
         static const bool noMap = EM_ASM_INT({ return Module['noMap'] ? 1 : 0; }) != 0;
