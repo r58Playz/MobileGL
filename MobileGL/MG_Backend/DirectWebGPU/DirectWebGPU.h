@@ -50,6 +50,14 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     void GetTextureImage(const SharedPtr<MG_State::GLState::ITextureObject>& texture,
                          TextureUploadTarget uploadTarget, GLint level, GLenum format, GLenum type,
                          GLsizei bufSize, GLvoid* pixels);
+    // Not yet implemented on WebGPU; wired as safe no-ops so the (unguarded) frontend
+    // GenerateMipmap_Backend / CopyTex*_Backend calls don't dereference a null pointer
+    // during replay. TODO: real GPU mipmap generation + framebuffer->texture copies.
+    void GenerateMipmap(GLenum target);
+    void CopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y,
+                           GLsizei width, GLsizei height);
+    void CopyTexImage2D(GLenum target, GLint level, GLenum internalformat, GLint x, GLint y, GLsizei width,
+                        GLsizei height, GLint border);
     void Finish();
     void Flush();
     void Present();

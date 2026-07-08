@@ -26,6 +26,7 @@
 namespace MobileGL { void Initialize(); }
 
 #include <fstream>
+#include <cmath>
 
 // Stub the non-snappy apitrace file backends (the fixtures are snappy-compressed) and
 // provide a snappy-only createForRead so we don't pull in zstd/zlib/brotli for wasm.
@@ -63,6 +64,10 @@ namespace {
     // trace-id -> replay-id maps for each GL object class.
     std::unordered_map<unsigned, GLuint> g_buf, g_tex, g_fbo, g_vao, g_prog, g_shader, g_rbo, g_sampler;
     std::unordered_map<std::string, unsigned long long> g_unhandledCounts;
+    // Per-draw-FBO geometry tally (diagnostics): which FBO gets the most vertices (= the
+    // gbuffer terrain pass), a sample program, and the first/last call touching it.
+    struct FboDrawStat { unsigned long long calls=0, verts=0; unsigned prog=0; long long firstCall=0, lastCall=0; };
+    std::unordered_map<unsigned, FboDrawStat> g_fboDrawStats;
     std::unordered_map<std::string, unsigned long long> g_unhandledFirstCall;
     std::unordered_map<unsigned, unsigned long long> g_texInternalFormatCounts;
     std::unordered_map<unsigned, unsigned long long> g_texSwizzleParamCounts;
@@ -154,6 +159,20 @@ namespace {
         }
         return nullptr;
     }
+    // Like floatPtr, but materializes into scratch and replaces non-finite values with 0.
+    // The BSL shaderpack emits inf/NaN projection matrices on the first Iris frame
+    // (frameTimeCounter==0 divides by zero). On WebGPU those NaNs get written into the
+    // sticky TAA history buffer (colortex3) and, since NaN propagates through the temporal
+    // accumulation, black out every subsequent frame's TAA resolve — unlike desktop GL,
+    // whose clamp/min/max reject NaN. Sanitizing the degenerate first-frame matrices keeps
+    // the history finite so the temporal buffer converges to the real scene.
+    const float* floatPtrSanitized(trace::Value& v, std::vector<float>& scratch, size_t count) {
+        const float* p = floatPtr(v, scratch);
+        if (!p) return nullptr;
+        if (p != scratch.data()) scratch.assign(p, p + count); // blob source -> copy so we can edit
+        for (float& f : scratch) if (!std::isfinite(f)) f = 0.0f;
+        return scratch.data();
+    }
     const int* intPtr(trace::Value& v, std::vector<int>& scratch) {
         if (const trace::Blob* b = v.toBlob()) return reinterpret_cast<const int*>(b->buf);
         if (const trace::Array* a = v.toArray()) {
@@ -199,6 +218,34 @@ static void dispatch(trace::Call* c) {
     if (!strcmp(n, "glGenFramebuffers")) { genNames(g_fbo, c, 0, 1, glGenFramebuffers); return; }
     if (!strcmp(n, "glGenVertexArrays")) { genNames(g_vao, c, 0, 1, glGenVertexArrays); return; }
     if (!strcmp(n, "glGenSamplers")) { genNames(g_sampler, c, 0, 1, glGenSamplers); return; }
+    // DSA object creation (GL 4.5; modern Minecraft/Iris use these). glCreate* return
+    // initialized objects; glCreateTextures additionally takes a target. Otherwise the
+    // trace->replay name mapping is identical to the glGen* path.
+    if (!strcmp(n, "glCreateTextures")) {
+        const GLenum target = AE(0);
+        const GLsizei cnt = AS(1);
+        const trace::Array* a = c->arg(2).toArray();
+        if (cnt > 0 && a) {
+            std::vector<GLuint> mine(cnt);
+            glCreateTextures(target, cnt, mine.data());
+            for (GLsizei i = 0; i < cnt && i < (GLsizei)a->size(); ++i) {
+                g_tex[(unsigned)a->values[i]->toUInt()] = mine[i];
+            }
+        }
+        return;
+    }
+    if (!strcmp(n, "glCreateFramebuffers")) { genNames(g_fbo, c, 0, 1, glCreateFramebuffers); return; }
+    if (!strcmp(n, "glCreateBuffers")) { genNames(g_buf, c, 0, 1, glCreateBuffers); return; }
+    if (!strcmp(n, "glCreateVertexArrays")) { genNames(g_vao, c, 0, 1, glCreateVertexArrays); return; }
+    if (!strcmp(n, "glCreateSamplers")) { genNames(g_sampler, c, 0, 1, glCreateSamplers); return; }
+    if (!strcmp(n, "glBindTextureUnit")) {
+        // DSA bind-to-unit (no active-unit state). Track for tail-state dumps and the
+        // backend's sampler-unit resolution, then bind the remapped texture.
+        const GLuint unit = AU(0);
+        if (unit < g_boundTraceTex2D.size()) g_boundTraceTex2D[unit] = AU(1);
+        glBindTextureUnit(unit, remap(g_tex, AU(1)));
+        return;
+    }
     if (!strcmp(n, "glBindBuffer")) { glBindBuffer(AE(0), remap(g_buf, AU(1))); return; }
     if (!strcmp(n, "glBindTexture")) {
         if (AE(0) == GL_TEXTURE_2D && g_curActiveTexUnit < g_boundTraceTex2D.size()) {
@@ -227,6 +274,19 @@ static void dispatch(trace::Call* c) {
             g_boundTraceSampler[AU(0)] = AU(1);
         }
         glBindSampler(AU(0), remap(g_sampler, AU(1)));
+        return;
+    }
+    if (!strcmp(n, "glBindSamplers")) {
+        // Multi-bind: samplers[i] -> unit first+i (null array unbinds the range).
+        const GLuint first = AU(0);
+        const GLsizei cnt = AS(1);
+        const trace::Array* a = c->arg(2).toArray();
+        for (GLsizei i = 0; i < cnt; ++i) {
+            const unsigned traceSamp = (a && i < (GLsizei)a->size()) ? (unsigned)a->values[i]->toUInt() : 0u;
+            const GLuint unit = first + (GLuint)i;
+            if (unit < g_boundTraceSampler.size()) g_boundTraceSampler[unit] = traceSamp;
+            glBindSampler(unit, remap(g_sampler, traceSamp));
+        }
         return;
     }
     if (!strcmp(n, "glCreateProgram")) {
@@ -292,10 +352,14 @@ static void dispatch(trace::Call* c) {
         return;
     }
     if (!strcmp(n, "glDeleteBuffers") || !strcmp(n, "glDeleteTextures") ||
-        !strcmp(n, "glDeleteFramebuffers")) {
+        !strcmp(n, "glDeleteFramebuffers") || !strcmp(n, "glDeleteVertexArrays") ||
+        !strcmp(n, "glDeleteRenderbuffers")) {
         return; // deletes: leave resources (harmless for a one-shot replay)
     }
     if (!strcmp(n, "glDeleteProgram") || !strcmp(n, "glDeleteShader") || !strcmp(n, "glDeleteSamplers")) return;
+    // Shaders are attached + linked in trace order; a later detach has no effect on the
+    // already-linked replay program, so skip it.
+    if (!strcmp(n, "glDetachShader")) return;
 
     // --- uniforms (location remapped against the active program) ---
     auto loc = [&]() -> GLint {
@@ -349,10 +413,29 @@ static void dispatch(trace::Call* c) {
         return;
     }
     if (!strcmp(n, "glUniformMatrix4fv")) {
-        std::vector<float> s; const float* p = floatPtr(c->arg(3), s);
-        if (p) glUniformMatrix4fv(loc(), AS(1), (GLboolean)c->arg(2).toBool(), p);
+        std::vector<float> s; const float* p = floatPtrSanitized(c->arg(3), s, (size_t)AS(1) * 16);
+        if (p) {
+            std::string value = "mat4[";
+            for (int i = 0; i < 16; ++i) { if (i) value += " "; value += std::to_string(p[i]); }
+            value += "]";
+            g_uniformValueByTraceLoc[traceLocKey()] = value;
+            glUniformMatrix4fv(loc(), AS(1), (GLboolean)c->arg(2).toBool(), p);
+        }
         return;
     }
+    if (!strcmp(n, "glUniformMatrix3fv")) {
+        std::vector<float> s; const float* p = floatPtrSanitized(c->arg(3), s, (size_t)AS(1) * 9);
+        if (p) glUniformMatrix3fv(loc(), AS(1), (GLboolean)c->arg(2).toBool(), p);
+        return;
+    }
+    if (!strcmp(n, "glUniformMatrix2fv")) {
+        std::vector<float> s; const float* p = floatPtrSanitized(c->arg(3), s, (size_t)AS(1) * 4);
+        if (p) glUniformMatrix2fv(loc(), AS(1), (GLboolean)c->arg(2).toBool(), p);
+        return;
+    }
+    if (!strcmp(n, "glUniform2i")) { glUniform2i(loc(), AS(1), AS(2)); return; }
+    if (!strcmp(n, "glUniform3i")) { glUniform3i(loc(), AS(1), AS(2), AS(3)); return; }
+    if (!strcmp(n, "glUniform4i")) { glUniform4i(loc(), AS(1), AS(2), AS(3), AS(4)); return; }
 
     // --- buffers / vertex arrays ---
     if (!strcmp(n, "glBufferData")) {
@@ -373,6 +456,21 @@ static void dispatch(trace::Call* c) {
     if (!strcmp(n, "glCopyBufferSubData")) {
         glCopyBufferSubData(AE(0), AE(1), (GLintptr)c->arg(2).toUInt(), (GLintptr)c->arg(3).toUInt(),
                             (GLsizeiptr)c->arg(4).toUInt());
+        return;
+    }
+    // Indexed buffer bindings (UBO / SSBO / transform feedback). Iris binds named uniform
+    // blocks here; the DirectWebGPU backend consumes them at draw time.
+    if (!strcmp(n, "glBindBufferBase")) {
+        glBindBufferBase(AE(0), AU(1), remap(g_buf, AU(2)));
+        return;
+    }
+    if (!strcmp(n, "glBindBufferRange")) {
+        glBindBufferRange(AE(0), AU(1), remap(g_buf, AU(2)), (GLintptr)c->arg(3).toUInt(),
+                          (GLsizeiptr)c->arg(4).toUInt());
+        return;
+    }
+    if (!strcmp(n, "glUniformBlockBinding")) {
+        glUniformBlockBinding(remap(g_prog, AU(0)), AU(1), AU(2));
         return;
     }
     // Persistent-mapped buffer streaming (Sodium's chunk vertex arena). Map once, write
@@ -529,12 +627,110 @@ static void dispatch(trace::Call* c) {
         return;
     }
 
+    // --- DSA textures (GL 4.5; operate on a texture name, not the bound target) ---
+    if (!strcmp(n, "glTextureParameteri")) {
+        const unsigned traceTex = AU(0);
+        auto& info = g_traceTexInfo[traceTex];
+        if (AE(1) == GL_TEXTURE_MIN_FILTER) info.minFilter = AS(2);
+        else if (AE(1) == GL_TEXTURE_MAG_FILTER) info.magFilter = AS(2);
+        else if (AE(1) == GL_TEXTURE_WRAP_S) info.wrapS = AS(2);
+        else if (AE(1) == GL_TEXTURE_WRAP_T) info.wrapT = AS(2);
+        if (AE(1) == GL_TEXTURE_MIN_FILTER) g_texMinFilterCounts[AS(2)]++;
+        else if (AE(1) == GL_TEXTURE_BASE_LEVEL || AE(1) == GL_TEXTURE_MAX_LEVEL) g_texLevelParamCounts[AE(1)]++;
+        glTextureParameteri(remap(g_tex, AU(0)), AE(1), AS(2));
+        return;
+    }
+    if (!strcmp(n, "glTextureParameterf")) { glTextureParameterf(remap(g_tex, AU(0)), AE(1), AF(2)); return; }
+    if (!strcmp(n, "glTextureParameteriv")) {
+        if (AE(1) == GL_TEXTURE_SWIZZLE_R || AE(1) == GL_TEXTURE_SWIZZLE_G || AE(1) == GL_TEXTURE_SWIZZLE_B ||
+            AE(1) == GL_TEXTURE_SWIZZLE_A || AE(1) == GL_TEXTURE_SWIZZLE_RGBA) {
+            g_texSwizzleParamCounts[AE(1)]++;
+        }
+        std::vector<int> s; const int* p = intPtr(c->arg(2), s);
+        if (p) glTextureParameteriv(remap(g_tex, AU(0)), AE(1), p);
+        return;
+    }
+    if (!strcmp(n, "glTextureParameterfv")) {
+        std::vector<float> s; const float* p = floatPtr(c->arg(2), s);
+        if (p) glTextureParameterfv(remap(g_tex, AU(0)), AE(1), p);
+        return;
+    }
+    if (!strcmp(n, "glGenerateTextureMipmap")) { glGenerateTextureMipmap(remap(g_tex, AU(0))); return; }
+    if (!strcmp(n, "glGenerateMipmap")) { glGenerateMipmap(AE(0)); return; }
+    if (!strcmp(n, "glTextureStorage2D")) {
+        const unsigned traceTex = AU(0);
+        auto& info = g_traceTexInfo[traceTex];
+        info.internalFormat = AU(2);
+        info.width = AS(3);
+        info.height = AS(4);
+        g_texInternalFormatCounts[AU(2)]++;
+        glTextureStorage2D(remap(g_tex, AU(0)), AS(1), AE(2), AS(3), AS(4));
+        return;
+    }
+    if (!strcmp(n, "glTextureSubImage2D")) {
+        size_t sz = 0; const void* d = blobOrOffsetPtr(c->arg(8), sz);
+        g_texUploadFormatCounts[AU(6)]++;
+        g_texUploadTypeCounts[AU(7)]++;
+        g_texUploadLevelCounts[AS(1)]++;
+        glTextureSubImage2D(remap(g_tex, AU(0)), AS(1), AS(2), AS(3), AS(4), AS(5), AE(6), AE(7), d);
+        return;
+    }
+    if (!strcmp(n, "glCopyImageSubData")) {
+        // src/dst name space depends on the target (texture vs renderbuffer).
+        auto nameFor = [&](GLenum tgt, unsigned name) -> GLuint {
+            return tgt == GL_RENDERBUFFER ? remap(g_rbo, name) : remap(g_tex, name);
+        };
+        glCopyImageSubData(nameFor(AE(1), AU(0)), AE(1), AS(2), AS(3), AS(4), AS(5),
+                           nameFor(AE(7), AU(6)), AE(7), AS(8), AS(9), AS(10), AS(11),
+                           AS(12), AS(13), AS(14));
+        return;
+    }
+    if (!strcmp(n, "glCopyTexSubImage2D")) {
+        glCopyTexSubImage2D(AE(0), AS(1), AS(2), AS(3), AS(4), AS(5), AS(6), AS(7));
+        return;
+    }
+    if (!strcmp(n, "glCopyTexImage2D")) {
+        glCopyTexImage2D(AE(0), AS(1), AE(2), AS(3), AS(4), AS(5), AS(6), AS(7));
+        return;
+    }
+
     // --- framebuffers ---
     if (!strcmp(n, "glFramebufferTexture2D") || !strcmp(n, "glFramebufferTexture2DEXT")) {
         if (AE(1) == GL_COLOR_ATTACHMENT0 && AU(3) != 0) {
             g_fboColor0TraceTex[g_boundDrawFbo] = AU(3);
         }
         glFramebufferTexture2D(AE(0), AE(1), AE(2), remap(g_tex, AU(3)), AS(4));
+        return;
+    }
+    // DSA framebuffers (GL 4.5). glNamedFramebufferTexture(fbo, attachment, texture, level).
+    if (!strcmp(n, "glNamedFramebufferTexture")) {
+        if (AE(1) == GL_COLOR_ATTACHMENT0 && AU(2) != 0) {
+            g_fboColor0TraceTex[AU(0)] = AU(2);
+        }
+        glNamedFramebufferTexture(remap(g_fbo, AU(0)), AE(1), remap(g_tex, AU(2)), AS(3));
+        return;
+    }
+    if (!strcmp(n, "glNamedFramebufferDrawBuffers") || !strcmp(n, "glDrawBuffers")) {
+        // Named: (fbo, n, bufs). Non-DSA: (n, bufs) on the bound draw FBO. The bufs are
+        // attachment enums (GL_COLOR_ATTACHMENTi / GL_NONE) and need no remapping.
+        const bool named = (n[2] == 'N');
+        const GLsizei cnt = named ? AS(1) : AS(0);
+        const trace::Array* a = c->arg(named ? 2 : 1).toArray();
+        std::vector<GLenum> bufs(cnt > 0 ? (size_t)cnt : 0);
+        for (GLsizei i = 0; i < cnt && a && i < (GLsizei)a->size(); ++i) {
+            bufs[(size_t)i] = (GLenum)a->values[i]->toUInt();
+        }
+        if (named) glNamedFramebufferDrawBuffers(remap(g_fbo, AU(0)), cnt, bufs.empty() ? nullptr : bufs.data());
+        else glDrawBuffers(cnt, bufs.empty() ? nullptr : bufs.data());
+        return;
+    }
+    if (!strcmp(n, "glNamedFramebufferDrawBuffer")) { glNamedFramebufferDrawBuffer(remap(g_fbo, AU(0)), AE(1)); return; }
+    if (!strcmp(n, "glNamedFramebufferReadBuffer")) { glNamedFramebufferReadBuffer(remap(g_fbo, AU(0)), AE(1)); return; }
+    if (!strcmp(n, "glDrawBuffer")) { glDrawBuffer(AE(0)); return; }
+    if (!strcmp(n, "glReadBuffer")) { glReadBuffer(AE(0)); return; }
+    if (!strcmp(n, "glBlitNamedFramebuffer")) {
+        glBlitNamedFramebuffer(remap(g_fbo, AU(0)), remap(g_fbo, AU(1)), AS(2), AS(3), AS(4), AS(5), AS(6),
+                               AS(7), AS(8), AS(9), (GLbitfield)c->arg(10).toUInt(), AE(11));
         return;
     }
     if (!strcmp(n, "glBlitFramebuffer")) {
@@ -641,13 +837,20 @@ static void dispatch(trace::Call* c) {
     if (!strcmp(n, "glClear")) { glClear((GLbitfield)c->arg(0).toUInt()); return; }
 
     // --- draws ---
+    auto tally = [&](long long verts) {
+        auto& s = g_fboDrawStats[g_boundDrawFbo];
+        if (s.calls == 0) s.firstCall = (long long)c->no;
+        s.lastCall = (long long)c->no; s.calls++; s.verts += (unsigned long long)verts; s.prog = g_curTraceProg;
+    };
     if (!strcmp(n, "glDrawArrays")) {
         printTailDrawState("glDrawArrays", static_cast<long long>(c->no), AE(0), AS(2), 1);
+        tally(AS(2));
         glDrawArrays(AE(0), AS(1), AS(2));
         return;
     }
     if (!strcmp(n, "glDrawElements")) {
         printTailDrawState("glDrawElements", static_cast<long long>(c->no), AE(0), AS(1), 1);
+        tally(AS(1));
         glDrawElements(AE(0), AS(1), AE(2), (const void*)(uintptr_t)c->arg(3).toUIntPtr());
         return;
     }
@@ -666,6 +869,7 @@ static void dispatch(trace::Call* c) {
             if (ba && i < (GLsizei)ba->size()) bv[i] = (GLint)ba->values[i]->toSInt();
         }
         printTailDrawState("glMultiDrawElementsBaseVertex", static_cast<long long>(c->no), AE(0), counts[0], dc);
+        { long long tv = 0; for (GLsizei i = 0; i < dc; ++i) tv += counts[i]; tally(tv); }
         glMultiDrawElementsBaseVertex(AE(0), counts.data(), AE(2), idx.data(), dc, bv.data());
         return;
     }
@@ -690,6 +894,15 @@ static void printUnhandledSummary() {
         const auto it = g_unhandledFirstCall.find(name);
         const unsigned long long first = (it != g_unhandledFirstCall.end()) ? it->second : 0ull;
         std::printf("[replay]   %s count=%llu first=%llu\n", name.c_str(), count, first);
+    }
+    // Per-FBO geometry tally, sorted by vertices (terrain gbuffer = the heaviest).
+    std::vector<std::pair<unsigned, FboDrawStat>> fbos(g_fboDrawStats.begin(), g_fboDrawStats.end());
+    std::sort(fbos.begin(), fbos.end(), [](const auto& a, const auto& b) { return a.second.verts > b.second.verts; });
+    std::printf("[replay] per-FBO draw tally (%zu fbos)\n", fbos.size());
+    for (const auto& [fbo, s] : fbos) {
+        const unsigned color0 = g_fboColor0TraceTex.count(fbo) ? g_fboColor0TraceTex[fbo] : 0u;
+        std::printf("[replay]   fbo=%u color0=%u calls=%llu verts=%llu prog=%u calls[%lld..%lld]\n",
+                    fbo, color0, s.calls, s.verts, s.prog, s.firstCall, s.lastCall);
     }
 }
 
@@ -801,7 +1014,10 @@ static void dumpTraceProgramSources(unsigned traceProgram) {
 }
 
 static void printTailDrawState(const char* kind, long long callNo, GLenum mode, GLsizei count, GLsizei draws) {
-    if (callNo + 256 < g_targetCall) {
+    static const long long vdbgFrom = (long long)EM_ASM_INT({ return Module['vdbgFrom'] || 0; });
+    const bool inNarrow = (callNo + 256 >= g_targetCall);
+    const bool inWide = (vdbgFrom > 0 && callNo >= vdbgFrom);
+    if (!inNarrow && !inWide) {
         return;
     }
     const unsigned fboColor0 = g_fboColor0TraceTex.count(g_boundDrawFbo) ? g_fboColor0TraceTex[g_boundDrawFbo] : 0u;
@@ -810,6 +1026,11 @@ static void printTailDrawState(const char* kind, long long callNo, GLenum mode, 
                 g_blendEnabled ? 1 : 0, static_cast<unsigned>(g_blendSrcRgb), static_cast<unsigned>(g_blendSrcAlpha),
                 static_cast<unsigned>(g_blendDstRgb), static_cast<unsigned>(g_blendDstAlpha),
                 static_cast<unsigned>(g_blendEqRgb), static_cast<unsigned>(g_blendEqAlpha));
+    // Outside the narrow near-target window, emit only the compact one-liner (buffer-flow
+    // trace); skip the verbose per-attrib / per-uniform dump to keep the log readable.
+    if (!inNarrow) {
+        return;
+    }
     const auto vaoIt = g_traceVaoAttribs.find(g_curTraceVao);
     const std::array<TraceAttribInfo, 16> emptyAttribs{};
     const auto& attribs = vaoIt != g_traceVaoAttribs.end() ? vaoIt->second : emptyAttribs;
@@ -877,6 +1098,11 @@ extern "C" EMSCRIPTEN_KEEPALIVE void replay_run() {
     while ((call = parser.parse_call())) {
         const long long no = (long long)call->no;
         if (g_callsReplayed % 10000 == 0) printf("[replay] %lld calls (at #%lld)...\n", g_callsReplayed, no);
+        extern int g_wgpuVerboseDraw;
+        // ?vdbgfrom=N opens the verbose-draw window from call N to the end; otherwise the
+        // default window is the 300 calls before the target.
+        static const long long vdbgFrom = (long long)EM_ASM_INT({ return Module['vdbgFrom'] || 0; });
+        g_wgpuVerboseDraw = ((vdbgFrom > 0 && no >= vdbgFrom) || (no + 300 >= g_targetCall)) ? 1 : 0;
         dispatch(call);
         // Submit pending GPU commands periodically so the backend's single command
         // buffer doesn't grow unbounded over ~900K calls (which fails to submit).
@@ -905,6 +1131,26 @@ extern "C" EMSCRIPTEN_KEEPALIVE void replay_capture() {
         g_height = capH;
     }
     g_pixels.assign((size_t)g_width * g_height * 4, 0);
+    // ?showtex=N (trace texture id) reads back that texture instead of the framebuffer, to
+    // introspect an intermediate colortex (RGBA8/RGB8 only). Bisects the composite chain.
+    const unsigned showTex = (unsigned)EM_ASM_INT({ return Module['showTex'] || 0; });
+    if (showTex != 0) {
+        const GLuint replayTex = remap(g_tex, showTex);
+        // Size the capture to the texture's own dimensions (recorded at glTexImage2D), so
+        // e.g. a 2048x2048 shadow map reads back fully instead of overflowing g_pixels.
+        const auto ti = g_traceTexInfo.find(showTex);
+        if (ti != g_traceTexInfo.end() && ti->second.width > 0 && ti->second.height > 0) {
+            g_width = ti->second.width;
+            g_height = ti->second.height;
+            g_pixels.assign((size_t)g_width * g_height * 4, 0);
+        }
+        glBindTexture(GL_TEXTURE_2D, replayTex);
+        std::printf("[replay] showtex trace=%u replay=%u %dx%d\n", showTex, replayTex, g_width, g_height);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_pixels.data());
+        g_captured = true;
+        printf("[replay] showtex done\n");
+        return;
+    }
     std::printf("[replay] capture readFbo=%u drawFbo=%u %dx%d\n", g_boundReadFbo, g_boundDrawFbo,
                 g_width, g_height);
     glReadPixels(0, 0, g_width, g_height, GL_RGBA, GL_UNSIGNED_BYTE, g_pixels.data());

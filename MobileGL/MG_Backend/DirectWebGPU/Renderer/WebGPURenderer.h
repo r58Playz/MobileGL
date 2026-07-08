@@ -95,6 +95,11 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             Uint32 binding = 0;
             enum class Kind { Texture, Sampler } kind = Kind::Texture;
             String glName;
+            // Parsed from tint's WGSL type: a Texture may be `texture_depth_2d` (from a
+            // GLSL sampler2DShadow) and a Sampler may be `sampler_comparison`. These pick
+            // the WebGPU bind-group entry type (depth sample type / comparison sampler).
+            Bool wgslDepth = false;
+            Bool wgslComparison = false;
         };
 
         // A vertex shader input (@location(N) ... : TYPE), parsed from tint's WGSL.
@@ -103,7 +108,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // and the invalid pipeline poisons the whole command buffer).
         struct VertexInput {
             Uint32 location = 0;
-            Bool isInt = false; // shader reads it as u32/i32 (vs f32)
+            Bool isInt = false;      // shader reads it as an integer (u32/i32, vs f32)
+            Bool isUnsigned = false; // when isInt: u32 (true) vs i32 (false)
         };
 
         struct WgpuProgram {
@@ -118,12 +124,21 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             Uint globalUboSize = 0;
             Vector<ResourceRef> resources;
             Vector<VertexInput> vertexLocations;
+            // Fragment-stage output @location(N) values parsed from tint's WGSL. Drives
+            // the pipeline's color-target array and the render pass' color attachments:
+            // WebGPU requires a target for exactly the locations the shader writes.
+            Vector<Uint32> fragmentOutputs;
             Bool HasResources() const { return !uboBindings.empty() || !resources.empty(); }
         };
 
         struct WgpuPipeline {
             WGPURenderPipeline pipeline = nullptr;
-            WGPUBindGroupLayout group0Layout = nullptr; // pipeline auto layout (if resources)
+            WGPUBindGroupLayout group0Layout = nullptr; // auto layout, or the explicit one below
+            // Non-null when this pipeline uses an explicit (hand-built) bind-group layout
+            // instead of tint's auto layout — required when a plain sampler2D binds a
+            // depth-format texture (WebGPU won't bind depth to a "float" sample type). The
+            // explicit bind-group layout itself is held in group0Layout above.
+            WGPUPipelineLayout pipelineLayout = nullptr;
             Uint dummyVertexSlots = 0; // # of constant zero vertex buffers bound after the real ones
         };
 
@@ -139,6 +154,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             Uint32 viewMipLevelCount = 1;
             Uint16 textureParamsVersion = 0;
             WGPUTextureFormat format = WGPUTextureFormat_Undefined;
+            Bool isDepth = false; // depth-format texture (sampled via depth/unfilterable-float)
             // See WgpuBuffer::lastUseSerial — same submit-ordering hazard for
             // queueWriteTexture re-uploads of a texture recorded draws sample or
             // render into.
@@ -186,8 +202,11 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // (4 bytes/texel) via copyTextureToBuffer + an async map blocked on JSPI.
         // `flipY` reverses rows (framebuffer origin); `srcIsBgra` vs `dstFormat`
         // (GL_RGBA/GL_BGRA) decides an R/B swap. Returns false on failure.
+        // Reads `tex` into `out` as RGBA8. 8-bit source formats copy directly (with R/B
+        // swap per dstFormat); float sources (RGBA16F/RGBA32F/RG11B10F) are decoded and
+        // clamped to [0,1]*255 for display/diagnostics.
         Bool ReadTextureToCPU(WGPUTexture tex, Uint32 srcX, Uint32 srcY, Uint32 w, Uint32 h,
-                              Bool srcIsBgra, GLenum dstFormat, Bool flipY, void* out);
+                              WGPUTextureFormat srcFmt, GLenum dstFormat, Bool flipY, void* out);
 
         const WgpuProgram* GetOrCreateProgram(MG_State::GLState::ProgramObject& program);
         const WgpuPipeline* GetOrCreatePipeline(MG_State::GLState::ProgramObject& program,
@@ -196,19 +215,44 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // Hash of everything WebGPU bakes into a render pipeline for the current GL
         // state, so distinct states map to distinct cached pipelines.
         Uint64 ComputePipelineKey(const MG_State::GLState::ProgramObject& program,
-                                  const MG_State::GLState::VertexArrayObject& vao, GLenum mode) const;
+                                  const MG_State::GLState::VertexArrayObject& vao, GLenum mode,
+                                  const WgpuProgram* prog) const;
+        // Depth texture creation (sampleable depth-format textures, for depthtex/shadowtex).
+        const WgpuTexture* GetOrCreateDepthTexture(MG_State::GLState::ITextureObject& texture,
+                                                   WGPUTextureFormat depthFmt);
         WGPUBuffer GetOrCreateVertexBuffer(MG_State::GLState::BufferObject& buffer);
+        // Deinterleaved copy of ONE vertex attribute into its own tightly-packed buffer
+        // (bindable at offset 0, attribute offset 0, 4-aligned arrayStride). Used when the
+        // GL attribute's byte offset or stride isn't 4-aligned — WebGPU requires the
+        // SetVertexBuffer offset, attribute offset, and arrayStride all be multiples of 4,
+        // which an interleaved GL buffer (e.g. a 2-byte attribute at byte 42) can't satisfy.
+        // Cached per (buffer, offset, stride, attrBytes).
+        WGPUBuffer GetOrCreateDeinterleavedBuffer(MG_State::GLState::BufferObject& buffer, Uint32 offsetBytes,
+                                                  Uint32 strideBytes, Uint32 attrBytes, Uint32 alignedStride);
+        // Deinterleave AND widen an integer vertex attribute to float32 (GL converts a
+        // non-normalized int attribute read as float; WebGPU has no such vertex format).
+        // componentBytes is 1/2/4; isSigned picks the integer interpretation. Produces a
+        // tightly-packed Float32x{count} buffer (bind at 0, arrayStride count*4).
+        WGPUBuffer GetOrCreateFloatConvertedBuffer(MG_State::GLState::BufferObject& buffer, Uint32 offsetBytes,
+                                                   Uint32 strideBytes, Uint32 componentBytes, Bool isSigned,
+                                                   Uint32 count);
         WGPUBuffer GetOrCreateIndexBuffer(MG_State::GLState::BufferObject& buffer);
         WGPUBuffer GetDummyVertexBuffer();
         WGPUBuffer GetOrCreateBuffer(UnorderedMap<const MG_State::GLState::BufferObject*, WgpuBuffer>& cache,
                                      MG_State::GLState::BufferObject& buffer, WGPUBufferUsage usage);
         const WgpuTexture* GetOrCreateTexture(MG_State::GLState::ITextureObject& texture);
         // Uploads every valid 2D mip level stored in `mip` into `tex` via the queue.
-        // Levels with no CPU pixels are left zero-initialized.
-        void UploadTextureLevels(WGPUTexture tex, MG_State::GLState::TextureObjectMipmap& mip);
+        // Levels with no CPU pixels are left zero-initialized. bytesPerTexel comes from
+        // the resolved WGPU format (RGBA8=4, RGBA16F=8, ...); it sizes the row pitch.
+        void UploadTextureLevels(WGPUTexture tex, MG_State::GLState::TextureObjectMipmap& mip,
+                                 Uint32 bytesPerTexel, Uint32 srcBytesPerTexel);
         // Builds (or reuses) a WGPUSampler matching the GL sampler params
         // (glTexParameter / glBindSampler). Cached by the resolved param values.
-        WGPUSampler GetOrCreateSampler(const MG_State::GLState::SamplerObject& sampler);
+        // comparison: emit a compare sampler (for sampler2DShadow / sampler_comparison).
+        // forceNonFiltering: clamp to nearest + no compare (required when the paired
+        // texture is depth sampled through a plain texture_2d<f32> = unfilterable-float).
+        WGPUSampler GetOrCreateSampler(const MG_State::GLState::SamplerObject& sampler, Bool comparison = false,
+                                       Bool forceNonFiltering = false);
         WGPUShaderModule MakeShaderModule(const char* wgsl);
         // Begins a Load render pass, binds the pipeline + vertex buffers for the
         // current program/VAO. Returns the pass (caller draws + ends) or nullptr.
@@ -231,6 +275,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // pipeline, so each distinct render-state combination is its own variant.
         UnorderedMap<Uint64, WgpuPipeline> m_pipelineCache;
         UnorderedMap<const MG_State::GLState::BufferObject*, WgpuBuffer> m_vertexBufferCache;
+        // Repacked (4-aligned-stride) vertex buffers, keyed by hash(buffer, origStride).
+        UnorderedMap<Uint64, WgpuBuffer> m_repackedVertexBufferCache;
         UnorderedMap<const MG_State::GLState::BufferObject*, WgpuBuffer> m_indexBufferCache;
         WGPUBuffer m_dummyVertexBuffer = nullptr; // shared constant-zero VB (see GetDummyVertexBuffer)
         UnorderedMap<const MG_State::GLState::ITextureObject*, WgpuTexture> m_textureCache;
@@ -256,12 +302,21 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         WGPUTextureView m_depthView = nullptr;
         static constexpr WGPUTextureFormat kDepthFormat = WGPUTextureFormat_Depth24Plus;
 
-        // Current draw target, resolved per Clear/draw from the bound draw FBO. For the
-        // default FB these alias the offscreen; for a user FBO they point at its
-        // attachments. Pipelines (color format + has-depth) are keyed off these.
-        WGPUTextureView m_curColorView = nullptr;
+        // Current draw target(s), resolved per Clear/draw from the bound draw FBO. For
+        // the default FB slot 0 aliases the offscreen; for a user FBO the slots map to
+        // its draw buffers (glDrawBuffers) -> color attachments, indexed by draw-buffer
+        // slot == fragment output @location. A slot with a null view is a hole (draw
+        // buffer None / unusable attachment). Pipelines (target formats + has-depth) are
+        // keyed off these.
+        static constexpr Uint kMaxColorTargets = 8; // matches FramebufferObject::MAX_DRAW_BUFFERS
+        struct CurColorTarget {
+            WGPUTextureView view = nullptr;
+            WGPUTextureFormat format = WGPUTextureFormat_Undefined;
+        };
+        CurColorTarget m_curColor[kMaxColorTargets];
+        Uint m_curColorCount = 0; // number of resolved slots (holes included)
         WGPUTextureView m_curDepthView = nullptr; // null => target has no depth
-        WGPUTextureFormat m_curColorFormat = WGPUTextureFormat_BGRA8Unorm;
+        WGPUTextureFormat m_curDepthFormat = WGPUTextureFormat_Depth24Plus; // format of m_curDepthView
         Uint32 m_curWidth = 0;
         Uint32 m_curHeight = 0;
         Bool m_curIsDefault = true;

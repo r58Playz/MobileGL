@@ -44,6 +44,10 @@ EM_JS(int, mobilegl_preferred_canvas_format, (), {
 extern "C" void mobilegl_jspi_wait();
 extern "C" void mobilegl_jspi_signal();
 
+// TEMP DIAG: the trace harness sets this to 1 near the target call so BeginDrawPass
+// logs each draw's program id + resource resolution + drew/skipped verdict.
+int g_wgpuVerboseDraw = 0;
+
 namespace MobileGL::MG_Backend::DirectWebGPU {
     namespace {
         // Component byte size of a vertex attribute element.
@@ -121,6 +125,37 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             return WGPUVertexFormat_Force32; // unsupported (type/size combination)
         }
 
+        // Base type a WGPU vertex format presents to the shader: 0 = float (incl. unorm/
+        // snorm/float16, all read as f32), 1 = i32, 2 = u32. Used to detect a mismatch
+        // with what the shader declares at a @location (WebGPU rejects the pipeline then).
+        int VertexFormatBaseType(WGPUVertexFormat f) {
+            switch (f) {
+            case WGPUVertexFormat_Uint8x2: case WGPUVertexFormat_Uint8x4:
+            case WGPUVertexFormat_Uint16x2: case WGPUVertexFormat_Uint16x4:
+            case WGPUVertexFormat_Uint32: case WGPUVertexFormat_Uint32x2:
+            case WGPUVertexFormat_Uint32x3: case WGPUVertexFormat_Uint32x4:
+                return 2;
+            case WGPUVertexFormat_Sint8x2: case WGPUVertexFormat_Sint8x4:
+            case WGPUVertexFormat_Sint16x2: case WGPUVertexFormat_Sint16x4:
+            case WGPUVertexFormat_Sint32: case WGPUVertexFormat_Sint32x2:
+            case WGPUVertexFormat_Sint32x3: case WGPUVertexFormat_Sint32x4:
+                return 1;
+            default:
+                return 0;
+            }
+        }
+
+        // Float32x{size} vertex format used when widening an integer attribute to float.
+        WGPUVertexFormat FloatFormatForSize(int size) {
+            switch (size) {
+            case 1: return WGPUVertexFormat_Float32;
+            case 2: return WGPUVertexFormat_Float32x2;
+            case 3: return WGPUVertexFormat_Float32x3;
+            case 4: return WGPUVertexFormat_Float32x4;
+            default: return WGPUVertexFormat_Force32;
+            }
+        }
+
         WGPUPrimitiveTopology ToTopology(GLenum mode) {
             switch (mode) {
             case GL_POINTS: return WGPUPrimitiveTopology_PointList;
@@ -140,14 +175,79 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             }
         }
 
-        // Minimal GL internal format -> WGPU texture format (8-bit, 4-channel for now;
-        // WebGPU has no 3-channel rgb8, so RGB textures must be expanded by the caller).
-        WGPUTextureFormat ToTextureFormat(TextureInternalFormat fmt) {
+        // Resolved WGPU color format + its byte size per texel (row-pitch input). WebGPU
+        // has no 3-channel rgb8/rgb16f, so RGB internal formats stay unsupported (would
+        // need caller-side expansion to RGBA). Depth formats are resolved separately
+        // (GetOrCreateFboDepth); this table is color/sampled targets only.
+        struct ColorFormatInfo {
+            WGPUTextureFormat format = WGPUTextureFormat_Undefined;
+            Uint32 bytesPerTexel = 0;    // WGPU texel size (write side)
+            Uint32 srcBytesPerTexel = 0; // GL source texel size; 0 => same as bytesPerTexel
+        };
+        ColorFormatInfo ToColorFormat(TextureInternalFormat fmt) {
             using F = TextureInternalFormat;
             switch (fmt) {
-            case F::RGBA8: return WGPUTextureFormat_RGBA8Unorm;
-            case F::SRGB8Alpha8: return WGPUTextureFormat_RGBA8UnormSrgb;
-            default: return WGPUTextureFormat_Undefined;
+            case F::R8: case F::Red:            return {WGPUTextureFormat_R8Unorm, 1};
+            case F::RG8: case F::RG:            return {WGPUTextureFormat_RG8Unorm, 2};
+            case F::RGBA8: case F::RGBA:        return {WGPUTextureFormat_RGBA8Unorm, 4};
+            case F::SRGB8Alpha8:                return {WGPUTextureFormat_RGBA8UnormSrgb, 4};
+            // WebGPU has no 3-channel rgb8: store as RGBA8 and expand the source pixels
+            // (alpha=1) on upload. sRGB8 likewise -> RGBA8UnormSrgb.
+            case F::RGB8: case F::RGB:          return {WGPUTextureFormat_RGBA8Unorm, 4, 3};
+            case F::SRGB8:                      return {WGPUTextureFormat_RGBA8UnormSrgb, 4, 3};
+            case F::RGB10A2:                    return {WGPUTextureFormat_RGB10A2Unorm, 4};
+            // WebGPU has no 16-bit unorm formats; map to the float variants. Iris writes
+            // normalized [0,1] values into these render targets, so float storage round-
+            // trips them fine (with float precision instead of 16-bit unorm quantization).
+            case F::R16:                        return {WGPUTextureFormat_R16Float, 2};
+            case F::RG16:                       return {WGPUTextureFormat_RG16Float, 4};
+            case F::RGBA16:                     return {WGPUTextureFormat_RGBA16Float, 8};
+            case F::R16F:                       return {WGPUTextureFormat_R16Float, 2};
+            case F::RG16F:                      return {WGPUTextureFormat_RG16Float, 4};
+            case F::RGBA16F:                    return {WGPUTextureFormat_RGBA16Float, 8};
+            case F::R32F:                       return {WGPUTextureFormat_R32Float, 4};
+            case F::RG32F:                      return {WGPUTextureFormat_RG32Float, 8};
+            case F::RGBA32F:                    return {WGPUTextureFormat_RGBA32Float, 16};
+            case F::R11FG11FB10F:               return {WGPUTextureFormat_RG11B10Ufloat, 4};
+            default:                            return {WGPUTextureFormat_Undefined, 0};
+            }
+        }
+
+        // WebGPU forbids setting a blend state on a non-blendable color target. 8-bit
+        // unorm, rgb10a2unorm, 16-bit float and rg11b10ufloat are blendable in core;
+        // 32-bit float needs the float32-blendable feature (absent in this toolchain),
+        // so treat it as non-blendable and just drop blending for those targets.
+        Bool IsBlendableFormat(WGPUTextureFormat f) {
+            switch (f) {
+            case WGPUTextureFormat_R8Unorm:
+            case WGPUTextureFormat_RG8Unorm:
+            case WGPUTextureFormat_RGBA8Unorm:
+            case WGPUTextureFormat_RGBA8UnormSrgb:
+            case WGPUTextureFormat_BGRA8Unorm:
+            case WGPUTextureFormat_BGRA8UnormSrgb:
+            case WGPUTextureFormat_RGB10A2Unorm:
+            case WGPUTextureFormat_R16Float:
+            case WGPUTextureFormat_RG16Float:
+            case WGPUTextureFormat_RGBA16Float:
+            case WGPUTextureFormat_RG11B10Ufloat:
+                return true;
+            default:
+                return false; // 32-bit float and integer targets
+            }
+        }
+
+        // GL depth internal format -> WGPU depth format (Undefined if not a depth format).
+        // Depth textures are created sampleable so Iris can read depthtex*/shadowtex*.
+        WGPUTextureFormat ToDepthFormat(TextureInternalFormat fmt) {
+            using F = TextureInternalFormat;
+            switch (fmt) {
+            case F::DepthComponent16:  return WGPUTextureFormat_Depth16Unorm;
+            case F::DepthComponent24:  return WGPUTextureFormat_Depth24Plus;
+            case F::DepthComponent32:  // not a core GL format; treat as 32F
+            case F::DepthComponent32F: return WGPUTextureFormat_Depth32Float;
+            case F::DepthComponent:    return WGPUTextureFormat_Depth32Float; // generic depth
+            case F::Depth24Stencil8:   return WGPUTextureFormat_Depth24PlusStencil8;
+            default:                   return WGPUTextureFormat_Undefined;
             }
         }
 
@@ -337,10 +437,13 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         EndFrame();
         for (auto& [k, b] : m_vertexBufferCache) { if (b.buffer) wgpuBufferRelease(b.buffer); }
         m_vertexBufferCache.clear();
+        for (auto& [k, b] : m_repackedVertexBufferCache) { if (b.buffer) wgpuBufferRelease(b.buffer); }
+        m_repackedVertexBufferCache.clear();
         for (auto& [k, b] : m_indexBufferCache) { if (b.buffer) wgpuBufferRelease(b.buffer); }
         m_indexBufferCache.clear();
         for (auto& [k, p] : m_pipelineCache) {
             if (p.group0Layout) wgpuBindGroupLayoutRelease(p.group0Layout);
+            if (p.pipelineLayout) wgpuPipelineLayoutRelease(p.pipelineLayout);
             if (p.pipeline) wgpuRenderPipelineRelease(p.pipeline);
         }
         m_pipelineCache.clear();
@@ -468,6 +571,11 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
 
     Bool WebGPURenderer::ResolveDrawTarget() {
         auto* gl = MG_State::pGLContext.get();
+        for (auto& c : m_curColor) {
+            c.view = nullptr;
+            c.format = WGPUTextureFormat_Undefined;
+        }
+        m_curColorCount = 0;
         const auto& fbo = gl->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
         if (!fbo || fbo->IsDefaultFramebuffer()) {
             EnsureOffscreenTarget();
@@ -484,45 +592,83 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             if (!colorView) {
                 return false;
             }
-            m_curColorView = colorView;
+            m_curColor[0] = {colorView, colorFormat};
+            m_curColorCount = 1;
             m_curDepthView = m_depthView;
-            m_curColorFormat = colorFormat;
+            m_curDepthFormat = kDepthFormat;
             m_curWidth = m_width;
             m_curHeight = m_height;
             m_curIsDefault = true;
             return true;
         }
-        // User FBO: single texture color attachment 0 (renderbuffer/MRT not supported yet).
-        const auto& color0 = fbo->GetAttachment(FramebufferAttachmentType::Color0);
-        if (!color0.IsValid() || color0.IsEmpty() || !color0.IsTexture()) {
-            MGLOG_E("DirectWebGPU: FBO %u lacks a texture color attachment 0 (renderbuffer/MRT unsupported)",
+        // User FBO: resolve each active draw buffer (glDrawBuffers) to its texture color
+        // attachment. Slot index == fragment output @location; a None / unusable draw
+        // buffer stays a hole (null view). Renderbuffer color attachments are still
+        // unsupported.
+        const auto& drawBuffers = fbo->GetDrawBuffers();
+        const Bool framebufferSrgb = gl->IsCapabilityEnabled(CapabilityInput::FramebufferSrgb);
+        Uint32 w = 0, h = 0;
+        Bool any = false;
+        Uint slotCount = 0;
+        for (Uint i = 0; i < MG_State::GLState::FramebufferObject::MAX_DRAW_BUFFERS && i < kMaxColorTargets;
+             ++i) {
+            const FramebufferAttachmentType att = drawBuffers[i];
+            if (att == FramebufferAttachmentType::None) {
+                continue; // hole
+            }
+            const auto& color = fbo->GetAttachment(att);
+            if (!color.IsValid() || color.IsEmpty() || !color.IsTexture()) {
+                MGLOG_E("DirectWebGPU: FBO %u draw buffer %u has no texture attachment "
+                        "(renderbuffer color unsupported)", fbo->GetExternalIndex(), i);
+                continue; // leave a hole; the shader output there is dropped
+            }
+            const WgpuTexture* wt = GetOrCreateTexture(*color.GetTexture());
+            if (!wt || !wt->attachmentView) {
+                continue;
+            }
+            // GL sRGB-encodes fragment outputs only into sRGB-format attachments while
+            // GL_FRAMEBUFFER_SRGB is enabled; a linear (UNORM) attachment is never
+            // encoded (raw bytes). attachmentSrgbView is non-null only for sRGB textures.
+            if (wt->attachmentSrgbView && framebufferSrgb) {
+                m_curColor[i] = {wt->attachmentSrgbView, ToSrgbViewFormat(wt->format)};
+            } else {
+                m_curColor[i] = {wt->attachmentView, ToLinearViewFormat(wt->format)};
+            }
+            slotCount = i + 1;
+            if (!any) {
+                w = wt->width;
+                h = wt->height;
+                any = true;
+            }
+        }
+        if (!any) {
+            MGLOG_E("DirectWebGPU: FBO %u has no usable texture color attachment",
                     fbo->GetExternalIndex());
             return false;
         }
-        const WgpuTexture* wt = GetOrCreateTexture(*color0.GetTexture());
-        if (!wt || !wt->attachmentView) {
-            return false;
-        }
-        // GL sRGB-encodes fragment outputs only into sRGB-format attachments, and only
-        // while GL_FRAMEBUFFER_SRGB is enabled (desktop GL; disabled by default). A
-        // linear (UNORM) attachment is never encoded: shader outputs and blending
-        // operate on the raw stored bytes, so render through the linear view.
-        // attachmentSrgbView is only non-null for genuinely sRGB-format textures.
-        if (wt->attachmentSrgbView && gl->IsCapabilityEnabled(CapabilityInput::FramebufferSrgb)) {
-            m_curColorView = wt->attachmentSrgbView;
-            m_curColorFormat = ToSrgbViewFormat(wt->format);
-        } else {
-            m_curColorView = wt->attachmentView;
-            m_curColorFormat = ToLinearViewFormat(wt->format);
-        }
-        m_curWidth = wt->width;
-        m_curHeight = wt->height;
+        m_curColorCount = slotCount;
+        m_curWidth = w;
+        m_curHeight = h;
         m_curIsDefault = false;
-        // Depth/stencil attachment -> a transient depth buffer (contents not sampled yet).
+        // Depth/stencil attachment. A texture attachment (depthtex*) becomes a real
+        // sampleable depth texture so later passes can read it; a renderbuffer (or the
+        // resolve failing) falls back to a transient depth buffer.
         const auto& depthAtt = fbo->GetAttachment(FramebufferAttachmentType::Depth);
-        m_curDepthView = (depthAtt.IsValid() && !depthAtt.IsEmpty())
-                             ? GetOrCreateFboDepth(*fbo, wt->width, wt->height)
-                             : nullptr;
+        if (depthAtt.IsValid() && !depthAtt.IsEmpty()) {
+            const WgpuTexture* dt =
+                (depthAtt.IsTexture() && depthAtt.GetTexture()) ? GetOrCreateTexture(*depthAtt.GetTexture())
+                                                                : nullptr;
+            if (dt && dt->isDepth && dt->attachmentView) {
+                m_curDepthView = dt->attachmentView;
+                m_curDepthFormat = dt->format;
+            } else {
+                m_curDepthView = GetOrCreateFboDepth(*fbo, w, h);
+                m_curDepthFormat = kDepthFormat;
+            }
+        } else {
+            m_curDepthView = nullptr;
+            m_curDepthFormat = kDepthFormat;
+        }
         return true;
     }
 
@@ -660,15 +806,26 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // A depth clear only applies if the current target actually has depth.
         const Bool doDepth = clearDepth && m_curDepthView != nullptr;
 
-        WGPURenderPassColorAttachment color{};
+        // glClear(GL_COLOR_BUFFER_BIT) clears every active draw buffer, so build one
+        // color attachment per resolved slot (holes -> null attachment).
+        std::vector<WGPURenderPassColorAttachment> colors;
         if (clearColor) {
             const auto& c = gl->GetClearColor();
-            color.view = m_curColorView;
-            color.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
-            color.loadOp = WGPULoadOp_Clear;
-            color.storeOp = WGPUStoreOp_Store;
-            color.clearValue = {static_cast<double>(c[0]), static_cast<double>(c[1]),
-                                static_cast<double>(c[2]), static_cast<double>(c[3])};
+            colors.resize(m_curColorCount);
+            for (Uint i = 0; i < m_curColorCount; ++i) {
+                WGPURenderPassColorAttachment& a = colors[i];
+                a = {};
+                a.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
+                if (m_curColor[i].view) {
+                    a.view = m_curColor[i].view;
+                    a.loadOp = WGPULoadOp_Clear;
+                    a.storeOp = WGPUStoreOp_Store;
+                    a.clearValue = {static_cast<double>(c[0]), static_cast<double>(c[1]),
+                                    static_cast<double>(c[2]), static_cast<double>(c[3])};
+                } else {
+                    a.view = nullptr; // hole: loadOp/storeOp must stay Undefined
+                }
+            }
         }
 
         WGPURenderPassDepthStencilAttachment depth{};
@@ -680,8 +837,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
 
         WGPURenderPassDescriptor rp{};
-        rp.colorAttachmentCount = clearColor ? 1 : 0;
-        rp.colorAttachments = clearColor ? &color : nullptr;
+        rp.colorAttachmentCount = colors.size();
+        rp.colorAttachments = colors.empty() ? nullptr : colors.data();
         rp.depthStencilAttachment = doDepth ? &depth : nullptr;
 
         WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(m_encoder, &rp);
@@ -769,6 +926,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         enum class Kind { Ubo, Texture, Sampler } kind = Kind::Texture;
         String varName;
         String typeName;
+        bool depth = false;      // texture_depth_2d (from GLSL sampler2DShadow)
+        bool comparison = false; // sampler_comparison
     };
     static void ParseWgslResources(const std::string& wgsl, std::vector<ParsedWgslResource>& out) {
         static const std::string tok = "@binding(";
@@ -810,8 +969,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                 r.kind = ParsedWgslResource::Kind::Ubo;
             } else if (r.typeName.find("texture") != std::string::npos) {
                 r.kind = ParsedWgslResource::Kind::Texture;
+                r.depth = r.typeName.find("texture_depth") != std::string::npos;
             } else if (r.typeName.find("sampler") != std::string::npos) {
                 r.kind = ParsedWgslResource::Kind::Sampler;
+                r.comparison = r.typeName.find("sampler_comparison") != std::string::npos;
             } else {
                 continue;
             }
@@ -891,9 +1052,9 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     }
 
     // Parse the @vertex entry's "@location(N) ... : TYPE" inputs from tint's WGSL.
-    // Output: (location, isInt) pairs.
+    // Output: (location, baseType) pairs where baseType is 0=float, 1=i32, 2=u32.
     static void ParseWgslVertexLocations(const std::string& wgsl,
-                                         std::vector<std::pair<Uint32, bool>>& out) {
+                                         std::vector<std::pair<Uint32, int>>& out) {
         const size_t vp = wgsl.find("@vertex");
         if (vp == std::string::npos) {
             return;
@@ -922,11 +1083,96 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             const std::string type =
                 (colon != std::string::npos && end != std::string::npos) ? wgsl.substr(colon + 1, end - colon - 1)
                                                                         : "";
-            const bool isInt =
-                (type.find('u') != std::string::npos) || (type.find('i') != std::string::npos);
-            out.emplace_back(n, isInt);
+            // u32 has 'u' but no 'i'; i32 has 'i' but no 'u'; check unsigned first.
+            const int baseType = (type.find('u') != std::string::npos) ? 2
+                                 : (type.find('i') != std::string::npos) ? 1
+                                                                         : 0;
+            out.emplace_back(n, baseType);
             pos = ns;
         }
+    }
+
+    // Parse the fragment stage's output @location(N) values from tint's WGSL. tint emits
+    // the entry as `@fragment fn main(...) -> <ReturnType> { ... }`; the outputs are the
+    // @location fields of the return struct (or a single inline `-> @location(0) vec4`).
+    // We deliberately parse only the RETURN type so fragment *inputs* (interpolated
+    // varyings, also @location) are excluded. The result drives the pipeline's color
+    // targets and the render pass' color attachments.
+    static void ParseWgslFragmentOutputs(const std::string& wgsl, std::vector<Uint32>& out) {
+        const size_t fp = wgsl.find("@fragment");
+        if (fp == std::string::npos) {
+            return;
+        }
+        const size_t arrow = wgsl.find("->", fp);
+        const size_t body = wgsl.find('{', fp);
+        if (arrow == std::string::npos || body == std::string::npos || arrow > body) {
+            return; // no return type (fragment writes nothing)
+        }
+        auto readLocation = [](const std::string& s, size_t at, Uint32& value) -> bool {
+            static const std::string tok = "@location(";
+            if (s.compare(at, tok.size(), tok) != 0) return false;
+            size_t ns = at + tok.size();
+            Uint32 n = 0;
+            bool got = false;
+            while (ns < s.size() && s[ns] >= '0' && s[ns] <= '9') {
+                n = n * 10 + static_cast<Uint32>(s[ns] - '0');
+                ++ns;
+                got = true;
+            }
+            if (got) value = n;
+            return got;
+        };
+        // Return type token sits between "->" and "{".
+        size_t rs = arrow + 2;
+        while (rs < body && (wgsl[rs] == ' ' || wgsl[rs] == '\t' || wgsl[rs] == '\n')) ++rs;
+        Uint32 inlineLoc = 0;
+        if (readLocation(wgsl, rs, inlineLoc)) {
+            out.push_back(inlineLoc); // single inline output: `-> @location(0) vec4<f32>`
+            return;
+        }
+        size_t re = rs;
+        while (re < body && (std::isalnum(static_cast<unsigned char>(wgsl[re])) || wgsl[re] == '_')) ++re;
+        const std::string retType = wgsl.substr(rs, re - rs);
+        if (retType.empty()) {
+            return;
+        }
+        // Find `struct <retType> {` ... `}` and collect its @location fields.
+        const std::string decl = "struct " + retType;
+        const size_t sp = wgsl.find(decl);
+        if (sp == std::string::npos) {
+            return;
+        }
+        const size_t open = wgsl.find('{', sp);
+        const size_t close = (open == std::string::npos) ? std::string::npos : wgsl.find('}', open);
+        if (open == std::string::npos || close == std::string::npos) {
+            return;
+        }
+        static const std::string tok = "@location(";
+        for (size_t p = wgsl.find(tok, open); p != std::string::npos && p < close;
+             p = wgsl.find(tok, p + tok.size())) {
+            Uint32 loc = 0;
+            if (readLocation(wgsl, p, loc)) {
+                out.push_back(loc);
+            }
+        }
+    }
+
+    // Texture unit a sampler uniform resolves to (its glUniform1i value); 0 if unknown.
+    static Int ResolveSamplerUnit(const MG_State::GLState::ProgramObject& program, const String& glName) {
+        const Int loc = program.GetUniformLocation(glName);
+        if (loc < 0) return 0;
+        const Int u = program.GetUniformSamplerOrImageUnitIndex(static_cast<Uint>(loc));
+        return u >= 0 ? u : 0;
+    }
+
+    // Does the Texture2D bound to that sampler's unit carry a GL depth internal format?
+    // Const/state-only, so it's safe from ComputePipelineKey and the pipeline builder.
+    static Bool BoundTextureIsDepth(const MG_State::GLState::ProgramObject& program, const String& glName) {
+        const Int unit = ResolveSamplerUnit(program, glName);
+        auto& tu = MG_State::pGLContext->GetTextureUnitObject(unit);
+        auto texObj = tu.GetBindingSlot(TextureTarget::Texture2D).GetBoundObject();
+        if (!texObj) return false;
+        return ToDepthFormat(texObj->GetFormat()) != WGPUTextureFormat_Undefined;
     }
 
     WGPUShaderModule WebGPURenderer::MakeShaderModule(const char* wgsl) {
@@ -943,6 +1189,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (auto it = m_programCache.find(&program); it != m_programCache.end()) {
             return &it->second;
         }
+        const int vdbg = g_wgpuVerboseDraw ? (int)program.GetExternalIndex() : -1;
         // SPIR-V is produced at link time, one blob per attached shader (parallel
         // to GetAttachedShaders). Transpile each stage to WGSL via tint.
         auto& spirv = program.GetGeneratedSpirv();
@@ -956,6 +1203,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             auto wgsl = MG_Util::ShaderTranspiler::SpirvToWgsl(spv);
             if (!wgsl.success) {
                 MGLOG_E("DirectWebGPU: SPIR-V -> WGSL failed: %s", wgsl.error.c_str());
+                if (vdbg >= 0) std::printf("[vdbg] prog=%d SpirvToWgsl FAILED stage=%d: %s\n", vdbg,
+                                           (int)shaders[i]->GetShaderStage(), wgsl.error.c_str());
                 return nullptr;
             }
             // Offset this stage's bindings into a disjoint range so vertex/fragment
@@ -979,11 +1228,14 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             // state doesn't provide; that invalid pipeline then poisons the whole
             // command buffer).
             if (shaders[i]->GetShaderStage() == ShaderStage::Vertex) {
-                std::vector<std::pair<Uint32, bool>> locs;
+                std::vector<std::pair<Uint32, int>> locs;
                 ParseWgslVertexLocations(code2, locs);
-                for (const auto& [loc, isInt] : locs) {
-                    prog.vertexLocations.push_back(VertexInput{loc, isInt});
+                for (const auto& [loc, baseType] : locs) {
+                    prog.vertexLocations.push_back(VertexInput{loc, baseType != 0, baseType == 2});
                 }
+            } else if (shaders[i]->GetShaderStage() == ShaderStage::Fragment) {
+                // Fragment output @location set -> the pipeline's color-target layout.
+                ParseWgslFragmentOutputs(code2, prog.fragmentOutputs);
             }
             // The WGSL is the exact module interface; parse it for the bind group
             // layout (rather than SPIRV-Reflect, which can't see tint dropping the
@@ -1010,6 +1262,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                     ref.kind = (r.kind == ParsedWgslResource::Kind::Texture) ? ResourceRef::Kind::Texture
                                                                              : ResourceRef::Kind::Sampler;
                     ref.glName = BaseUniformName(r.varName);
+                    ref.wgslDepth = r.depth;
+                    ref.wgslComparison = r.comparison;
                     prog.resources.push_back(ref);
                 }
             }
@@ -1024,6 +1278,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
         if (!prog.vertex || !prog.fragment) {
             MGLOG_E("DirectWebGPU: program missing vertex or fragment WGSL module");
+            if (vdbg >= 0) std::printf("[vdbg] prog=%d missing module: vertex=%d fragment=%d nShaders=%zu nSpirv=%zu\n",
+                                       vdbg, prog.vertex ? 1 : 0, prog.fragment ? 1 : 0, shaders.size(), spirv.size());
             if (prog.vertex) wgpuShaderModuleRelease(prog.vertex);
             if (prog.fragment) wgpuShaderModuleRelease(prog.fragment);
             return nullptr;
@@ -1037,7 +1293,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
 
     Uint64 WebGPURenderer::ComputePipelineKey(const MG_State::GLState::ProgramObject& program,
                                               const MG_State::GLState::VertexArrayObject& vao,
-                                              GLenum mode) const {
+                                              GLenum mode, const WgpuProgram* prog) const {
         Uint64 key = 1469598103934665603ull; // FNV-1a
         auto mix = [&key](Uint64 v) {
             for (int i = 0; i < 8; ++i) {
@@ -1077,40 +1333,74 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                 (static_cast<Uint64>(dA) << 24) | (static_cast<Uint64>(eC) << 32) |
                 (static_cast<Uint64>(eA) << 40));
         }
-        // Current draw target: color format + whether it has a depth attachment (both
-        // baked into the pipeline by WebGPU).
-        mix(static_cast<Uint64>(m_curColorFormat));
+        // Current draw target(s): per-slot color format (holes included) + slot count +
+        // whether there is a depth attachment (all baked into the pipeline by WebGPU).
+        mix(static_cast<Uint64>(m_curColorCount));
+        for (Uint i = 0; i < m_curColorCount; ++i) {
+            mix((static_cast<Uint64>(m_curColor[i].format) << 1) | (m_curColor[i].view ? 1u : 0u));
+        }
         mix(m_curDepthView != nullptr ? 1 : 0);
+        mix(static_cast<Uint64>(m_curDepthFormat));
+        // Whether each sampled texture resolves to a depth format decides the bind-group
+        // layout (float vs unfilterable-float/depth sample type), which is baked into the
+        // pipeline — so distinct depth/non-depth bindings need distinct cached pipelines.
+        if (prog) {
+            for (const auto& r : prog->resources) {
+                if (r.kind == ResourceRef::Kind::Texture) {
+                    mix(BoundTextureIsDepth(program, r.glName) ? 1u : 0u);
+                }
+            }
+        }
         return key;
     }
 
     const WebGPURenderer::WgpuPipeline*
     WebGPURenderer::GetOrCreatePipeline(MG_State::GLState::ProgramObject& program,
                                         const MG_State::GLState::VertexArrayObject& vao, GLenum mode) {
-        const Uint64 key = ComputePipelineKey(program, vao, mode);
-        if (auto it = m_pipelineCache.find(key); it != m_pipelineCache.end()) {
-            return &it->second;
-        }
+        const int vdbg = g_wgpuVerboseDraw ? (int)program.GetExternalIndex() : -1;
         const WgpuProgram* prog = GetOrCreateProgram(program);
         if (!prog) {
+            if (vdbg >= 0) std::printf("[vdbg] prog=%d pipeline: GetOrCreateProgram null\n", vdbg);
             return nullptr;
+        }
+        const Uint64 key = ComputePipelineKey(program, vao, mode, prog);
+        if (auto it = m_pipelineCache.find(key); it != m_pipelineCache.end()) {
+            return &it->second;
         }
 
         // One vertex buffer layout per enabled+supported attribute, in ascending
         // attribute order (the draw path binds vertex buffers in the same order),
         // followed by dummy layouts for any shader @location the VAO doesn't supply.
         constexpr Uint kMaxAttribs = 16;
+        // The shader's base type at a @location (-1 none, 0 float, 1 i32, 2 u32). A VAO
+        // attribute whose WGPU format base type doesn't match (e.g. a GL non-normalized
+        // integer attribute the shader reads as float — no WebGPU format widens int->float)
+        // is dropped to a dummy of the shader's type, keeping the pipeline valid.
+        auto shaderExpects = [&](Uint loc) -> int {
+            for (const auto& vi : prog->vertexLocations) {
+                if (vi.location == loc) return !vi.isInt ? 0 : (vi.isUnsigned ? 2 : 1);
+            }
+            return -1;
+        };
         std::vector<WGPUVertexAttribute> attrs;
         attrs.reserve(kMaxAttribs + prog->vertexLocations.size());
         Bool covered[64] = {};
         for (Uint i = 0; i < kMaxAttribs; ++i) {
             if (!vao.IsAttributeEnabled(i)) continue;
             const auto& a = vao.GetAttribute(i);
-            if (!a.Buffer ||
-                ToVertexFormat(a.Type, a.Size, a.Normalized, a.IsInteger) == WGPUVertexFormat_Force32)
-                continue;
+            const WGPUVertexFormat vf = ToVertexFormat(a.Type, a.Size, a.Normalized, a.IsInteger);
+            if (!a.Buffer || vf == WGPUVertexFormat_Force32) continue;
+            const int exp = shaderExpects(i);
+            const int baseVf = VertexFormatBaseType(vf);
+            // Shader wants float but the VAO gives a (non-normalized) integer format: GL
+            // widens int->float, so present it as Float32x{size} via a converted buffer.
+            const Bool convert = (exp == 0 && baseVf != 0 && a.Size >= 1 && a.Size <= 4);
+            if (exp >= 0 && baseVf != exp && !convert) continue; // other base-type mismatch -> dummy
             WGPUVertexAttribute va{};
-            va.format = ToVertexFormat(a.Type, a.Size, a.Normalized, a.IsInteger);
+            va.format = convert ? FloatFormatForSize(a.Size) : vf;
+            // Offset 0 in the layout: an aligned attribute is bound at its (4-aligned)
+            // byte offset; a non-aligned / converted one gets its own buffer bound at 0.
+            // Either way the attribute sits at the start of each arrayStride step.
             va.offset = 0;
             va.shaderLocation = i;
             attrs.push_back(va);
@@ -1119,12 +1409,17 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // Dummy attributes for shader inputs the VAO doesn't supply (disabled / unsupported
         // format). WebGPU requires every shader @location to be present in the vertex state;
         // a missing one makes the pipeline invalid and poisons the whole command buffer.
+        // The dummy format must match the shader's base type (float/i32/u32) exactly, or
+        // the pipeline is invalid. All dummies share one buffer (see the layout below);
+        // each gets a distinct 16-byte slot so their attribute ranges don't overlap.
+        const SizeT firstDummy = attrs.size();
         Uint dummyCount = 0;
         for (const auto& vi : prog->vertexLocations) {
             if (vi.location < 64 && covered[vi.location]) continue;
             WGPUVertexAttribute va{};
-            va.format = vi.isInt ? WGPUVertexFormat_Uint32x4 : WGPUVertexFormat_Float32x4;
-            va.offset = 0;
+            va.format = !vi.isInt ? WGPUVertexFormat_Float32x4
+                        : (vi.isUnsigned ? WGPUVertexFormat_Uint32x4 : WGPUVertexFormat_Sint32x4);
+            va.offset = static_cast<uint64_t>(dummyCount) * 16u;
             va.shaderLocation = vi.location;
             attrs.push_back(va);
             ++dummyCount;
@@ -1136,64 +1431,129 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         for (Uint i = 0; i < kMaxAttribs; ++i) {
             if (!vao.IsAttributeEnabled(i)) continue;
             const auto& a = vao.GetAttribute(i);
-            if (!a.Buffer ||
-                ToVertexFormat(a.Type, a.Size, a.Normalized, a.IsInteger) == WGPUVertexFormat_Force32)
-                continue;
+            const WGPUVertexFormat vf = ToVertexFormat(a.Type, a.Size, a.Normalized, a.IsInteger);
+            if (!a.Buffer || vf == WGPUVertexFormat_Force32) continue;
+            const int exp = shaderExpects(i);
+            const int baseVf = VertexFormatBaseType(vf);
+            const Bool convert = (exp == 0 && baseVf != 0 && a.Size >= 1 && a.Size <= 4);
+            if (exp >= 0 && baseVf != exp && !convert) continue; // matches the attr loop's skip
             WGPUVertexBufferLayout layout{};
             // Divisor>0 -> per-instance attribute (glVertexAttribDivisor); 0 -> per-vertex.
             layout.stepMode = a.Divisor > 0 ? WGPUVertexStepMode_Instance : WGPUVertexStepMode_Vertex;
-            // Tightly-packed stride from the actual component size; WebGPU requires the
-            // arrayStride to be a multiple of 4, so round up.
-            uint64_t packed = static_cast<uint64_t>(ComponentByteSize(a.Type)) * a.Size;
-            packed = (packed + 3u) & ~uint64_t(3);
-            layout.arrayStride = a.Stride ? static_cast<uint64_t>(a.Stride) : packed;
+            const Uint32 attrBytes = ComponentByteSize(a.Type) * a.Size;
+            const Uint32 glStride = a.Stride ? static_cast<Uint32>(a.Stride) : attrBytes;
+            // WebGPU requires bind offset, attribute offset, and arrayStride all be
+            // multiples of 4. Interleaved when the GL offset+stride already satisfy that;
+            // a converted attribute is tight Float32x{size} (stride size*4); otherwise the
+            // attribute is deinterleaved to a tight (round4(attrBytes)) buffer.
+            const Bool aligned = !convert && (a.Offset % 4u == 0u) && (glStride % 4u == 0u);
+            layout.arrayStride = convert ? static_cast<uint64_t>(a.Size) * 4u
+                                 : aligned ? static_cast<uint64_t>(glStride)
+                                           : static_cast<uint64_t>((attrBytes + 3u) & ~3u);
             layout.attributeCount = 1;
             layout.attributes = &attrs[ai++];
             layouts.push_back(layout);
         }
-        // Dummy layouts: a shared zero buffer with arrayStride 0 (constant per vertex).
-        for (Uint d = 0; d < dummyCount; ++d) {
+        // All dummy attributes share ONE layout backed by the constant zero buffer
+        // (arrayStride 0 -> every vertex reads the same region). Collapsing them into a
+        // single buffer keeps the total vertex-buffer count within WebGPU's limit for
+        // shaders that declare many @location inputs the VAO doesn't supply.
+        if (dummyCount > 0) {
             WGPUVertexBufferLayout layout{};
             layout.stepMode = WGPUVertexStepMode_Vertex;
             layout.arrayStride = 0;
-            layout.attributeCount = 1;
-            layout.attributes = &attrs[ai++];
+            layout.attributeCount = dummyCount;
+            layout.attributes = &attrs[firstDummy];
             layouts.push_back(layout);
+        }
+
+        // WebGPU caps vertex buffers at 8 and attributes at 16; a pipeline exceeding
+        // either becomes an error object that poisons the whole command buffer. Skip the
+        // draw instead (rare — only shaders with very many distinct attributes).
+        if (layouts.size() > 8 || attrs.size() > 16) {
+            static Bool warned = false;
+            if (!warned) {
+                warned = true;
+                MGLOG_W("DirectWebGPU: draw skipped: %zu vertex buffers / %zu attributes exceed WebGPU "
+                        "limits (8/16)", layouts.size(), attrs.size());
+            }
+            if (vdbg >= 0) std::printf("[vdbg] prog=%d pipeline: %zu layouts / %zu attrs exceed 8/16 (dummies=%u)\n",
+                                       vdbg, layouts.size(), attrs.size(), dummyCount);
+            return nullptr;
         }
 
         auto* gl = MG_State::pGLContext.get();
 
-        // Color target: write mask + (optional) blend, from GL state.
+        // Per-slot color targets, indexed by fragment output @location. WebGPU requires
+        // a target exactly where the shader writes; unwritten slots below the max are
+        // holes (format Undefined). The write mask / blend state are shared across all
+        // targets (GL's per-buffer color mask / blend-i are not tracked yet).
         const auto cmask = gl->GetColorMask();
-        WGPUColorTargetState colorTarget{};
-        colorTarget.format = m_curColorFormat;
-        colorTarget.writeMask = (cmask.r() ? WGPUColorWriteMask_Red : 0u) |
-                                (cmask.g() ? WGPUColorWriteMask_Green : 0u) |
-                                (cmask.b() ? WGPUColorWriteMask_Blue : 0u) |
-                                (cmask.a() ? WGPUColorWriteMask_Alpha : 0u);
+        const WGPUColorWriteMask writeMask =
+            (cmask.r() ? WGPUColorWriteMask_Red : 0u) | (cmask.g() ? WGPUColorWriteMask_Green : 0u) |
+            (cmask.b() ? WGPUColorWriteMask_Blue : 0u) | (cmask.a() ? WGPUColorWriteMask_Alpha : 0u);
+        const Bool blendEnabled = gl->IsCapabilityEnabled(CapabilityInput::Blend);
         WGPUBlendState blend{};
-        if (gl->IsCapabilityEnabled(CapabilityInput::Blend)) {
+        if (blendEnabled) {
             BlendFactor sR, dR, sA, dA;
             gl->GetBlendFunc(sR, dR, sA, dA);
             BlendEquation eC, eA;
             gl->GetBlendEquation(eC, eA);
             blend.color = {ToBlendOp(eC), ToBlendFactor(sR), ToBlendFactor(dR)};
             blend.alpha = {ToBlendOp(eA), ToBlendFactor(sA), ToBlendFactor(dA)};
-            colorTarget.blend = &blend;
+        }
+
+        Uint32 targetCount = 0;
+        for (Uint32 loc : prog->fragmentOutputs) {
+            targetCount = std::max(targetCount, loc + 1);
+        }
+        std::vector<WGPUColorTargetState> colorTargets(targetCount);
+        std::vector<char> isOutput(targetCount, 0);
+        for (Uint32 loc : prog->fragmentOutputs) {
+            if (loc < targetCount) isOutput[loc] = 1;
+        }
+        for (Uint32 i = 0; i < targetCount; ++i) {
+            WGPUColorTargetState& ct = colorTargets[i];
+            ct = {};
+            if (!isOutput[i]) {
+                ct.format = WGPUTextureFormat_Undefined; // hole (shader doesn't write it)
+                continue;
+            }
+            // The shader writes @location(i): a resolved attachment must exist there.
+            if (i >= m_curColorCount || !m_curColor[i].view ||
+                m_curColor[i].format == WGPUTextureFormat_Undefined) {
+                MGLOG_E("DirectWebGPU: fragment writes location %u but draw buffer %u is "
+                        "unbound/unsupported; skipping draw", i, i);
+                if (vdbg >= 0) std::printf("[vdbg] prog=%d pipeline: frag writes loc %u but curColorCount=%u "
+                                           "view=%p fmt=0x%x\n", vdbg, i, m_curColorCount,
+                                           i < m_curColorCount ? (void*)m_curColor[i].view : nullptr,
+                                           i < m_curColorCount ? (unsigned)m_curColor[i].format : 0u);
+                return nullptr;
+            }
+            ct.format = m_curColor[i].format;
+            ct.writeMask = writeMask;
+            if (blendEnabled && IsBlendableFormat(ct.format)) {
+                ct.blend = &blend;
+            }
+        }
+        // A render pipeline needs at least one color target or a depth-stencil target.
+        if (targetCount == 0 && m_curDepthView == nullptr) {
+            if (vdbg >= 0) std::printf("[vdbg] prog=%d pipeline: no color targets and no depth\n", vdbg);
+            return nullptr;
         }
 
         WGPUFragmentState fragment{};
         fragment.module = prog->fragment;
         fragment.entryPoint = Wgpu::View("main");
-        fragment.targetCount = 1;
-        fragment.targets = &colorTarget;
+        fragment.targetCount = targetCount;
+        fragment.targets = targetCount ? colorTargets.data() : nullptr;
 
         // Depth-stencil: declared only if the current target has a depth attachment.
         // depthWrite only when the test is on (GL doesn't write depth with the test off).
         const Bool hasDepth = (m_curDepthView != nullptr);
         const Bool depthTest = gl->IsCapabilityEnabled(CapabilityInput::DepthTest);
         WGPUDepthStencilState depthState{};
-        depthState.format = kDepthFormat;
+        depthState.format = m_curDepthFormat;
         depthState.depthWriteEnabled = (depthTest && gl->GetDepthMask())
                                            ? WGPUOptionalBool_True
                                            : WGPUOptionalBool_False;
@@ -1201,8 +1561,65 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         depthState.stencilFront.compare = WGPUCompareFunction_Always;
         depthState.stencilBack.compare = WGPUCompareFunction_Always;
 
+        // Bind-group layout. Tint's auto layout suffices unless a plain sampler2D binds a
+        // depth-format texture: auto types it "float", which WebGPU won't let a depth
+        // texture bind to. Then build an explicit layout with the right per-binding types
+        // (depth / unfilterable-float sample types, comparison / non-filtering samplers).
+        Bool needsExplicit = false;
+        if (prog->HasResources()) {
+            for (const auto& r : prog->resources) {
+                if (r.kind == ResourceRef::Kind::Texture && !r.wgslDepth &&
+                    BoundTextureIsDepth(program, r.glName)) {
+                    needsExplicit = true;
+                    break;
+                }
+            }
+        }
+        WGPUBindGroupLayout explicitBgl = nullptr;
+        WGPUPipelineLayout explicitPl = nullptr;
+        if (needsExplicit) {
+            auto visOf = [](Uint32 binding) -> WGPUShaderStage {
+                return binding >= kStageBindingStride ? WGPUShaderStage_Fragment : WGPUShaderStage_Vertex;
+            };
+            std::vector<WGPUBindGroupLayoutEntry> bgle;
+            for (Uint32 b : prog->uboBindings) {
+                WGPUBindGroupLayoutEntry e{};
+                e.binding = b;
+                e.visibility = visOf(b);
+                e.buffer.type = WGPUBufferBindingType_Uniform;
+                bgle.push_back(e);
+            }
+            for (const auto& r : prog->resources) {
+                WGPUBindGroupLayoutEntry e{};
+                e.binding = r.binding;
+                e.visibility = visOf(r.binding);
+                if (r.kind == ResourceRef::Kind::Texture) {
+                    e.texture.viewDimension = WGPUTextureViewDimension_2D;
+                    e.texture.multisampled = 0;
+                    e.texture.sampleType = r.wgslDepth ? WGPUTextureSampleType_Depth
+                                           : BoundTextureIsDepth(program, r.glName)
+                                               ? WGPUTextureSampleType_UnfilterableFloat
+                                               : WGPUTextureSampleType_Float;
+                } else {
+                    e.sampler.type = r.wgslComparison           ? WGPUSamplerBindingType_Comparison
+                                     : BoundTextureIsDepth(program, r.glName)
+                                         ? WGPUSamplerBindingType_NonFiltering
+                                         : WGPUSamplerBindingType_Filtering;
+                }
+                bgle.push_back(e);
+            }
+            WGPUBindGroupLayoutDescriptor bgld{};
+            bgld.entryCount = bgle.size();
+            bgld.entries = bgle.empty() ? nullptr : bgle.data();
+            explicitBgl = wgpuDeviceCreateBindGroupLayout(m_device, &bgld);
+            WGPUPipelineLayoutDescriptor pld{};
+            pld.bindGroupLayoutCount = 1;
+            pld.bindGroupLayouts = &explicitBgl;
+            explicitPl = wgpuDeviceCreatePipelineLayout(m_device, &pld);
+        }
+
         WGPURenderPipelineDescriptor desc{};
-        desc.layout = nullptr; // auto layout; bind groups built from the pipeline's layout
+        desc.layout = explicitPl; // null => tint's auto layout
         desc.vertex.module = prog->vertex;
         desc.vertex.entryPoint = Wgpu::View("main");
         desc.vertex.bufferCount = layouts.size();
@@ -1217,16 +1634,25 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         desc.multisample.mask = 0xFFFFFFFFu;
         desc.fragment = &fragment;
 
+        if (vdbg >= 0) std::printf("[vdbg] prog=%d pipeline: creating targetCount=%u hasDepth=%d depthFmt=0x%x "
+                                   "layouts=%zu attrs=%zu needsExplicit=%d\n", vdbg, targetCount, hasDepth ? 1 : 0,
+                                   (unsigned)m_curDepthFormat, layouts.size(), attrs.size(), needsExplicit ? 1 : 0);
         WGPURenderPipeline pipeline = wgpuDeviceCreateRenderPipeline(m_device, &desc);
         if (!pipeline) {
+            if (vdbg >= 0) std::printf("[vdbg] prog=%d pipeline: wgpuDeviceCreateRenderPipeline null\n", vdbg);
+            if (explicitPl) wgpuPipelineLayoutRelease(explicitPl);
+            if (explicitBgl) wgpuBindGroupLayoutRelease(explicitBgl);
             return nullptr;
         }
         WgpuPipeline entry;
         entry.pipeline = pipeline;
-        entry.dummyVertexSlots = dummyCount;
-        // The auto-generated group-0 layout is shared by all state variants of this
-        // program (same shaders); keep it for building per-draw bind groups.
-        if (prog->HasResources()) {
+        entry.dummyVertexSlots = dummyCount > 0 ? 1 : 0; // all dummies share one buffer
+        // group0Layout is what per-draw bind groups are built against: either our explicit
+        // layout (owned here) or tint's auto layout fetched from the pipeline.
+        if (needsExplicit) {
+            entry.pipelineLayout = explicitPl;
+            entry.group0Layout = explicitBgl;
+        } else if (prog->HasResources()) {
             entry.group0Layout = wgpuRenderPipelineGetBindGroupLayout(pipeline, 0);
         }
         auto [ins, ok] = m_pipelineCache.emplace(key, entry);
@@ -1303,6 +1729,152 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         return GetOrCreateBuffer(m_vertexBufferCache, buffer, WGPUBufferUsage_Vertex);
     }
 
+    WGPUBuffer WebGPURenderer::GetOrCreateDeinterleavedBuffer(MG_State::GLState::BufferObject& buffer,
+                                                              Uint32 offsetBytes, Uint32 strideBytes,
+                                                              Uint32 attrBytes, Uint32 alignedStride) {
+        const Uint64 serial = buffer.GetChangeSerial();
+        const SizeT size = buffer.GetSize();
+        const auto& data = buffer.GetDataReadOnly();
+        if (strideBytes == 0 || attrBytes == 0 || alignedStride == 0 || !data ||
+            size < static_cast<SizeT>(offsetBytes) + attrBytes) {
+            return nullptr;
+        }
+        // Vertex v's attribute occupies [offsetBytes + v*stride, +attrBytes]; find how many fit.
+        const SizeT vtxCount = (size - offsetBytes - attrBytes) / strideBytes + 1;
+        const Uint64 newSize = static_cast<Uint64>(vtxCount) * alignedStride;
+        // Cache key: FNV-1a of (buffer pointer, offset, stride, attrBytes).
+        Uint64 keyHash = 1469598103934665603ull;
+        auto mixByte = [&keyHash](Uint8 b) { keyHash ^= b; keyHash *= 1099511628211ull; };
+        const auto ptrVal = static_cast<Uint64>(reinterpret_cast<SizeT>(&buffer));
+        for (int i = 0; i < 8; ++i) mixByte(static_cast<Uint8>(ptrVal >> (i * 8)));
+        for (int i = 0; i < 4; ++i) mixByte(static_cast<Uint8>(offsetBytes >> (i * 8)));
+        for (int i = 0; i < 4; ++i) mixByte(static_cast<Uint8>(strideBytes >> (i * 8)));
+        for (int i = 0; i < 4; ++i) mixByte(static_cast<Uint8>(attrBytes >> (i * 8)));
+
+        auto build = [&](WGPUBuffer buf) {
+            std::vector<Uint8> packed(newSize, 0);
+            const Uint8* src = static_cast<const Uint8*>(data->data());
+            for (SizeT v = 0; v < vtxCount; ++v) {
+                std::memcpy(&packed[v * alignedStride], &src[offsetBytes + v * strideBytes], attrBytes);
+            }
+            wgpuQueueWriteBuffer(m_queue, buf, 0, packed.data(), packed.size());
+        };
+
+        auto it = m_repackedVertexBufferCache.find(keyHash);
+        if (it != m_repackedVertexBufferCache.end()) {
+            WgpuBuffer& cb = it->second;
+            if (cb.serial == serial && cb.size == newSize) {
+                cb.lastUseSerial = m_flushSerial;
+                return cb.buffer; // up to date
+            }
+            if (cb.buffer && cb.size == newSize) {
+                // Same size, new contents -> re-upload. queueWriteBuffer lands at submit
+                // time, so submit any recorded draws still using it first (see WgpuBuffer).
+                if (cb.lastUseSerial == m_flushSerial) {
+                    FlushFrame();
+                }
+                build(cb.buffer);
+                cb.serial = serial;
+                cb.lastUseSerial = m_flushSerial;
+                return cb.buffer;
+            }
+            if (cb.buffer) wgpuBufferRelease(cb.buffer);
+            m_repackedVertexBufferCache.erase(it);
+        }
+        WGPUBufferDescriptor bd{};
+        bd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
+        bd.size = newSize;
+        WGPUBuffer buf = wgpuDeviceCreateBuffer(m_device, &bd);
+        if (!buf) {
+            return nullptr;
+        }
+        build(buf);
+        m_repackedVertexBufferCache.emplace(keyHash, WgpuBuffer{buf, serial, newSize, m_flushSerial});
+        return buf;
+    }
+
+    WGPUBuffer WebGPURenderer::GetOrCreateFloatConvertedBuffer(MG_State::GLState::BufferObject& buffer,
+                                                               Uint32 offsetBytes, Uint32 strideBytes,
+                                                               Uint32 componentBytes, Bool isSigned,
+                                                               Uint32 count) {
+        const Uint64 serial = buffer.GetChangeSerial();
+        const SizeT size = buffer.GetSize();
+        const auto& data = buffer.GetDataReadOnly();
+        const Uint32 attrBytes = componentBytes * count;
+        if (componentBytes == 0 || count == 0 || count > 4 || strideBytes == 0 || !data ||
+            size < static_cast<SizeT>(offsetBytes) + attrBytes) {
+            return nullptr;
+        }
+        const SizeT vtxCount = (size - offsetBytes - attrBytes) / strideBytes + 1;
+        const Uint32 outStride = count * 4u; // Float32x{count}
+        const Uint64 newSize = static_cast<Uint64>(vtxCount) * outStride;
+        // Cache key: FNV-1a of a "converted" marker + (buffer, offset, stride, comp, signed, count).
+        Uint64 keyHash = 1469598103934665603ull;
+        auto mixByte = [&keyHash](Uint8 b) { keyHash ^= b; keyHash *= 1099511628211ull; };
+        mixByte(0xC0); // distinguishes converted from plain deinterleaved entries
+        const auto ptrVal = static_cast<Uint64>(reinterpret_cast<SizeT>(&buffer));
+        for (int i = 0; i < 8; ++i) mixByte(static_cast<Uint8>(ptrVal >> (i * 8)));
+        for (int i = 0; i < 4; ++i) mixByte(static_cast<Uint8>(offsetBytes >> (i * 8)));
+        for (int i = 0; i < 4; ++i) mixByte(static_cast<Uint8>(strideBytes >> (i * 8)));
+        mixByte(static_cast<Uint8>(componentBytes));
+        mixByte(static_cast<Uint8>(isSigned ? 1 : 0));
+        mixByte(static_cast<Uint8>(count));
+
+        auto readComp = [&](const Uint8* p) -> float {
+            if (componentBytes == 1) {
+                return isSigned ? static_cast<float>(static_cast<int8_t>(p[0]))
+                                : static_cast<float>(static_cast<uint8_t>(p[0]));
+            }
+            if (componentBytes == 2) {
+                const uint16_t u = static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+                return isSigned ? static_cast<float>(static_cast<int16_t>(u)) : static_cast<float>(u);
+            }
+            const uint32_t u = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+                               (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+            return isSigned ? static_cast<float>(static_cast<int32_t>(u)) : static_cast<float>(u);
+        };
+        auto build = [&](WGPUBuffer buf) {
+            std::vector<float> out(static_cast<SizeT>(vtxCount) * count, 0.0f);
+            const Uint8* src = static_cast<const Uint8*>(data->data());
+            for (SizeT v = 0; v < vtxCount; ++v) {
+                for (Uint32 c = 0; c < count; ++c) {
+                    out[v * count + c] = readComp(&src[offsetBytes + v * strideBytes + c * componentBytes]);
+                }
+            }
+            wgpuQueueWriteBuffer(m_queue, buf, 0, out.data(), out.size() * sizeof(float));
+        };
+
+        auto it = m_repackedVertexBufferCache.find(keyHash);
+        if (it != m_repackedVertexBufferCache.end()) {
+            WgpuBuffer& cb = it->second;
+            if (cb.serial == serial && cb.size == newSize) {
+                cb.lastUseSerial = m_flushSerial;
+                return cb.buffer;
+            }
+            if (cb.buffer && cb.size == newSize) {
+                if (cb.lastUseSerial == m_flushSerial) {
+                    FlushFrame();
+                }
+                build(cb.buffer);
+                cb.serial = serial;
+                cb.lastUseSerial = m_flushSerial;
+                return cb.buffer;
+            }
+            if (cb.buffer) wgpuBufferRelease(cb.buffer);
+            m_repackedVertexBufferCache.erase(it);
+        }
+        WGPUBufferDescriptor bd{};
+        bd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
+        bd.size = newSize;
+        WGPUBuffer buf = wgpuDeviceCreateBuffer(m_device, &bd);
+        if (!buf) {
+            return nullptr;
+        }
+        build(buf);
+        m_repackedVertexBufferCache.emplace(keyHash, WgpuBuffer{buf, serial, newSize, m_flushSerial});
+        return buf;
+    }
+
     WGPUBuffer WebGPURenderer::GetOrCreateIndexBuffer(MG_State::GLState::BufferObject& buffer) {
         return GetOrCreateBuffer(m_indexBufferCache, buffer, WGPUBufferUsage_Index);
     }
@@ -1313,10 +1885,12 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (!m_dummyVertexBuffer) {
             WGPUBufferDescriptor bd{};
             bd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
-            bd.size = 16; // one vec4 of zeros; arrayStride 0 makes every vertex read it
+            // 16 distinct 16-byte (vec4) slots of zeros: all dummy attributes share this
+            // one buffer (arrayStride 0), each reading its own slot (offset = index*16).
+            bd.size = 16 * 16;
             m_dummyVertexBuffer = wgpuDeviceCreateBuffer(m_device, &bd);
             if (m_dummyVertexBuffer) {
-                const Uint8 zeros[16] = {};
+                const Uint8 zeros[16 * 16] = {};
                 wgpuQueueWriteBuffer(m_queue, m_dummyVertexBuffer, 0, zeros, sizeof(zeros));
             }
         }
@@ -1325,7 +1899,14 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
 
     const WebGPURenderer::WgpuTexture*
     WebGPURenderer::GetOrCreateTexture(MG_State::GLState::ITextureObject& texture) {
-        const WGPUTextureFormat fmt = ToTextureFormat(texture.GetFormat());
+        // Depth-format textures (depthtex*/shadowtex*) take a separate path: a sampleable
+        // depth texture with depth-aspect views, no color mip upload / sRGB handling.
+        if (const WGPUTextureFormat depthFmt = ToDepthFormat(texture.GetFormat());
+            depthFmt != WGPUTextureFormat_Undefined) {
+            return GetOrCreateDepthTexture(texture, depthFmt);
+        }
+        const ColorFormatInfo info = ToColorFormat(texture.GetFormat());
+        const WGPUTextureFormat fmt = info.format;
         if (fmt == WGPUTextureFormat_Undefined) {
             std::printf("[webgpu] unsupported sampled texture format enum=%d\n", static_cast<int>(texture.GetFormat()));
             MGLOG_E("DirectWebGPU: unsupported texture internal format for sampling");
@@ -1385,7 +1966,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                     if (cached.lastUseSerial == m_flushSerial) {
                         FlushFrame();
                     }
-                    UploadTextureLevels(cached.texture, *mip);
+                    UploadTextureLevels(cached.texture, *mip, info.bytesPerTexel,
+                                        info.srcBytesPerTexel ? info.srcBytesPerTexel : info.bytesPerTexel);
                 }
                 if (viewDirty) {
                     if (cached.view) {
@@ -1434,7 +2016,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
         // Upload level-0 CPU data if present; FBO attachments allocated without data
         // (glTexImage2D NULL) just stay zero-initialized and get rendered into.
-        UploadTextureLevels(tex, *mip);
+        UploadTextureLevels(tex, *mip, info.bytesPerTexel,
+                            info.srcBytesPerTexel ? info.srcBytesPerTexel : info.bytesPerTexel);
 
         WgpuTexture wt;
         wt.texture = tex;
@@ -1470,9 +2053,75 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         return &ins->second;
     }
 
-    void WebGPURenderer::UploadTextureLevels(WGPUTexture tex, MG_State::GLState::TextureObjectMipmap& mip) {
+    const WebGPURenderer::WgpuTexture*
+    WebGPURenderer::GetOrCreateDepthTexture(MG_State::GLState::ITextureObject& texture,
+                                            WGPUTextureFormat depthFmt) {
+        const IntVec3 dim = texture.GetBaseSize();
+        if (dim.x() <= 0 || dim.y() <= 0) {
+            return nullptr;
+        }
+        const Uint32 w = static_cast<Uint32>(dim.x());
+        const Uint32 h = static_cast<Uint32>(dim.y());
+        const Bool hasStencil = (depthFmt == WGPUTextureFormat_Depth24PlusStencil8);
+
+        auto it = m_textureCache.find(&texture);
+        if (it != m_textureCache.end()) {
+            WgpuTexture& c = it->second;
+            if (c.isDepth && c.width == w && c.height == h && c.format == depthFmt) {
+                c.lastUseSerial = m_flushSerial;
+                return &c; // depth targets carry no CPU data to re-upload
+            }
+            if (c.attachmentSrgbView) wgpuTextureViewRelease(c.attachmentSrgbView);
+            if (c.attachmentView) wgpuTextureViewRelease(c.attachmentView);
+            if (c.view) wgpuTextureViewRelease(c.view);
+            if (c.texture) wgpuTextureRelease(c.texture);
+            m_textureCache.erase(it);
+        }
+
+        WGPUTextureDescriptor td{};
+        td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc;
+        td.dimension = WGPUTextureDimension_2D;
+        td.size = {w, h, 1};
+        td.format = depthFmt;
+        td.mipLevelCount = 1;
+        td.sampleCount = 1;
+        WGPUTexture tex = wgpuDeviceCreateTexture(m_device, &td);
+        if (!tex) {
+            return nullptr;
+        }
+        WgpuTexture wt;
+        wt.texture = tex;
+        // Sampled view: single (depth) aspect, required for texture bindings.
+        WGPUTextureViewDescriptor vd{};
+        vd.format = depthFmt;
+        vd.dimension = WGPUTextureViewDimension_2D;
+        vd.baseMipLevel = 0;
+        vd.mipLevelCount = 1;
+        vd.baseArrayLayer = 0;
+        vd.arrayLayerCount = 1;
+        vd.aspect = WGPUTextureAspect_DepthOnly;
+        wt.view = wgpuTextureCreateView(tex, &vd);
+        // Depth-stencil attachment view: include stencil aspect when present.
+        WGPUTextureViewDescriptor ad = vd;
+        ad.aspect = hasStencil ? WGPUTextureAspect_All : WGPUTextureAspect_DepthOnly;
+        wt.attachmentView = wgpuTextureCreateView(tex, &ad);
+        wt.width = w;
+        wt.height = h;
+        wt.mipLevelCount = 1;
+        wt.viewBaseMipLevel = 0;
+        wt.viewMipLevelCount = 1;
+        wt.format = depthFmt;
+        wt.isDepth = true;
+        wt.lastUseSerial = m_flushSerial;
+        auto [ins, ok] = m_textureCache.emplace(&texture, wt);
+        return &ins->second;
+    }
+
+    void WebGPURenderer::UploadTextureLevels(WGPUTexture tex, MG_State::GLState::TextureObjectMipmap& mip,
+                                             Uint32 bytesPerTexel, Uint32 srcBytesPerTexel) {
         const auto target = TextureUploadTarget::Texture2D;
         const Uint32 levelCount = CountValidMipLevels(mip, target);
+        std::vector<Uint8> expandScratch;
         for (Uint32 level = 0; level < levelCount; ++level) {
             const IntVec3 dim = mip.GetMipmapTexelSize(target, level);
             const Uint32 w = static_cast<Uint32>(dim.x());
@@ -1480,27 +2129,63 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             const SizeT byteSize = mip.GetMipmapByteSize(target, level);
             void* pixels = mip.MapMipmapData(target, level);
             if (pixels && byteSize > 0) {
+                const void* src = pixels;
+                SizeT srcSize = byteSize;
+                // WebGPU has no 3-channel format: expand an RGB(8) source into the RGBA8
+                // texture, filling alpha with 0xFF. Only when the source really carries a
+                // level's worth of 3-byte texels (render-target attachments have none).
+                if (srcBytesPerTexel != 0 && srcBytesPerTexel != bytesPerTexel &&
+                    srcBytesPerTexel == 3 && bytesPerTexel == 4 &&
+                    byteSize >= static_cast<SizeT>(w) * h * 3) {
+                    expandScratch.assign(static_cast<SizeT>(w) * h * 4, 0xFF);
+                    const Uint8* s = static_cast<const Uint8*>(pixels);
+                    for (SizeT px = 0; px < static_cast<SizeT>(w) * h; ++px) {
+                        expandScratch[px * 4 + 0] = s[px * 3 + 0];
+                        expandScratch[px * 4 + 1] = s[px * 3 + 1];
+                        expandScratch[px * 4 + 2] = s[px * 3 + 2];
+                        // alpha stays 0xFF
+                    }
+                    src = expandScratch.data();
+                    srcSize = expandScratch.size();
+                } else if (byteSize < static_cast<SizeT>(w) * h * bytesPerTexel) {
+                    // Source smaller than the WGPU layout expects (e.g. an unexpanded
+                    // packed format); skip rather than over-read.
+                    mip.MarkStorageDirty(target, level, false);
+                    continue;
+                }
                 WGPUTexelCopyTextureInfo dst{};
                 dst.texture = tex;
                 dst.mipLevel = level;
                 WGPUTexelCopyBufferLayout dataLayout{};
-                dataLayout.bytesPerRow = w * 4u; // RGBA8 (4 bytes/texel)
+                // Row pitch from the resolved WGPU format's texel size (RGBA8=4,
+                // RGBA16F=8, RGBA32F=16, ...). queueWriteTexture has no 256B alignment
+                // requirement (unlike buffer copies).
+                dataLayout.bytesPerRow = w * bytesPerTexel;
                 dataLayout.rowsPerImage = h;
                 WGPUExtent3D ext{w, h, 1};
-                wgpuQueueWriteTexture(m_queue, &dst, pixels, byteSize, &dataLayout, &ext);
+                wgpuQueueWriteTexture(m_queue, &dst, src, srcSize, &dataLayout, &ext);
             }
             mip.MarkStorageDirty(target, level, false);
         }
     }
 
-    WGPUSampler WebGPURenderer::GetOrCreateSampler(const MG_State::GLState::SamplerObject& sampler) {
+    WGPUSampler WebGPURenderer::GetOrCreateSampler(const MG_State::GLState::SamplerObject& sampler,
+                                                   Bool comparison, Bool forceNonFiltering) {
         WGPUSamplerDescriptor sd{};
         sd.addressModeU = ToWgpuAddressMode(sampler.GetWrapS());
         sd.addressModeV = ToWgpuAddressMode(sampler.GetWrapT());
         sd.addressModeW = ToWgpuAddressMode(sampler.GetWrapR());
-        sd.magFilter = ToWgpuFilter(sampler.GetMagFilter());
-        sd.minFilter = ToWgpuFilter(sampler.GetMinFilter());
-        sd.mipmapFilter = ToWgpuMipmapFilter(sampler.GetMipmapMode());
+        if (forceNonFiltering && !comparison) {
+            // A depth texture sampled through a plain texture_2d<f32> is unfilterable-
+            // float, so its sampler must be non-filtering (nearest, no interpolation).
+            sd.magFilter = WGPUFilterMode_Nearest;
+            sd.minFilter = WGPUFilterMode_Nearest;
+            sd.mipmapFilter = WGPUMipmapFilterMode_Nearest;
+        } else {
+            sd.magFilter = ToWgpuFilter(sampler.GetMagFilter());
+            sd.minFilter = ToWgpuFilter(sampler.GetMinFilter());
+            sd.mipmapFilter = ToWgpuMipmapFilter(sampler.GetMipmapMode());
+        }
         // WebGPU requires 0 <= lodMinClamp <= lodMaxClamp; GL defaults (-1000..1000)
         // must be clamped. With no mipmaps yet this only affects validity.
         const Float maxLod = sampler.GetMipmapMode() == SamplerMipmapMode::None
@@ -1510,8 +2195,21 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         sd.lodMinClamp = minLod < maxLod ? minLod : maxLod;
         sd.lodMaxClamp = maxLod;
         sd.maxAnisotropy = 1;
-        // compare-samplers are a depth-texture feature; not wired up yet (would need
-        // tint to emit a sampler_comparison binding), so leave .compare unset.
+        if (comparison) {
+            // sampler2DShadow -> a comparison sampler (hardware PCF against a depth ref).
+            using CF = SamplerCompareFunc;
+            switch (sampler.GetSamplerCompareFunc()) {
+            case CF::Never: sd.compare = WGPUCompareFunction_Never; break;
+            case CF::Less: sd.compare = WGPUCompareFunction_Less; break;
+            case CF::Equal: sd.compare = WGPUCompareFunction_Equal; break;
+            case CF::Greater: sd.compare = WGPUCompareFunction_Greater; break;
+            case CF::NotEqual: sd.compare = WGPUCompareFunction_NotEqual; break;
+            case CF::GreaterEqual: sd.compare = WGPUCompareFunction_GreaterEqual; break;
+            case CF::Always: sd.compare = WGPUCompareFunction_Always; break;
+            case CF::LessEqual:
+            default: sd.compare = WGPUCompareFunction_LessEqual; break;
+            }
+        }
 
         // Key the cache by the resolved WGPU descriptor fields (dedupes identical
         // samplers across textures, like the Vulkan backend's sampler cache).
@@ -1528,6 +2226,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         mix(static_cast<Uint32>(sd.magFilter));
         mix(static_cast<Uint32>(sd.minFilter));
         mix(static_cast<Uint32>(sd.mipmapFilter));
+        mix(static_cast<Uint32>(sd.compare)); // distinguishes comparison samplers
         Uint32 lodBits;
         std::memcpy(&lodBits, &sd.lodMinClamp, 4); mix(lodBits);
         std::memcpy(&lodBits, &sd.lodMaxClamp, 4); mix(lodBits);
@@ -1543,13 +2242,16 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     WGPURenderPassEncoder WebGPURenderer::BeginDrawPass(MG_State::GLState::ProgramObject& program,
                                                         const MG_State::GLState::VertexArrayObject& vao,
                                                         GLenum mode) {
+        const int vdbg = g_wgpuVerboseDraw ? (int)program.GetExternalIndex() : -1;
         // Resolve the draw target first: the pipeline (color format + has-depth) and the
         // pass attachments both depend on it.
         if (!ResolveDrawTarget()) {
+            if (vdbg >= 0) std::printf("[vdbg] prog=%d SKIP: ResolveDrawTarget failed\n", vdbg);
             return nullptr;
         }
         const WgpuPipeline* p = GetOrCreatePipeline(program, vao, mode);
         if (!p) {
+            if (vdbg >= 0) std::printf("[vdbg] prog=%d SKIP: pipeline null\n", vdbg);
             return nullptr;
         }
 
@@ -1560,24 +2262,61 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // flush-capable resolution happens first, and the fresh UBO + bind group are
         // created only after it.
 
+        const WgpuProgram* prog = GetOrCreateProgram(program);
+        if (!prog) {
+            return nullptr;
+        }
+        // Same shader-base-type check as GetOrCreatePipeline, so the bound vertex buffers
+        // stay 1:1 with the pipeline's real (non-dummy) vertex layouts.
+        auto shaderExpects = [&](Uint loc) -> int {
+            for (const auto& vi : prog->vertexLocations) {
+                if (vi.location == loc) return !vi.isInt ? 0 : (vi.isUnsigned ? 2 : 1);
+            }
+            return -1;
+        };
+
         // Vertex buffers (ascending attribute order, matching the pipeline layouts).
         std::vector<std::pair<WGPUBuffer, uint64_t>> vertexBuffers;
         for (Uint i = 0; i < 16; ++i) {
             if (!vao.IsAttributeEnabled(i)) continue;
             const auto& a = vao.GetAttribute(i);
-            if (!a.Buffer ||
-                ToVertexFormat(a.Type, a.Size, a.Normalized, a.IsInteger) == WGPUVertexFormat_Force32)
-                continue;
-            WGPUBuffer vb = GetOrCreateVertexBuffer(*a.Buffer);
+            const WGPUVertexFormat vf = ToVertexFormat(a.Type, a.Size, a.Normalized, a.IsInteger);
+            if (!a.Buffer || vf == WGPUVertexFormat_Force32) continue;
+            const int exp = shaderExpects(i);
+            const int baseVf = VertexFormatBaseType(vf);
+            const Bool convert = (exp == 0 && baseVf != 0 && a.Size >= 1 && a.Size <= 4);
+            if (exp >= 0 && baseVf != exp && !convert) continue; // dropped to a dummy in the pipeline
+            // Mirror the pipeline builder's interleaved / deinterleaved / converted choice.
+            const Uint32 attrBytes = ComponentByteSize(a.Type) * a.Size;
+            const Uint32 glStride = a.Stride ? static_cast<Uint32>(a.Stride) : attrBytes;
+            const Bool aligned = !convert && (a.Offset % 4u == 0u) && (glStride % 4u == 0u);
+            WGPUBuffer vb = nullptr;
+            uint64_t bindOffset = 0;
+            if (convert) {
+                const Bool isSigned = (a.Type == DataType::Int8 || a.Type == DataType::Int16 ||
+                                       a.Type == DataType::Int32);
+                vb = GetOrCreateFloatConvertedBuffer(*a.Buffer, static_cast<Uint32>(a.Offset), glStride,
+                                                     ComponentByteSize(a.Type), isSigned, a.Size);
+            } else if (aligned) {
+                vb = GetOrCreateVertexBuffer(*a.Buffer);
+                bindOffset = static_cast<uint64_t>(a.Offset);
+            } else {
+                const Uint32 alignedStride = (attrBytes + 3u) & ~3u;
+                vb = GetOrCreateDeinterleavedBuffer(*a.Buffer, static_cast<Uint32>(a.Offset), glStride,
+                                                    attrBytes, alignedStride);
+            }
             if (!vb) continue;
-            vertexBuffers.emplace_back(vb, static_cast<uint64_t>(a.Offset));
+            vertexBuffers.emplace_back(vb, bindOffset);
         }
 
         // Sampled textures + samplers, resolved to texture units by uniform name.
         // (A texelFetch-only texture has no companion sampler.)
-        const WgpuProgram* prog = GetOrCreateProgram(program);
         std::vector<WGPUBindGroupEntry> entries;
         const Bool wantResources = prog && prog->HasResources() && p->group0Layout;
+        // Every resource the pipeline's auto layout expects must resolve; a missing one
+        // (unsupported texture format, no texture bound) would leave the bind group short
+        // an entry and invalidate the whole command buffer. Track and skip the draw if so.
+        Bool resourcesOk = true;
         if (wantResources) {
             for (const auto& r : prog->resources) {
                 Int unit = 0;
@@ -1601,10 +2340,16 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                             std::printf("[webgpu] sampler '%s' resolved to unit %d with no Texture2D bound\n",
                                         r.glName.c_str(), unit);
                         }
-                        continue;
+                        resourcesOk = false;
+                        break;
                     }
                     const WgpuTexture* wt = GetOrCreateTexture(*texObj);
-                    if (!wt) continue;
+                    if (vdbg >= 0) {
+                        std::printf("[vdbg] prog=%d texture '%s' bind=%u unit=%d fmt=0x%x -> %s\n", vdbg,
+                                    r.glName.c_str(), r.binding, unit, (unsigned)texObj->GetFormat(),
+                                    wt ? "ok" : "NULL");
+                    }
+                    if (!wt) { resourcesOk = false; break; }
                     WGPUBindGroupEntry te{};
                     te.binding = r.binding;
                     te.textureView = wt->view;
@@ -1615,14 +2360,40 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                     const auto& samplerOverride = textureUnit.GetSamplerObject();
                     const auto& effectiveSampler =
                         samplerOverride ? samplerOverride : (texObj ? texObj->GetSamplerObject() : samplerOverride);
-                    WGPUSampler sampler = effectiveSampler ? GetOrCreateSampler(*effectiveSampler) : nullptr;
-                    if (!sampler) continue;
+                    // sampler2DShadow -> comparison sampler; a plain sampler2D on a depth
+                    // texture -> non-filtering (must match the unfilterable-float binding).
+                    const Bool comparison = r.wgslComparison;
+                    const Bool depthPaired =
+                        texObj && ToDepthFormat(texObj->GetFormat()) != WGPUTextureFormat_Undefined;
+                    WGPUSampler sampler = effectiveSampler
+                                              ? GetOrCreateSampler(*effectiveSampler, comparison,
+                                                                   depthPaired && !comparison)
+                                              : nullptr;
+                    if (vdbg >= 0) {
+                        std::printf("[vdbg] prog=%d sampler '%s' bind=%u unit=%d cmp=%d depthPaired=%d hasEff=%d -> %s\n",
+                                    vdbg, r.glName.c_str(), r.binding, unit, comparison ? 1 : 0,
+                                    depthPaired ? 1 : 0, effectiveSampler ? 1 : 0, sampler ? "ok" : "NULL");
+                    }
+                    if (!sampler) { resourcesOk = false; break; }
                     WGPUBindGroupEntry se{};
                     se.binding = r.binding;
                     se.sampler = sampler;
                     entries.push_back(se);
                 }
             }
+        }
+
+        // A resource the pipeline layout requires couldn't be resolved -> the bind group
+        // would be incomplete and poison the command buffer. Skip this draw instead (the
+        // rest of the frame still renders). Common while backend format/depth support is
+        // incomplete (e.g. an Iris pass sampling a depth/shadow or unsupported-format tex).
+        if (wantResources && !resourcesOk) {
+            if (vdbg >= 0) std::printf("[vdbg] prog=%d SKIP: resources not ok\n", vdbg);
+            return nullptr;
+        }
+        if (vdbg >= 0) {
+            std::printf("[vdbg] prog=%d DREW: wantResources=%d entries=%zu targetColors=%u\n", vdbg,
+                        wantResources ? 1 : 0, entries.size(), m_curColorCount);
         }
 
         // ---- Phase 2: fresh per-draw UBO + bind group (no flushes past here). ----
@@ -1661,14 +2432,34 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
 
         // ---- Phase 3: open the pass and record state. ----
-        // Draw into a Load render pass so a prior glClear is preserved. The depth
-        // attachment is present only if the current target has one (matching the
-        // pipeline's depthStencil state).
-        WGPURenderPassColorAttachment color{};
-        color.view = m_curColorView;
-        color.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
-        color.loadOp = WGPULoadOp_Load;
-        color.storeOp = WGPUStoreOp_Store;
+        // Draw into a Load render pass so a prior glClear is preserved. Color attachments
+        // must match the pipeline's color targets exactly: one per fragment output
+        // @location, with holes (null) where the shader doesn't write. The depth
+        // attachment is present only if the current target has one.
+        if (!prog) {
+            return nullptr;
+        }
+        Uint32 targetCount = 0;
+        for (Uint32 loc : prog->fragmentOutputs) {
+            targetCount = std::max(targetCount, loc + 1);
+        }
+        std::vector<char> isOutput(targetCount, 0);
+        for (Uint32 loc : prog->fragmentOutputs) {
+            if (loc < targetCount) isOutput[loc] = 1;
+        }
+        std::vector<WGPURenderPassColorAttachment> colors(targetCount);
+        for (Uint32 i = 0; i < targetCount; ++i) {
+            WGPURenderPassColorAttachment& a = colors[i];
+            a = {};
+            a.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
+            if (isOutput[i] && i < m_curColorCount && m_curColor[i].view) {
+                a.view = m_curColor[i].view;
+                a.loadOp = WGPULoadOp_Load;
+                a.storeOp = WGPUStoreOp_Store;
+            } else {
+                a.view = nullptr; // hole: loadOp/storeOp stay Undefined
+            }
+        }
         WGPURenderPassDepthStencilAttachment depth{};
         const Bool hasDepth = (m_curDepthView != nullptr);
         if (hasDepth) {
@@ -1677,8 +2468,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             depth.depthStoreOp = WGPUStoreOp_Store;
         }
         WGPURenderPassDescriptor rp{};
-        rp.colorAttachmentCount = 1;
-        rp.colorAttachments = &color;
+        rp.colorAttachmentCount = colors.size();
+        rp.colorAttachments = colors.empty() ? nullptr : colors.data();
         rp.depthStencilAttachment = hasDepth ? &depth : nullptr;
 
         WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(m_encoder, &rp);
@@ -1890,6 +2681,51 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             mobilegl_jspi_signal();
         }
         constexpr Uint32 AlignUp256(Uint32 v) { return (v + 255u) & ~255u; }
+
+        // IEEE half -> float (for float texture readback/diagnostics).
+        float HalfToFloat(uint16_t h) {
+            const uint32_t sign = (h & 0x8000u) << 16;
+            const uint32_t exp = (h >> 10) & 0x1Fu;
+            const uint32_t mant = h & 0x3FFu;
+            uint32_t f;
+            if (exp == 0) {
+                if (mant == 0) {
+                    f = sign; // +/-0
+                } else {
+                    // subnormal -> normalize
+                    int e = -1;
+                    uint32_t m = mant;
+                    do { ++e; m <<= 1; } while ((m & 0x400u) == 0);
+                    m &= 0x3FFu;
+                    f = sign | ((uint32_t)(127 - 15 - e) << 23) | (m << 13);
+                }
+            } else if (exp == 0x1Fu) {
+                f = sign | 0x7F800000u | (mant << 13); // inf/nan
+            } else {
+                f = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+            }
+            float out;
+            std::memcpy(&out, &f, 4);
+            return out;
+        }
+        Uint8 ToUnorm8(float v) {
+            if (v <= 0.0f) return 0;
+            if (v >= 1.0f) return 255;
+            return static_cast<Uint8>(v * 255.0f + 0.5f);
+        }
+        // Byte size of a WGPU texture format we can read back (0 = unsupported).
+        Uint32 ReadbackBytesPerTexel(WGPUTextureFormat f) {
+            switch (f) {
+            case WGPUTextureFormat_RGBA8Unorm:
+            case WGPUTextureFormat_RGBA8UnormSrgb:
+            case WGPUTextureFormat_BGRA8Unorm:
+            case WGPUTextureFormat_BGRA8UnormSrgb:
+            case WGPUTextureFormat_RG11B10Ufloat: return 4;
+            case WGPUTextureFormat_RGBA16Float: return 8;
+            case WGPUTextureFormat_RGBA32Float: return 16;
+            default: return 0;
+            }
+        }
     } // namespace
 
     void WebGPURenderer::Finish() {
@@ -1910,12 +2746,17 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     }
 
     Bool WebGPURenderer::ReadTextureToCPU(WGPUTexture tex, Uint32 srcX, Uint32 srcY, Uint32 w, Uint32 h,
-                                          Bool srcIsBgra, GLenum dstFormat, Bool flipY, void* out) {
+                                          WGPUTextureFormat srcFmt, GLenum dstFormat, Bool flipY, void* out) {
         if (m_readbackInFlight) {
             MGLOG_E("DirectWebGPU: reentrant readback while one is in flight; ignoring");
             return false;
         }
-        const Uint32 bytesPerRow = AlignUp256(w * 4u); // WebGPU requires 256B row alignment
+        const Uint32 bpt = ReadbackBytesPerTexel(srcFmt);
+        if (bpt == 0) {
+            MGLOG_E("DirectWebGPU: readback unsupported for texture format %d", static_cast<int>(srcFmt));
+            return false;
+        }
+        const Uint32 bytesPerRow = AlignUp256(w * bpt); // WebGPU requires 256B row alignment
         const Uint64 bufSize = static_cast<Uint64>(bytesPerRow) * h;
 
         WGPUBufferDescriptor bd{};
@@ -1958,21 +2799,50 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                 wgpuBufferGetConstMappedRange(readback, 0, bufSize));
             if (mapped) {
                 auto* dstBytes = static_cast<Uint8*>(out);
+                const Bool srcIsBgra = (srcFmt == WGPUTextureFormat_BGRA8Unorm ||
+                                        srcFmt == WGPUTextureFormat_BGRA8UnormSrgb);
                 const Bool wantBgra = (dstFormat == GL_BGRA);
                 const Bool swapRB = (srcIsBgra != wantBgra);
+                const Bool isHalf = (srcFmt == WGPUTextureFormat_RGBA16Float);
+                const Bool isFloat = (srcFmt == WGPUTextureFormat_RGBA32Float);
+                const Bool isRG11B10 = (srcFmt == WGPUTextureFormat_RG11B10Ufloat);
+                auto rd16 = [](const Uint8* p) { return static_cast<uint16_t>(p[0] | (p[1] << 8)); };
+                auto rd32f = [](const Uint8* p) {
+                    uint32_t u = p[0] | (p[1] << 8) | (p[2] << 16) | (static_cast<uint32_t>(p[3]) << 24);
+                    float f; std::memcpy(&f, &u, 4); return f;
+                };
                 for (Uint32 row = 0; row < h; ++row) {
                     const Uint64 srcRowIdx = flipY ? (h - 1 - row) : row;
                     const Uint8* srcRow = mapped + srcRowIdx * bytesPerRow;
                     Uint8* dstRow = dstBytes + static_cast<Uint64>(row) * w * 4u;
-                    if (swapRB) {
-                        for (Uint32 px = 0; px < w; ++px) {
-                            dstRow[px * 4 + 0] = srcRow[px * 4 + 2];
-                            dstRow[px * 4 + 1] = srcRow[px * 4 + 1];
-                            dstRow[px * 4 + 2] = srcRow[px * 4 + 0];
-                            dstRow[px * 4 + 3] = srcRow[px * 4 + 3];
+                    for (Uint32 px = 0; px < w; ++px) {
+                        const Uint8* s = srcRow + static_cast<Uint64>(px) * bpt;
+                        Uint8* d = dstRow + px * 4u;
+                        if (isHalf) {
+                            d[0] = ToUnorm8(HalfToFloat(rd16(s + 0)));
+                            d[1] = ToUnorm8(HalfToFloat(rd16(s + 2)));
+                            d[2] = ToUnorm8(HalfToFloat(rd16(s + 4)));
+                            d[3] = ToUnorm8(HalfToFloat(rd16(s + 6)));
+                        } else if (isFloat) {
+                            d[0] = ToUnorm8(rd32f(s + 0));
+                            d[1] = ToUnorm8(rd32f(s + 4));
+                            d[2] = ToUnorm8(rd32f(s + 8));
+                            d[3] = ToUnorm8(rd32f(s + 12));
+                        } else if (isRG11B10) {
+                            const uint32_t u = s[0] | (s[1] << 8) | (s[2] << 16) | (static_cast<uint32_t>(s[3]) << 24);
+                            // R,G: 11-bit float (5e6m); B: 10-bit float (5e5m). Widen to half then decode.
+                            const uint16_t rh = static_cast<uint16_t>((((u) & 0x7FFu) >> 6) << 10 | (((u) & 0x3Fu) << 4));
+                            const uint16_t gh = static_cast<uint16_t>((((u >> 11) & 0x7FFu) >> 6) << 10 | (((u >> 11) & 0x3Fu) << 4));
+                            const uint16_t bh = static_cast<uint16_t>((((u >> 22) & 0x3FFu) >> 5) << 10 | (((u >> 22) & 0x1Fu) << 5));
+                            d[0] = ToUnorm8(HalfToFloat(rh));
+                            d[1] = ToUnorm8(HalfToFloat(gh));
+                            d[2] = ToUnorm8(HalfToFloat(bh));
+                            d[3] = 255;
+                        } else if (swapRB) {
+                            d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = s[3];
+                        } else {
+                            d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
                         }
-                    } else {
-                        std::memcpy(dstRow, srcRow, w * 4u);
                     }
                 }
                 ok = true;
@@ -2012,10 +2882,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // natural order — no flip. The stored bytes are returned as-is (no sRGB
         // encode/decode happens on readback, even for sRGB framebuffers).
         (void)srcH;
-        const Bool surfaceIsBgra = (srcFmt == WGPUTextureFormat_BGRA8Unorm ||
-                                    srcFmt == WGPUTextureFormat_BGRA8UnormSrgb);
         ReadTextureToCPU(srcTex, static_cast<Uint32>(x < 0 ? 0 : x), static_cast<Uint32>(y < 0 ? 0 : y),
-                         w, h, surfaceIsBgra, format, /*flipY=*/false, pixels);
+                         w, h, srcFmt, format, /*flipY=*/false, pixels);
     }
 
     void WebGPURenderer::GetTextureImage(MG_State::GLState::ITextureObject& texture,
@@ -2032,6 +2900,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             MGLOG_E("DirectWebGPU: GetTextureImage only supports 2D level 0 for now");
             return;
         }
+        // Submit pending draws so the readback reflects everything rendered so far.
+        if (m_frameActive) {
+            FlushFrame();
+        }
         const WgpuTexture* wt = GetOrCreateTexture(texture);
         if (!wt || !wt->texture) {
             return;
@@ -2043,7 +2915,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
         // Texture data is returned in texture order (top-to-bottom): no flip. Our
         // texture formats (RGBA8/SRGB8Alpha8) are RGBA-order, so srcIsBgra=false.
-        ReadTextureToCPU(wt->texture, 0, 0, w, h, /*srcIsBgra=*/false, format, /*flipY=*/false, pixels);
+        ReadTextureToCPU(wt->texture, 0, 0, w, h, wt->format, format, /*flipY=*/false, pixels);
     }
 
     void WebGPURenderer::GetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void* pixels) {

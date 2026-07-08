@@ -27,3 +27,4 @@ tools/trace_replay/work/
 
 # Prebuilt tint artifacts (produced by tools/build-tint.sh)
 tools/tint/out/
+/build-web

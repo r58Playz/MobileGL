@@ -45,6 +45,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         m_backendFunctions.GL.ReadPixels = &DirectWebGPU::ReadPixels;
         m_backendFunctions.GL.GetTexImage = &DirectWebGPU::GetTexImage;
         m_backendFunctions.GL.GetTextureImage = &DirectWebGPU::GetTextureImage;
+        // Safe no-ops (frontend calls these unguarded; see DirectWebGPU.cpp).
+        m_backendFunctions.GL.GenerateMipmap = &DirectWebGPU::GenerateMipmap;
+        m_backendFunctions.GL.CopyTexSubImage2D = &DirectWebGPU::CopyTexSubImage2D;
+        m_backendFunctions.GL.CopyTexImage2D = &DirectWebGPU::CopyTexImage2D;
         m_backendFunctions.GL.Finish = &DirectWebGPU::Finish;
         m_backendFunctions.GL.Flush = &DirectWebGPU::Flush;
     }

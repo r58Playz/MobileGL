@@ -24,6 +24,10 @@
       // ?dumpprog=N dumps trace program N's GLSL on first glUseProgram.
       targetCall: parseInt(new URLSearchParams(location.search).get('target') || '0', 10) || 0,
       dumpProg: parseInt(new URLSearchParams(location.search).get('dumpprog') || '0', 10) || 0,
+      // ?showtex=N reads back trace texture N (an intermediate colortex) instead of the FB.
+      showTex: parseInt(new URLSearchParams(location.search).get('showtex') || '0', 10) || 0,
+      // ?vdbgfrom=N opens the backend verbose-draw log from call N to the end of the trace.
+      vdbgFrom: parseInt(new URLSearchParams(location.search).get('vdbgfrom') || '0', 10) || 0,
       // ?nomap=1 skips replaying mapped-buffer memcpy writes (corruption bisection).
       noMap: new URLSearchParams(location.search).get('nomap') === '1',
       // ?nogolden=1 skips the golden compare (partial replays don't match the final
@@ -44,7 +48,12 @@
         (async () => {
           try {
             const adapter = await navigator.gpu.requestAdapter();
-            const device = await adapter.requestDevice({ requiredLimits: {
+            // Optional features Iris float render targets rely on: rg11b10ufloat as a
+            // renderable target, and linear filtering of 32-bit float textures. Request
+            // only those the adapter actually advertises.
+            const wanted = ['rg11b10ufloat-renderable', 'float32-filterable'];
+            const requiredFeatures = wanted.filter((f) => adapter.features.has(f));
+            const device = await adapter.requestDevice({ requiredFeatures, requiredLimits: {
               maxBufferSize: adapter.limits.maxBufferSize,
               maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
             }});
