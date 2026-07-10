@@ -8,6 +8,12 @@ option(MOBILEGL_FORCE_RELEASE_OPT "Enable Release optimization flags in Debug bu
 option(MOBILEGL_ENABLE_TRACY      "Enable tracy for profiling"                       OFF)
 option(MOBILEGL_BUILD_TRACE_REPLAY "Build desktop apitrace replay runner"            OFF)
 option(MOBILEGL_IOS               "Build MobileGL for iOS instead of macOS when APPLE is set" OFF)
+# Emscripten GL-translation-backend adapter for the patched pongasoft emscripten-glfw
+# (exports mobilegl_webgl_* / mobilegl_get_proc_address over MobileGL's EGL/WebGPU flow).
+option(MOBILEGL_EMSCRIPTEN_GLFW   "Build the emscripten-glfw GL-backend adapter"     OFF)
+# Fixed-function pipeline emulation (SimpleFPEWrapper) in front of MobileGL, for legacy
+# apps such as Minecraft 1.16 and lower. Requires MOBILEGL_EMSCRIPTEN_GLFW.
+option(MOBILEGL_EMSCRIPTEN_GLFW_FPE "Enable SimpleFPEWrapper fixed-function front layer" OFF)
 set(MOBILEGL_LOG_ACTIVE_LEVEL "MOBILEGL_LOG_LEVEL_INFO" CACHE STRING "MobileGL active log level macro")
 set(MOBILEGL_VULKAN_LIBRARY "" CACHE FILEPATH "Vulkan loader/MoltenVK library to link for iOS builds")
 
@@ -343,6 +349,18 @@ if (EMSCRIPTEN)
         ${EMDAWNWEBGPU_WEBGPU_CPP}
     )
 
+    # emscripten-glfw GL-backend adapter (mobilegl_webgl_* / mobilegl_get_proc_address).
+    # Defines are scoped to the adapter TU so toggling the option doesn't recompile the archive.
+    if (MOBILEGL_EMSCRIPTEN_GLFW)
+        list(APPEND SOURCE_FILES MobileGL/MG_Impl/EmscriptenGLFW/EmscriptenGLFWBackend.cpp)
+        set(_mobilegl_glfw_defs MOBILEGL_EMSCRIPTEN_GLFW)
+        if (MOBILEGL_EMSCRIPTEN_GLFW_FPE)
+            list(APPEND _mobilegl_glfw_defs MOBILEGL_EMSCRIPTEN_GLFW_FPE)
+        endif()
+        set_source_files_properties(MobileGL/MG_Impl/EmscriptenGLFW/EmscriptenGLFWBackend.cpp
+            PROPERTIES COMPILE_DEFINITIONS "${_mobilegl_glfw_defs}")
+    endif()
+
     # WgslTranspiler.cpp is the only TU that includes tint; compile it with tint's
     # ABI (C++20, no RTTI/exceptions) + the matching TINT_BUILD_* defines + the
     # prebuilt header bundle. Isolated here so the rest of MobileGL stays C++23.
@@ -589,6 +607,63 @@ if (EMSCRIPTEN)
             "-sWASM_ASYNC_COMPILATION=0"
             "--shell-file=${CMAKE_SOURCE_DIR}/tools/web_harness/shell.html")
         set_target_properties(mobilegl_web_harness PROPERTIES SUFFIX ".html")
+    endif()
+
+    # Threaded harness: exercises the FULL ikvmcraft pipeline (pthreads + PROXY_TO_PTHREAD +
+    # a transferred OffscreenCanvas owned by the render worker) through the mobilegl_* adapter.
+    # Requires MOBILEGL_EMSCRIPTEN_GLFW (the adapter) and a -pthread build of MobileGL.
+    option(MOBILEGL_BUILD_WEB_HARNESS_THREADED "Build the threaded (pthread) DirectWebGPU harness" OFF)
+    if (MOBILEGL_BUILD_WEB_HARNESS_THREADED)
+        if (NOT MOBILEGL_EMSCRIPTEN_GLFW)
+            message(FATAL_ERROR "MOBILEGL_BUILD_WEB_HARNESS_THREADED requires -DMOBILEGL_EMSCRIPTEN_GLFW=ON")
+        endif()
+        add_executable(mobilegl_web_harness_threaded ${CMAKE_SOURCE_DIR}/tools/web_harness/main_threaded.cpp)
+        target_link_libraries(mobilegl_web_harness_threaded PRIVATE ${CMAKE_PROJECT_NAME})
+        set(_emdawn_js_flags_mt)
+        foreach(_js ${EMDAWNWEBGPU_JS_LIBRARIES})
+            list(APPEND _emdawn_js_flags_mt "--js-library=${_js}")
+        endforeach()
+        target_link_options(mobilegl_web_harness_threaded PRIVATE
+            ${_emdawn_js_flags_mt}
+            "--js-library=${CMAKE_SOURCE_DIR}/MobileGL/MG_Backend/DirectWebGPU/lib_mobilegl_webgpu.js"
+            "-pthread"
+            "-sPROXY_TO_PTHREAD=1"
+            "-sOFFSCREENCANVAS_SUPPORT=1"
+            "-sOFFSCREENCANVASES_TO_PTHREAD=.canvas"
+            "-sPTHREAD_POOL_SIZE=4"
+            "-sWASM_BIGINT" "-sSTACK_SIZE=16MB" "-sALLOW_MEMORY_GROWTH=1" "-sEXIT_RUNTIME=0"
+            "-sEXPORTED_RUNTIME_METHODS=ccall"
+            "-sEXPORTED_FUNCTIONS=_main,_run_render"
+            "--shell-file=${CMAKE_SOURCE_DIR}/tools/web_harness/shell_threaded.html")
+        set_target_properties(mobilegl_web_harness_threaded PROPERTIES SUFFIX ".html")
+    endif()
+
+    # Part-A validation probe: links MobileGL + the symbol-renamed SimpleFPEWrapper archive and
+    # exercises the mobilegl_* adapter + SFPEW proc-address routing on the main thread. Point
+    # -DMOBILEGL_SFPEW_ARCHIVE at the renamed libSimpleFPEWrapper.a.
+    option(MOBILEGL_BUILD_FPE_PROBE "Build the FPE adapter link/routing probe" OFF)
+    set(MOBILEGL_SFPEW_ARCHIVE "" CACHE FILEPATH "Path to the symbol-renamed libSimpleFPEWrapper.a")
+    if (MOBILEGL_BUILD_FPE_PROBE)
+        if (NOT MOBILEGL_EMSCRIPTEN_GLFW OR NOT EXISTS "${MOBILEGL_SFPEW_ARCHIVE}")
+            message(FATAL_ERROR "MOBILEGL_BUILD_FPE_PROBE needs MOBILEGL_EMSCRIPTEN_GLFW=ON and a valid MOBILEGL_SFPEW_ARCHIVE")
+        endif()
+        add_library(sfpew_renamed STATIC IMPORTED)
+        set_target_properties(sfpew_renamed PROPERTIES IMPORTED_LOCATION "${MOBILEGL_SFPEW_ARCHIVE}")
+        add_executable(mobilegl_fpe_probe ${CMAKE_SOURCE_DIR}/tools/web_harness/main_fpe_probe.cpp)
+        target_link_libraries(mobilegl_fpe_probe PRIVATE ${CMAKE_PROJECT_NAME} sfpew_renamed)
+        set(_emdawn_js_flags_probe)
+        foreach(_js ${EMDAWNWEBGPU_JS_LIBRARIES})
+            list(APPEND _emdawn_js_flags_probe "--js-library=${_js}")
+        endforeach()
+        target_link_options(mobilegl_fpe_probe PRIVATE
+            ${_emdawn_js_flags_probe}
+            "--js-library=${CMAKE_SOURCE_DIR}/MobileGL/MG_Backend/DirectWebGPU/lib_mobilegl_webgpu.js"
+            "-sWASM_BIGINT" "-sSTACK_SIZE=16MB" "-sALLOW_MEMORY_GROWTH=1" "-sEXIT_RUNTIME=0"
+            "-sEXPORTED_RUNTIME_METHODS=addRunDependency,removeRunDependency"
+            "-sEXPORTED_FUNCTIONS=_main"
+            "-sWASM_ASYNC_COMPILATION=0"
+            "--shell-file=${CMAKE_SOURCE_DIR}/tools/web_harness/shell.html")
+        set_target_properties(mobilegl_fpe_probe PROPERTIES SUFFIX ".html")
     endif()
 
     # Browser-side apitrace replayer: replays a recorded GL trace through MobileGL ->

@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>MobileGL threaded DirectWebGPU harness</title></head>
+<body style="margin:0;background:#111">
+  <!-- id + class mirror ikvmcraft's <canvas id="canvas" class="canvas">. The canvas is
+       transferControlToOffscreen'd to the render worker via OFFSCREENCANVASES_TO_PTHREAD='.canvas'
+       (the link-flag equivalent of ikvmcraft's runtime transferredCanvasNames=['.canvas'] monkeypatch). -->
+  <canvas id="canvas" class="canvas" width="512" height="512" style="display:block;margin:20px auto;background:#000"></canvas>
+  <pre id="log" style="color:#0f0;font:12px monospace;padding:8px;white-space:pre-wrap"></pre>
+  <script>
+    var logEl = document.getElementById('log');
+    var Module = {
+      canvas: document.getElementById('canvas'),
+      print:    function(t){ logEl.textContent += t + "\n"; console.log(t); },
+      printErr: function(t){ logEl.textContent += "ERR: " + t + "\n"; console.error(t); },
+    };
+    // No main-thread WebGPU device preinit on purpose: the render WORKER acquires its own
+    // device (see main_threaded.cpp), matching the de-risk conclusion that GPUDevice is created
+    // on the render pthread, not transferred from main.
+  </script>
+  {{{ SCRIPT }}}
+</body>
+</html>
