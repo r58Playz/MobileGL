@@ -28,14 +28,11 @@
 
 // Returns the device's preferred canvas format so the surface (and pipeline color
 // targets, which share m_format) avoid an extra blit copy: 1 = rgba8unorm,
-// 0 = bgra8unorm (the WebGPU-guaranteed canvas formats).
-EM_JS(int, mobilegl_preferred_canvas_format, (), {
-    try {
-        return navigator["gpu"]["getPreferredCanvasFormat"]() === "rgba8unorm" ? 1 : 0;
-    } catch (e) {
-        return 0;
-    }
-});
+// 0 = bgra8unorm (the WebGPU-guaranteed canvas formats). Defined in lib_mobilegl_webgpu.js
+// (a --js-library function, NOT EM_JS: EM_JS creates a per-function symbol that emcc must
+// re-materialize at final link from the em_js section, which does not survive the
+// `emcc -r` relocatable combine used to pack this into libglfw3.a).
+extern "C" int mobilegl_preferred_canvas_format();
 
 // JSPI suspend primitive (defined in lib_mobilegl_webgpu.js). mobilegl_jspi_wait is
 // wrapped in WebAssembly.Suspending: calling it suspends the whole wasm stack (which

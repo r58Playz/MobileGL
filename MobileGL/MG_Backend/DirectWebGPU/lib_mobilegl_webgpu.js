@@ -21,6 +21,16 @@
 // Only one wait may be outstanding at a time; the backend enforces that with its
 // in-flight readback guard.
 mergeInto(LibraryManager.library, {
+  // Device's preferred canvas format: 1 = rgba8unorm, 0 = bgra8unorm. A --js-library function
+  // (not EM_JS) so it survives the native-deps `emcc -r` relocatable combine into libglfw3.a.
+  mobilegl_preferred_canvas_format: function () {
+    try {
+      return (navigator['gpu']['getPreferredCanvasFormat']() === 'rgba8unorm') ? 1 : 0;
+    } catch (e) {
+      return 0;
+    }
+  },
+
   mobilegl_jspi_wait: function () {
     return new Promise(function (resolve) {
       Module['__mobileglJspiResolve'] = resolve;
