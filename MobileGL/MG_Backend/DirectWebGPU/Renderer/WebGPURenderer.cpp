@@ -41,6 +41,15 @@ extern "C" int mobilegl_preferred_canvas_format();
 extern "C" void mobilegl_jspi_wait();
 extern "C" void mobilegl_jspi_signal();
 
+// WebGPU device bootstrap (defined in lib_mobilegl_webgpu.js). The device must live on the thread
+// that renders. In the single-threaded harness it is preinitialized in JS (preRun) and
+// mobilegl_has_webgpu_device() returns 1, so we never suspend. In the threaded host (e.g. ikvmcraft's
+// render pthread) no device is preset, so mobilegl_acquire_webgpu_device() — wrapped in
+// WebAssembly.Suspending — requests an adapter/device via navigator.gpu on THIS worker and JSPI-suspends
+// until it's ready (the render entry must be WebAssembly.promising, which the host's render loop is).
+extern "C" int mobilegl_has_webgpu_device();
+extern "C" void mobilegl_acquire_webgpu_device();
+
 namespace MobileGL::MG_Backend::DirectWebGPU {
     namespace {
         // Component byte size of a vertex attribute element.
@@ -432,6 +441,12 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (!m_instance) {
             MGLOG_E("WebGPURenderer: wgpuCreateInstance failed");
             return false;
+        }
+
+        // Ensure a WebGPU device exists on THIS thread. No-op (no suspend) when one was already
+        // preinitialized in JS; otherwise acquires one on this worker via JSPI (see the externs above).
+        if (!mobilegl_has_webgpu_device()) {
+            mobilegl_acquire_webgpu_device();
         }
 
         // The device is created asynchronously by JS at startup and handed to the

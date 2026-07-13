@@ -31,6 +31,43 @@ mergeInto(LibraryManager.library, {
     }
   },
 
+  // WebGPU device bootstrap. mobilegl_has_webgpu_device() is a plain (non-suspending) probe so the
+  // caller can skip the suspend when a device was preinitialized in JS (preRun) — a Suspending call
+  // requires a WebAssembly.promising entry, which a preRun-populated main thread is not.
+  mobilegl_has_webgpu_device: function () {
+    return (Module['preinitializedWebGPUDevice']) ? 1 : 0;
+  },
+
+  // Acquire a WebGPU device on the CALLING thread (the render worker in the threaded host) and stash
+  // it in Module.preinitializedWebGPUDevice, so the synchronous emscripten_webgpu_get_device() finds
+  // it. Wrapped in WebAssembly.Suspending (see __postset): JSPI suspends the wasm stack until the
+  // async adapter/device request resolves. Always resolves (never rejects) — on failure the device
+  // stays unset and emscripten_webgpu_get_device() reports the error path.
+  mobilegl_acquire_webgpu_device: function () {
+    return new Promise(function (resolve) {
+      if (Module['preinitializedWebGPUDevice']) { resolve(); return; }
+      if (typeof navigator === 'undefined' || !navigator['gpu']) {
+        console.error('[mobilegl] WebGPU (navigator.gpu) unavailable on this thread');
+        resolve(); return;
+      }
+      navigator['gpu'].requestAdapter().then(function (adapter) {
+        if (!adapter) throw new Error('no WebGPU adapter');
+        // Optional features MobileGL/Iris float render targets use, requested only when available.
+        var wanted = ['rg11b10ufloat-renderable', 'float32-filterable'];
+        var requiredFeatures = wanted.filter(function (f) { return adapter.features.has(f); });
+        return adapter.requestDevice({ requiredFeatures: requiredFeatures });
+      }).then(function (device) {
+        Module['preinitializedWebGPUDevice'] = device;
+        resolve();
+      }).catch(function (e) {
+        console.error('[mobilegl] WebGPU device acquisition failed: ' + (e && e.stack || e));
+        resolve();
+      });
+    });
+  },
+  mobilegl_acquire_webgpu_device__postset:
+    '_mobilegl_acquire_webgpu_device = new WebAssembly.Suspending(_mobilegl_acquire_webgpu_device);',
+
   mobilegl_jspi_wait: function () {
     return new Promise(function (resolve) {
       Module['__mobileglJspiResolve'] = resolve;
