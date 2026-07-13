@@ -9,3 +9,12 @@
      errorCallback: (callback, type, message, userdata) => {
        var sp = stackSave();
        var messagePtr = stringToUTF8OnStack(message);
+@@ -643,7 +643,7 @@
+     return firstResolvedFuture;
+   }),
+ #else
+-  emwgpuWaitAny: () => {
++  emwgpuWaitAny: (futurePtr, futureCount, timeoutNSPtr) => {
+     abort('TODO: Implement asyncify-free WaitAny for timeout=0');
+   },
+ #endif
