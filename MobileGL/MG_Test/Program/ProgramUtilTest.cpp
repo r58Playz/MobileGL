@@ -494,6 +494,56 @@ TEST_F(ProgramUtilTest, CompileAndLinkProgram) {
     }
 }
 
+TEST_F(ProgramUtilTest, DefaultBlockStructMembersUseDottedUniformNames) {
+    using namespace MG_Util::ShaderTranspiler;
+
+    constexpr const char* fogFragmentShader = R"(#version 460 core
+struct fog_param_t {
+    vec4 color;
+    float density;
+    float start;
+    float end;
+};
+uniform fog_param_t fogParam;
+layout(location = 0) out vec4 FragColor;
+void main() {
+    FragColor = fogParam.color * fogParam.density + vec4(fogParam.start + fogParam.end);
+}
+)";
+
+    auto shader = ShaderCompiler::CompileShader({.shaderType = GL_FRAGMENT_SHADER, .sourceStr = fogFragmentShader});
+    ASSERT_TRUE(shader.has_value()) << shader.error().log;
+
+    auto program = ShaderCompiler::LinkProgram({.shaders = {shader.value()}});
+    ASSERT_TRUE(program.has_value()) << program.error().log;
+
+    auto binaries = ShaderCompiler::GetSpirvBinaryFromProgram({
+        .shaderTypes = {GL_FRAGMENT_SHADER},
+        .program = *program.value(),
+    });
+    ASSERT_TRUE(binaries.has_value()) << binaries.error().log;
+    ASSERT_EQ(binaries->size(), 1u);
+
+    const auto verifyMetadata = [](const SpvcMetadata& metadata) {
+        // SPIRV-Cross reports the declared 28-byte payload while SPIRV-Reflect
+        // may include the block's trailing alignment padding.
+        EXPECT_GE(metadata.globalUboSize, 28u);
+        EXPECT_EQ(metadata.plainUniformOffsetsInUBO.at("fogParam.color"), 0u);
+        EXPECT_EQ(metadata.plainUniformOffsetsInUBO.at("fogParam.density"), 16u);
+        EXPECT_EQ(metadata.plainUniformOffsetsInUBO.at("fogParam.start"), 20u);
+        EXPECT_EQ(metadata.plainUniformOffsetsInUBO.at("fogParam.end"), 24u);
+        EXPECT_EQ(metadata.plainUniformOffsetsInUBO.count("fogParam"), 0u);
+    };
+
+    SpvcSession transpileSession(binaries->front(), SessionUsageBit::Transpile);
+    ASSERT_EQ(transpileSession.ParseMetaData(), SPVC_SUCCESS);
+    verifyMetadata(transpileSession.GetMetadata());
+
+    SpvcSession reflectionSession(binaries->front(), SessionUsageBit::Reflection);
+    ASSERT_EQ(reflectionSession.ParseMetaData(), SPVC_SUCCESS);
+    verifyMetadata(reflectionSession.GetMetadata());
+}
+
 TEST_F(ProgramUtilTest, DecompProgram) {
     using namespace MG_Util::ShaderTranspiler;
     ShaderAttrib vs_attrib{.shaderType = GL_VERTEX_SHADER, .sourceStr = vs};
@@ -946,4 +996,3 @@ void main() {
     Vector<uint32_t> optimized;
     ASSERT_TRUE(ShaderCompiler::SanitizeAndOptimizeBinary(binRes->at(0), optimized));
 }
-

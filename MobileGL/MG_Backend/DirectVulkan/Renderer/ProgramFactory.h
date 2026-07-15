@@ -56,7 +56,9 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             Vector<TextureTarget> samplerTextureTargetByBinding;
             Vector<String> storageBlockNameByBinding;
             Vector<Int> storageBlockIndexByBinding;
-            Int globalUboBinding = -1;
+            // Shader stage owning a synthetic default-block UBO at each descriptor
+            // binding. Unknown means the binding is not a global UBO.
+            Vector<ShaderStage> globalUboStageByBinding;
             Uint32 activeVertexInputLocationMask = 0;
             Array<GLenum, kMaxVertexInputLocations> vertexInputTypes{};
             Uint32 activeFragmentOutputLocationMask = 0;
@@ -84,7 +86,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 samplerTextureTargetByBinding = std::move(other.samplerTextureTargetByBinding);
                 storageBlockNameByBinding = std::move(other.storageBlockNameByBinding);
                 storageBlockIndexByBinding = std::move(other.storageBlockIndexByBinding);
-                globalUboBinding = other.globalUboBinding;
+                globalUboStageByBinding = std::move(other.globalUboStageByBinding);
                 activeVertexInputLocationMask = other.activeVertexInputLocationMask;
                 vertexInputTypes = other.vertexInputTypes;
                 activeFragmentOutputLocationMask = other.activeFragmentOutputLocationMask;
@@ -95,7 +97,6 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 other.hash = 0;
                 other.descriptorSetLayout = VK_NULL_HANDLE;
                 other.pipelineLayout = VK_NULL_HANDLE;
-                other.globalUboBinding = -1;
                 other.activeVertexInputLocationMask = 0;
                 other.activeFragmentOutputLocationMask = 0;
                 other.rasterizationProducerStage = ShaderStage::Unknown;
@@ -120,7 +121,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 samplerTextureTargetByBinding = std::move(other.samplerTextureTargetByBinding);
                 storageBlockNameByBinding = std::move(other.storageBlockNameByBinding);
                 storageBlockIndexByBinding = std::move(other.storageBlockIndexByBinding);
-                globalUboBinding = other.globalUboBinding;
+                globalUboStageByBinding = std::move(other.globalUboStageByBinding);
                 activeVertexInputLocationMask = other.activeVertexInputLocationMask;
                 vertexInputTypes = other.vertexInputTypes;
                 activeFragmentOutputLocationMask = other.activeFragmentOutputLocationMask;
@@ -131,7 +132,6 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 other.hash = 0;
                 other.descriptorSetLayout = VK_NULL_HANDLE;
                 other.pipelineLayout = VK_NULL_HANDLE;
-                other.globalUboBinding = -1;
                 other.activeVertexInputLocationMask = 0;
                 other.activeFragmentOutputLocationMask = 0;
                 other.rasterizationProducerStage = ShaderStage::Unknown;

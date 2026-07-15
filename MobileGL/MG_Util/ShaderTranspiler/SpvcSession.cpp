@@ -249,31 +249,48 @@ namespace MobileGL {
                         if (strcmp(list[i].name, GLOBAL_UBO_NAME) == 0) {
                             spvc_type type = spvc_compiler_get_type_handle(compiler, list[i].base_type_id);
                             spvc_compiler_get_declared_struct_size(compiler, type, &metadata.globalUboSize);
-                            size_t num_members = spvc_type_get_num_member_types(type);
-                            for (size_t j = 0; j < num_members; ++j) {
-                                const char* memberName =
-                                    spvc_compiler_get_member_name(compiler, list[i].base_type_id, j);
+                            // glGetUniformLocation addresses struct leaves (for example
+                            // "fogParam.density"), while glslang represents the default
+                            // block as a top-level "fogParam" struct member. Flatten that
+                            // hierarchy into the GL names expected by ProgramObject.
+                            auto recordMembers = [&](auto&& self, spvc_type_id structTypeId, const String& prefix,
+                                                     Uint baseOffset) -> spvc_result {
+                                spvc_type structType = spvc_compiler_get_type_handle(compiler, structTypeId);
+                                const size_t memberCount = spvc_type_get_num_member_types(structType);
+                                for (size_t memberIndex = 0; memberIndex < memberCount; ++memberIndex) {
+                                    const char* rawName =
+                                        spvc_compiler_get_member_name(compiler, structTypeId, memberIndex);
+                                    const String memberName = prefix.empty() ? rawName : prefix + "." + rawName;
 
-                                unsigned memberOffset = 0;
-                                SPVC_CHK_RESULT(
-                                    spvc_compiler_type_struct_member_offset(compiler, type, j, &memberOffset);)
-                                metadata.plainUniformOffsetsInUBO[memberName] = memberOffset;
-                                SizeT memberSize = 0;
-                                SPVC_CHK_RESULT(
-                                    spvc_compiler_get_declared_struct_member_size(compiler, type, j, &memberSize);)
-                                metadata.plainUniformMemberSizesInBytes[memberName] = memberSize;
+                                    unsigned relativeOffset = 0;
+                                    spvc_result result = spvc_compiler_type_struct_member_offset(
+                                        compiler, structType, memberIndex, &relativeOffset);
+                                    if (result != SPVC_SUCCESS) return result;
 
-                                auto memberTypeId = spvc_type_get_member_type(type, j);
-                                spvc_type memberType = spvc_compiler_get_type_handle(compiler, memberTypeId);
-                                spvc_basetype basetype = spvc_type_get_basetype(memberType);
-                                auto vectorSize = spvc_type_get_vector_size(memberType);
-                                auto matCol = spvc_type_get_columns(memberType);
-                                metadata.plainUniformMemberTypes[memberName] = {
-                                    .basetype = basetype,
-                                    .vectorSize = vectorSize,
-                                    .matCol = matCol,
-                                };
-                            }
+                                    const spvc_type_id memberTypeId =
+                                        spvc_type_get_member_type(structType, memberIndex);
+                                    spvc_type memberType = spvc_compiler_get_type_handle(compiler, memberTypeId);
+                                    if (spvc_type_get_basetype(memberType) == SPVC_BASETYPE_STRUCT) {
+                                        result = self(self, memberTypeId, memberName, baseOffset + relativeOffset);
+                                        if (result != SPVC_SUCCESS) return result;
+                                        continue;
+                                    }
+
+                                    SizeT memberSize = 0;
+                                    result = spvc_compiler_get_declared_struct_member_size(
+                                        compiler, structType, memberIndex, &memberSize);
+                                    if (result != SPVC_SUCCESS) return result;
+                                    metadata.plainUniformOffsetsInUBO[memberName] = baseOffset + relativeOffset;
+                                    metadata.plainUniformMemberSizesInBytes[memberName] = memberSize;
+                                    metadata.plainUniformMemberTypes[memberName] = {
+                                        .basetype = spvc_type_get_basetype(memberType),
+                                        .vectorSize = spvc_type_get_vector_size(memberType),
+                                        .matCol = spvc_type_get_columns(memberType),
+                                    };
+                                }
+                                return SPVC_SUCCESS;
+                            };
+                            SPVC_CHK_RESULT(recordMembers(recordMembers, list[i].base_type_id, "", 0);)
                             SPVC_CHK_RETURN
                         }
                     }
@@ -298,22 +315,31 @@ namespace MobileGL {
                     auto& block = binding->block;
                     metadata.globalUboSize = block.size;
 
-                    for (uint32_t j = 0; j < block.member_count; ++j) {
-                        auto& member = block.members[j];
-                        metadata.plainUniformOffsetsInUBO[member.name] = member.offset;
-                        metadata.plainUniformMemberSizesInBytes[member.name] = member.size;
+                    auto recordMembers = [&](auto&& self, const SpvReflectBlockVariable& parent,
+                                             const String& prefix) -> void {
+                        for (uint32_t j = 0; j < parent.member_count; ++j) {
+                            const auto& member = parent.members[j];
+                            const String memberName = prefix.empty() ? member.name : prefix + "." + member.name;
+                            if (member.member_count != 0) {
+                                self(self, member, memberName);
+                                continue;
+                            }
 
-                        Uint32 vectorSize = member.numeric.vector.component_count;
-                        if (vectorSize == 0) vectorSize = 1;
-                        Uint32 matCol = member.numeric.matrix.column_count;
-                        if (matCol == 0) matCol = 1;
+                            Uint32 vectorSize = member.numeric.vector.component_count;
+                            if (vectorSize == 0) vectorSize = 1;
+                            Uint32 matCol = member.numeric.matrix.column_count;
+                            if (matCol == 0) matCol = 1;
 
-                        metadata.plainUniformMemberTypes[member.name] = {
-                            .basetype = MapReflectToSpvcBasetype(member),
-                            .vectorSize = vectorSize,
-                            .matCol = matCol,
-                        };
-                    }
+                            metadata.plainUniformOffsetsInUBO[memberName] = member.absolute_offset;
+                            metadata.plainUniformMemberSizesInBytes[memberName] = member.size;
+                            metadata.plainUniformMemberTypes[memberName] = {
+                                .basetype = MapReflectToSpvcBasetype(member),
+                                .vectorSize = vectorSize,
+                                .matCol = matCol,
+                            };
+                        }
+                    };
+                    recordMembers(recordMembers, block, "");
                     return SPVC_SUCCESS;
                 }
                 return SPVC_ERROR_INVALID_SPIRV;

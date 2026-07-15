@@ -24,7 +24,9 @@
 #include <cstdlib>
 #include <cctype>
 #include <algorithm>
+#include <cmath>
 #include <unordered_set>
+#include <cstdio>
 
 // Returns the device's preferred canvas format so the surface (and pipeline color
 // targets, which share m_format) avoid an extra blit copy: 1 = rgba8unorm,
@@ -373,6 +375,30 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             }
         }
 
+        WGPUStencilOperation ToStencilOperation(StencilOperation op) {
+            switch (op) {
+            case StencilOperation::Keep: return WGPUStencilOperation_Keep;
+            case StencilOperation::Zero: return WGPUStencilOperation_Zero;
+            case StencilOperation::Replace: return WGPUStencilOperation_Replace;
+            case StencilOperation::IncrementClamp: return WGPUStencilOperation_IncrementClamp;
+            case StencilOperation::DecrementClamp: return WGPUStencilOperation_DecrementClamp;
+            case StencilOperation::Invert: return WGPUStencilOperation_Invert;
+            case StencilOperation::IncrementWrap: return WGPUStencilOperation_IncrementWrap;
+            case StencilOperation::DecrementWrap: return WGPUStencilOperation_DecrementWrap;
+            default: return WGPUStencilOperation_Keep;
+            }
+        }
+
+        Bool HasStencilAspect(WGPUTextureFormat format) {
+            return format == WGPUTextureFormat_Stencil8 ||
+                   format == WGPUTextureFormat_Depth24PlusStencil8 ||
+                   format == WGPUTextureFormat_Depth32FloatStencil8;
+        }
+
+        Bool DrawModeUsesPolygonFill(GLenum mode) {
+            return mode == GL_TRIANGLES || mode == GL_TRIANGLE_STRIP || mode == GL_TRIANGLE_FAN;
+        }
+
         WGPUBlendFactor ToBlendFactor(BlendFactor f) {
             switch (f) {
             case BlendFactor::Zero: return WGPUBlendFactor_Zero;
@@ -703,9 +729,23 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                 any = true;
             }
         }
+        // Resolve depth/stencil before rejecting an attachment-less color set: a
+        // depth-only FBO is complete and is used by shadow-map passes.
+        const auto& depthAtt = fbo->GetAttachment(FramebufferAttachmentType::Depth);
+        const auto& stencilAtt = fbo->GetAttachment(FramebufferAttachmentType::Stencil);
+        const auto* depthOrStencilAtt =
+            (depthAtt.IsValid() && !depthAtt.IsEmpty()) ? &depthAtt :
+            ((stencilAtt.IsValid() && !stencilAtt.IsEmpty()) ? &stencilAtt : nullptr);
+        const WgpuTexture* resolvedDepth =
+            (depthOrStencilAtt && depthOrStencilAtt->IsTexture() && depthOrStencilAtt->GetTexture())
+                ? GetOrCreateTexture(*depthOrStencilAtt->GetTexture()) : nullptr;
+        if (!any && resolvedDepth && resolvedDepth->attachmentView) {
+            w = resolvedDepth->width;
+            h = resolvedDepth->height;
+            any = true;
+        }
         if (!any) {
-            MGLOG_E("DirectWebGPU: FBO %u has no usable texture color attachment",
-                    fbo->GetExternalIndex());
+            MGLOG_E("DirectWebGPU: FBO %u has no usable attachment", fbo->GetExternalIndex());
             return false;
         }
         m_curColorCount = slotCount;
@@ -715,14 +755,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // Depth/stencil attachment. A texture attachment (depthtex*) becomes a real
         // sampleable depth texture so later passes can read it; a renderbuffer (or the
         // resolve failing) falls back to a transient depth buffer.
-        const auto& depthAtt = fbo->GetAttachment(FramebufferAttachmentType::Depth);
-        if (depthAtt.IsValid() && !depthAtt.IsEmpty()) {
-            const WgpuTexture* dt =
-                (depthAtt.IsTexture() && depthAtt.GetTexture()) ? GetOrCreateTexture(*depthAtt.GetTexture())
-                                                                : nullptr;
-            if (dt && dt->isDepth && dt->attachmentView) {
-                m_curDepthView = dt->attachmentView;
-                m_curDepthFormat = dt->format;
+        if (depthOrStencilAtt) {
+            if (resolvedDepth && resolvedDepth->isDepth && resolvedDepth->attachmentView) {
+                m_curDepthView = resolvedDepth->attachmentView;
+                m_curDepthFormat = resolvedDepth->format;
             } else {
                 m_curDepthView = GetOrCreateFboDepth(*fbo, w, h);
                 m_curDepthFormat = kDepthFormat;
@@ -854,8 +890,9 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
         const Bool clearColor = (mask & GL_COLOR_BUFFER_BIT) != 0;
         const Bool clearDepth = (mask & GL_DEPTH_BUFFER_BIT) != 0;
-        if (!clearColor && !clearDepth) {
-            return; // stencil-only clear unsupported for now
+        const Bool clearStencil = (mask & GL_STENCIL_BUFFER_BIT) != 0;
+        if (!clearColor && !clearDepth && !clearStencil) {
+            return;
         }
         BeginFrameIfNeeded();
         if (!m_frameActive) {
@@ -867,6 +904,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
         // A depth clear only applies if the current target actually has depth.
         const Bool doDepth = clearDepth && m_curDepthView != nullptr;
+        const Bool doStencil = clearStencil && m_curDepthView != nullptr && HasStencilAspect(m_curDepthFormat);
 
         // glClear(GL_COLOR_BUFFER_BIT) clears every active draw buffer, so build one
         // color attachment per resolved slot (holes -> null attachment).
@@ -891,17 +929,22 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
 
         WGPURenderPassDepthStencilAttachment depth{};
-        if (doDepth) {
+        if (doDepth || doStencil) {
             depth.view = m_curDepthView;
-            depth.depthLoadOp = WGPULoadOp_Clear;
+            depth.depthLoadOp = doDepth ? WGPULoadOp_Clear : WGPULoadOp_Load;
             depth.depthStoreOp = WGPUStoreOp_Store;
-            depth.depthClearValue = gl->GetClearDepth();
+            if (doDepth) depth.depthClearValue = gl->GetClearDepth();
+            if (HasStencilAspect(m_curDepthFormat)) {
+                depth.stencilLoadOp = doStencil ? WGPULoadOp_Clear : WGPULoadOp_Load;
+                depth.stencilStoreOp = WGPUStoreOp_Store;
+                if (doStencil) depth.stencilClearValue = static_cast<Uint32>(gl->GetClearStencil());
+            }
         }
 
         WGPURenderPassDescriptor rp{};
         rp.colorAttachmentCount = colors.size();
         rp.colorAttachments = colors.empty() ? nullptr : colors.data();
-        rp.depthStencilAttachment = doDepth ? &depth : nullptr;
+        rp.depthStencilAttachment = (doDepth || doStencil) ? &depth : nullptr;
 
         WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(m_encoder, &rp);
         wgpuRenderPassEncoderEnd(pass);
@@ -1679,12 +1722,30 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                     continue;
                 }
                 if (r.kind == ParsedWgslResource::Kind::Ubo) {
+                    Int blockIndex = -1;
                     if (r.typeName.find("MGL_GLOBAL_UBO") == String::npos) {
-                        continue; // only the default-block UBO is driven by glUniform*
+                        String blockName = r.typeName;
+                        blockName.erase(blockName.begin(), std::find_if(blockName.begin(), blockName.end(),
+                            [](unsigned char c) { return !std::isspace(c); }));
+                        blockName.erase(std::find_if(blockName.rbegin(), blockName.rend(),
+                            [](unsigned char c) { return !std::isspace(c); }).base(), blockName.end());
+                        const Uint reflectedIndex = program.GetUniformBlockIndex(blockName.c_str());
+                        if (reflectedIndex == 0xFFFFFFFFu) {
+                            MGLOG_E("DirectWebGPU: WGSL UBO '%s' does not map to an active GL uniform block",
+                                    blockName.c_str());
+                            return nullptr;
+                        }
+                        blockIndex = static_cast<Int>(reflectedIndex);
                     }
-                    if (std::find(prog.uboBindings.begin(), prog.uboBindings.end(), r.binding) ==
-                        prog.uboBindings.end()) {
-                        prog.uboBindings.push_back(r.binding);
+                    const ShaderStage stage = shaders[i]->GetShaderStage();
+                    const auto duplicate = std::find_if(
+                        prog.uboBindings.begin(), prog.uboBindings.end(),
+                        [binding = r.binding, stage, blockIndex](const WgpuProgram::StageUboBinding& ubo) {
+                            return ubo.binding == binding && ubo.stage == stage &&
+                                   ubo.blockIndex == blockIndex;
+                        });
+                    if (duplicate == prog.uboBindings.end()) {
+                        prog.uboBindings.push_back({r.binding, stage, blockIndex});
                     }
                 } else {
                     ResourceRef ref;
@@ -1729,16 +1790,14 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             if (prog.fragment) wgpuShaderModuleRelease(prog.fragment);
             return nullptr;
         }
-        if (!prog.uboBindings.empty()) {
-            prog.globalUboSize = program.GetUBOSize();
-        }
         auto [ins, ok] = m_programCache.emplace(&program, prog);
         return &ins->second;
     }
 
     Uint64 WebGPURenderer::ComputePipelineKey(const MG_State::GLState::ProgramObject& program,
                                               const MG_State::GLState::VertexArrayObject& vao,
-                                              GLenum mode, const WgpuProgram* prog) const {
+                                              GLenum mode, WGPUIndexFormat stripIndexFormat,
+                                              const WgpuProgram* prog) const {
         Uint64 key = 1469598103934665603ull; // FNV-1a
         auto mix = [&key](Uint64 v) {
             for (int i = 0; i < 8; ++i) {
@@ -1748,6 +1807,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         };
         mix(static_cast<Uint64>(reinterpret_cast<SizeT>(&program)));
         mix(static_cast<Uint64>(mode));
+        mix(static_cast<Uint64>(stripIndexFormat));
         // Vertex layout (per enabled attribute: index, format, stride, instance divisor>0).
         for (Uint i = 0; i < 16; ++i) {
             if (!vao.IsAttributeEnabled(i)) continue;
@@ -1778,6 +1838,46 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                 (static_cast<Uint64>(dA) << 24) | (static_cast<Uint64>(eC) << 32) |
                 (static_cast<Uint64>(eA) << 40));
         }
+        // Vulkan consumes the indexed blend state for every draw buffer. WebGPU bakes
+        // the same per-target state into the pipeline, so it must participate in the key.
+        for (Uint i = 0; i < kMaxColorTargets; ++i) {
+            const Bool enabled = gl->IsCapabilityEnabledIndexed(CapabilityInput::Blend, i);
+            mix(enabled ? 1 : 0);
+            if (enabled) {
+                BlendFactor sR, dR, sA, dA;
+                BlendEquation eC, eA;
+                gl->GetBlendFuncIndexed(i, sR, dR, sA, dA);
+                gl->GetBlendEquationIndexed(i, eC, eA);
+                mix(static_cast<Uint64>(sR) | (static_cast<Uint64>(dR) << 8) |
+                    (static_cast<Uint64>(sA) << 16) | (static_cast<Uint64>(dA) << 24) |
+                    (static_cast<Uint64>(eC) << 32) | (static_cast<Uint64>(eA) << 40));
+            }
+        }
+        const Bool stencil = gl->IsCapabilityEnabled(CapabilityInput::StencilTest);
+        mix(stencil ? 1 : 0);
+        if (stencil) {
+            for (StencilFace face : {StencilFace::Front, StencilFace::Back}) {
+                const auto& s = gl->GetStencilState(face);
+                mix(static_cast<Uint64>(s.Func) | (static_cast<Uint64>(s.FailOp) << 8) |
+                    (static_cast<Uint64>(s.PassDepthFailOp) << 16) |
+                    (static_cast<Uint64>(s.PassDepthPassOp) << 24));
+                mix(s.ValueMask);
+                mix(s.WriteMask);
+            }
+        }
+        const Bool polygonOffset = gl->IsCapabilityEnabled(CapabilityInput::PolygonOffsetFill) &&
+                                   DrawModeUsesPolygonFill(mode);
+        mix(polygonOffset ? 1 : 0);
+        if (polygonOffset) {
+            Uint32 factorBits = 0, unitsBits = 0;
+            const Float factor = gl->GetPolygonOffsetFactor();
+            const Float units = gl->GetPolygonOffsetUnits();
+            std::memcpy(&factorBits, &factor, sizeof(factorBits));
+            std::memcpy(&unitsBits, &units, sizeof(unitsBits));
+            mix(factorBits);
+            mix(unitsBits);
+        }
+        mix(gl->IsCapabilityEnabled(CapabilityInput::RasterizerDiscard) ? 1 : 0);
         // Current draw target(s): per-slot color format (holes included) + slot count +
         // whether there is a depth attachment (all baked into the pipeline by WebGPU).
         mix(static_cast<Uint64>(m_curColorCount));
@@ -1814,6 +1914,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         enum Kind { Aligned, Convert, Deinterleave } kind = Aligned;
         WGPUVertexStepMode stepMode = WGPUVertexStepMode_Vertex;
         uint64_t arrayStride = 0;
+        uint64_t maxAttrEnd = 0; // max(attr.offset + attr.byteSize); WebGPU's per-vertex used bytes
         std::vector<VGroupAttr> attrs;
         MG_State::GLState::BufferObject* buffer = nullptr; // GL source buffer (identity + whole-bind)
         // Buffer-build params for Convert / Deinterleave singletons:
@@ -1835,6 +1936,12 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             const WGPUVertexFormat vf = ToVertexFormat(a.Type, a.Size, a.Normalized, a.IsInteger);
             if (!a.Buffer || vf == WGPUVertexFormat_Force32) continue;
             const int exp = shaderExpects(i);
+            // The shader declares no attribute at this location: don't bind a vertex buffer for
+            // it. Legacy state trackers (e.g. SFPEW's shared FPE VAO) can leave an attribute from
+            // a previous, different-format draw still enabled; binding its (stale, differently
+            // sized) buffer against this pipeline's layout is a WebGPU size-validation error that
+            // invalidates the whole command buffer. The shader can't read it anyway.
+            if (exp < 0) continue;
             const int baseVf = VertexFormatBaseType(vf);
             const Bool convert = (exp == 0 && baseVf != 0 && a.Size >= 1 && a.Size <= 4);
             if (exp >= 0 && baseVf != exp && !convert) continue; // base-type mismatch -> dummy
@@ -1861,6 +1968,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                     dst->buffer = a.Buffer.get();
                 }
                 dst->attrs.push_back(VGroupAttr{i, vf, static_cast<uint64_t>(a.Offset)});
+                dst->maxAttrEnd = std::max(dst->maxAttrEnd, static_cast<uint64_t>(a.Offset) + attrBytes);
                 continue;
             }
             VGroup g;
@@ -1876,10 +1984,12 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             if (convert) {
                 g.kind = VGroup::Convert;
                 g.arrayStride = static_cast<uint64_t>(a.Size) * 4u; // tight Float32x{size}
+                g.maxAttrEnd = g.arrayStride;
                 g.attrs.push_back(VGroupAttr{i, FloatFormatForSize(a.Size), 0});
             } else {
                 g.kind = VGroup::Deinterleave;
                 g.arrayStride = static_cast<uint64_t>((attrBytes + 3u) & ~3u);
+                g.maxAttrEnd = attrBytes;
                 g.attrs.push_back(VGroupAttr{i, vf, 0});
             }
             groups.push_back(std::move(g));
@@ -1889,12 +1999,13 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
 
     const WebGPURenderer::WgpuPipeline*
     WebGPURenderer::GetOrCreatePipeline(MG_State::GLState::ProgramObject& program,
-                                        const MG_State::GLState::VertexArrayObject& vao, GLenum mode) {
+                                        const MG_State::GLState::VertexArrayObject& vao, GLenum mode,
+                                        WGPUIndexFormat stripIndexFormat) {
         const WgpuProgram* prog = GetOrCreateProgram(program);
         if (!prog) {
             return nullptr;
         }
-        const Uint64 key = ComputePipelineKey(program, vao, mode, prog);
+        const Uint64 key = ComputePipelineKey(program, vao, mode, stripIndexFormat, prog);
         if (auto it = m_pipelineCache.find(key); it != m_pipelineCache.end()) {
             return &it->second;
         }
@@ -1986,28 +2097,18 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
 
         // Per-slot color targets, indexed by fragment output @location. WebGPU requires
         // a target exactly where the shader writes; unwritten slots below the max are
-        // holes (format Undefined). The write mask / blend state are shared across all
-        // targets (GL's per-buffer color mask / blend-i are not tracked yet).
+        // holes (format Undefined).
         const auto cmask = gl->GetColorMask();
         const WGPUColorWriteMask writeMask =
             (cmask.r() ? WGPUColorWriteMask_Red : 0u) | (cmask.g() ? WGPUColorWriteMask_Green : 0u) |
             (cmask.b() ? WGPUColorWriteMask_Blue : 0u) | (cmask.a() ? WGPUColorWriteMask_Alpha : 0u);
-        const Bool blendEnabled = gl->IsCapabilityEnabled(CapabilityInput::Blend);
-        WGPUBlendState blend{};
-        if (blendEnabled) {
-            BlendFactor sR, dR, sA, dA;
-            gl->GetBlendFunc(sR, dR, sA, dA);
-            BlendEquation eC, eA;
-            gl->GetBlendEquation(eC, eA);
-            blend.color = {ToBlendOp(eC), ToBlendFactor(sR), ToBlendFactor(dR)};
-            blend.alpha = {ToBlendOp(eA), ToBlendFactor(sA), ToBlendFactor(dA)};
-        }
 
         Uint32 targetCount = 0;
         for (Uint32 loc : prog->fragmentOutputs) {
             targetCount = std::max(targetCount, loc + 1);
         }
         std::vector<WGPUColorTargetState> colorTargets(targetCount);
+        std::vector<WGPUBlendState> blendStates(targetCount);
         std::vector<char> isOutput(targetCount, 0);
         for (Uint32 loc : prog->fragmentOutputs) {
             if (loc < targetCount) isOutput[loc] = 1;
@@ -2028,8 +2129,15 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             }
             ct.format = m_curColor[i].format;
             ct.writeMask = writeMask;
+            const Bool blendEnabled = gl->IsCapabilityEnabledIndexed(CapabilityInput::Blend, i);
             if (blendEnabled && IsBlendableFormat(ct.format)) {
-                ct.blend = &blend;
+                BlendFactor sR, dR, sA, dA;
+                BlendEquation eC, eA;
+                gl->GetBlendFuncIndexed(i, sR, dR, sA, dA);
+                gl->GetBlendEquationIndexed(i, eC, eA);
+                blendStates[i].color = {ToBlendOp(eC), ToBlendFactor(sR), ToBlendFactor(dR)};
+                blendStates[i].alpha = {ToBlendOp(eA), ToBlendFactor(sA), ToBlendFactor(dA)};
+                ct.blend = &blendStates[i];
             }
         }
         // A render pipeline needs at least one color target or a depth-stencil target.
@@ -2047,6 +2155,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // depthWrite only when the test is on (GL doesn't write depth with the test off).
         const Bool hasDepth = (m_curDepthView != nullptr);
         const Bool depthTest = gl->IsCapabilityEnabled(CapabilityInput::DepthTest);
+        const Bool stencilTest = gl->IsCapabilityEnabled(CapabilityInput::StencilTest) &&
+                                 HasStencilAspect(m_curDepthFormat);
         WGPUDepthStencilState depthState{};
         depthState.format = m_curDepthFormat;
         depthState.depthWriteEnabled = (depthTest && gl->GetDepthMask())
@@ -2054,7 +2164,32 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                                            : WGPUOptionalBool_False;
         depthState.depthCompare = depthTest ? ToCompareFunc(gl->GetDepthFunc()) : WGPUCompareFunction_Always;
         depthState.stencilFront.compare = WGPUCompareFunction_Always;
-        depthState.stencilBack.compare = WGPUCompareFunction_Always;
+        depthState.stencilFront.failOp = WGPUStencilOperation_Keep;
+        depthState.stencilFront.depthFailOp = WGPUStencilOperation_Keep;
+        depthState.stencilFront.passOp = WGPUStencilOperation_Keep;
+        depthState.stencilBack = depthState.stencilFront;
+        depthState.stencilReadMask = 0xFFFFFFFFu;
+        depthState.stencilWriteMask = 0xFFFFFFFFu;
+        if (stencilTest) {
+            const auto& front = gl->GetStencilState(StencilFace::Front);
+            const auto& back = gl->GetStencilState(StencilFace::Back);
+            depthState.stencilFront = {ToCompareFunc(front.Func), ToStencilOperation(front.FailOp),
+                                       ToStencilOperation(front.PassDepthFailOp),
+                                       ToStencilOperation(front.PassDepthPassOp)};
+            depthState.stencilBack = {ToCompareFunc(back.Func), ToStencilOperation(back.FailOp),
+                                      ToStencilOperation(back.PassDepthFailOp),
+                                      ToStencilOperation(back.PassDepthPassOp)};
+            // WebGPU exposes one read/write mask and one dynamic reference for both
+            // faces. Prefer the front-face values when GL configured them differently.
+            depthState.stencilReadMask = front.ValueMask;
+            depthState.stencilWriteMask = front.WriteMask;
+        }
+        if (gl->IsCapabilityEnabled(CapabilityInput::PolygonOffsetFill) && DrawModeUsesPolygonFill(mode)) {
+            // WebGPU's constant depth bias is integral; slope scale remains floating
+            // point. Rounding is the closest representation of GL's float `units`.
+            depthState.depthBias = static_cast<Int32>(std::lround(gl->GetPolygonOffsetUnits()));
+            depthState.depthBiasSlopeScale = gl->GetPolygonOffsetFactor();
+        }
 
         // Bind-group layout. Tint's auto layout suffices unless a plain sampler2D binds a
         // depth-format texture: auto types it "float", which WebGPU won't let a depth
@@ -2077,10 +2212,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                 return binding >= kStageBindingStride ? WGPUShaderStage_Fragment : WGPUShaderStage_Vertex;
             };
             std::vector<WGPUBindGroupLayoutEntry> bgle;
-            for (Uint32 b : prog->uboBindings) {
+            for (const auto& ubo : prog->uboBindings) {
                 WGPUBindGroupLayoutEntry e{};
-                e.binding = b;
-                e.visibility = visOf(b);
+                e.binding = ubo.binding;
+                e.visibility = visOf(ubo.binding);
                 e.buffer.type = WGPUBufferBindingType_Uniform;
                 bgle.push_back(e);
             }
@@ -2120,6 +2255,9 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         desc.vertex.bufferCount = layouts.size();
         desc.vertex.buffers = layouts.empty() ? nullptr : layouts.data();
         desc.primitive.topology = ToTopology(mode);
+        if (mode == GL_LINE_STRIP || mode == GL_TRIANGLE_STRIP) {
+            desc.primitive.stripIndexFormat = stripIndexFormat;
+        }
         desc.primitive.frontFace = ToFrontFace(gl->GetFrontFaceMode());
         desc.primitive.cullMode =
             gl->IsCapabilityEnabled(CapabilityInput::CullFace) ? ToCullMode(gl->GetCullFaceMode())
@@ -2913,13 +3051,34 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
 
     WGPURenderPassEncoder WebGPURenderer::BeginDrawPass(MG_State::GLState::ProgramObject& program,
                                                         const MG_State::GLState::VertexArrayObject& vao,
-                                                        GLenum mode) {
+                                                        GLenum mode, WGPUIndexFormat stripIndexFormat,
+                                                        Int64 vertexAccessEnd) {
+        auto* gl = MG_State::pGLContext.get();
+        // Both states mean "produce no rasterized fragments". WebGPU has no pipeline
+        // rasterizer-discard switch and no FrontAndBack cull mode, so skipping the draw
+        // is the exact observable result (transform feedback is not implemented here).
+        if (gl->IsCapabilityEnabled(CapabilityInput::RasterizerDiscard) ||
+            (gl->IsCapabilityEnabled(CapabilityInput::CullFace) &&
+             gl->GetCullFaceMode() == CullFaceMode::FrontAndBack)) {
+            return nullptr;
+        }
+        static Bool warnedLineWidth = false;
+        if (!warnedLineWidth && gl->GetLineWidth() != 1.0f) {
+            warnedLineWidth = true;
+            MGLOG_W("DirectWebGPU: WebGPU core only supports line width 1; glLineWidth(%g) is clamped",
+                    static_cast<double>(gl->GetLineWidth()));
+        }
+        static Bool warnedLogicOp = false;
+        if (!warnedLogicOp && gl->IsCapabilityEnabled(CapabilityInput::ColorLogicOp)) {
+            warnedLogicOp = true;
+            MGLOG_W("DirectWebGPU: WebGPU has no fixed-function color logic operations; state is ignored");
+        }
         // Resolve the draw target first: the pipeline (color format + has-depth) and the
         // pass attachments both depend on it.
         if (!ResolveDrawTarget()) {
             return nullptr;
         }
-        const WgpuPipeline* p = GetOrCreatePipeline(program, vao, mode);
+        const WgpuPipeline* p = GetOrCreatePipeline(program, vao, mode, stripIndexFormat);
         if (!p) {
             return nullptr;
         }
@@ -2949,7 +3108,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // shared GL buffer once at offset 0 (each attribute carries its real byte offset);
         // Convert / Deinterleave groups get their own repacked buffer.
         std::vector<std::pair<WGPUBuffer, uint64_t>> vertexBuffers;
+        Bool coveredLoc[64] = {}; // shader locations supplied by a real vertex buffer
         for (const auto& g : ComputeVertexGroups(vao, shaderExpects)) {
+            for (const auto& ga : g.attrs)
+                if (ga.location < 64) coveredLoc[ga.location] = true;
             WGPUBuffer vb = nullptr;
             if (g.kind == VGroup::Convert) {
                 vb = GetOrCreateFloatConvertedBuffer(*g.buffer, g.srcOffset, g.glStride, g.compByteSize,
@@ -2962,6 +3124,33 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             }
             if (!vb) continue;
             vertexBuffers.emplace_back(vb, 0);
+            // Overflow guard: a non-indexed draw that reads past a bound vertex buffer is a
+            // WebGPU validation error that invalidates the ENTIRE command buffer, so the whole
+            // frame's submit (glClear included) is rejected and the screen keeps stale content.
+            // Replicate WebGPU's exact per-vertex-buffer requirement so we never skip a valid
+            // draw: required = (vertexAccessEnd-1)*arrayStride + maxAttrEnd. Skip only the one
+            // offending draw (return null -> caller drops it) rather than losing the frame, and
+            // log the culprit once per attribute site so the root cause can be traced.
+            if (vertexAccessEnd > 0 && g.arrayStride > 0 && g.stepMode == WGPUVertexStepMode_Vertex) {
+                const uint64_t bufSize = wgpuBufferGetSize(vb);
+                const uint64_t required =
+                    (static_cast<uint64_t>(vertexAccessEnd) - 1u) * g.arrayStride + g.maxAttrEnd;
+                if (required > bufSize) {
+                    const Uint32 loc0 = g.attrs.empty() ? 0u : g.attrs.front().location;
+                    if (g_loggedMissingSamplerUnits.insert("vtxoverflow#" + std::to_string(loc0)).second) {
+                        std::printf("[webgpu] SKIP draw: needs %llu bytes but bound vertex buffer is %llu "
+                                    "(vertexEnd=%lld arrayStride=%llu maxAttrEnd=%llu kind=%d) mode 0x%x; attrs:",
+                                    (unsigned long long)required, (unsigned long long)bufSize,
+                                    (long long)vertexAccessEnd, (unsigned long long)g.arrayStride,
+                                    (unsigned long long)g.maxAttrEnd, (int)g.kind, (unsigned)mode);
+                        for (const auto& ga : g.attrs)
+                            std::printf(" [loc=%u off=%llu fmt=%d]", ga.location,
+                                        (unsigned long long)ga.offset, (int)ga.format);
+                        std::printf("\n");
+                    }
+                    return nullptr;
+                }
+            }
         }
 
         // Sampled textures + samplers, resolved to texture units by uniform name.
@@ -3039,28 +3228,77 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // ---- Phase 2: fresh per-draw UBO + bind group (no flushes past here). ----
         WGPUBindGroup bindGroup = nullptr;
         if (wantResources) {
-            if (!prog->uboBindings.empty() && prog->globalUboSize > 0) {
-                // Fresh per-draw UBO buffer with this draw's uniforms (see m_frameUboBuffers).
-                // The same buffer is bound at every stage's UBO binding.
-                const Uint64 uboSize = (static_cast<Uint64>(prog->globalUboSize) + 15u) & ~Uint64(15);
-                WGPUBufferDescriptor bd{};
-                bd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
-                bd.size = uboSize;
-                WGPUBuffer ubo = wgpuDeviceCreateBuffer(m_device, &bd);
-                m_frameUboBuffers.push_back(ubo);
-                const void* uboData = program.GetUBOData();
-                const Uint sz = program.GetUBOSize();
-                if (ubo && uboData && sz > 0) {
-                    WriteBufferPadded(m_queue, ubo, uboData, sz);
-                }
-                for (Uint32 binding : prog->uboBindings) {
+            if (!prog->uboBindings.empty()) {
+                // Each stage's synthetic default block has an independent member
+                // layout. Upload and bind its matching stage-local payload instead of
+                // aliasing every stage onto the same bytes.
+                const auto* stageData = static_cast<const Uint8*>(program.GetStageUBOData());
+                for (const auto& stageBinding : prog->uboBindings) {
+                    std::vector<Uint8> paddedBlock;
+                    const void* uploadData = nullptr;
+                    Uint uploadSize = 0;
+                    if (stageBinding.blockIndex < 0) {
+                        const auto* stageUbo = program.GetStageGlobalUbo(stageBinding.stage);
+                        if (!stageUbo || !stageData || stageUbo->size == 0) {
+                            resourcesOk = false;
+                            break;
+                        }
+                        uploadData = stageData + stageUbo->scratchOffset;
+                        uploadSize = stageUbo->size;
+                    } else {
+                        const Uint blockIndex = static_cast<Uint>(stageBinding.blockIndex);
+                        const Uint frontendBinding = program.GetUniformBlockBinding(blockIndex);
+                        if (frontendBinding >= MG_State::pGLContext->GetBufferBindingPointCount(BufferTarget::Uniform)) {
+                            resourcesOk = false;
+                            break;
+                        }
+                        auto& bindingPoint = MG_State::pGLContext->GetBufferBindingPoint(
+                            BufferTarget::Uniform, frontendBinding);
+                        const auto buffer = bindingPoint.GetBoundObject();
+                        if (!buffer) {
+                            resourcesOk = false;
+                            break;
+                        }
+                        buffer->SyncPersistentMappedRange();
+                        const auto data = buffer->GetDataReadOnly();
+                        const auto range = bindingPoint.GetRange();
+                        const SizeT start = std::min(range.start, buffer->GetSize());
+                        const SizeT end = std::min(range.end, buffer->GetSize());
+                        const Uint blockSize = program.GetUBOSizeAt(blockIndex);
+                        if (!data || start >= end || blockSize == 0) {
+                            resourcesOk = false;
+                            break;
+                        }
+                        const SizeT available = end - start;
+                        uploadSize = blockSize;
+                        if (available < blockSize) {
+                            paddedBlock.assign(blockSize, 0);
+                            std::memcpy(paddedBlock.data(), data->data() + start, available);
+                            uploadData = paddedBlock.data();
+                        } else {
+                            uploadData = data->data() + start;
+                        }
+                    }
+                    const Uint64 uboSize = (static_cast<Uint64>(uploadSize) + 15u) & ~Uint64(15);
+                    WGPUBufferDescriptor bd{};
+                    bd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+                    bd.size = uboSize;
+                    WGPUBuffer ubo = wgpuDeviceCreateBuffer(m_device, &bd);
+                    if (!ubo) {
+                        resourcesOk = false;
+                        break;
+                    }
+                    m_frameUboBuffers.push_back(ubo);
+                    WriteBufferPadded(m_queue, ubo, uploadData, uploadSize);
+
                     WGPUBindGroupEntry e{};
-                    e.binding = binding;
+                    e.binding = stageBinding.binding;
                     e.buffer = ubo;
                     e.size = uboSize;
                     entries.push_back(e);
                 }
             }
+            if (!resourcesOk) return nullptr;
             if (!entries.empty()) {
                 WGPUBindGroupDescriptor bgd{};
                 bgd.layout = p->group0Layout;
@@ -3106,6 +3344,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             depth.view = m_curDepthView;
             depth.depthLoadOp = WGPULoadOp_Load;
             depth.depthStoreOp = WGPUStoreOp_Store;
+            if (HasStencilAspect(m_curDepthFormat)) {
+                depth.stencilLoadOp = WGPULoadOp_Load;
+                depth.stencilStoreOp = WGPUStoreOp_Store;
+            }
         }
         WGPURenderPassDescriptor rp{};
         rp.colorAttachmentCount = colors.size();
@@ -3115,22 +3357,20 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(m_encoder, &rp);
         wgpuRenderPassEncoderSetPipeline(pass, p->pipeline);
 
-        auto* gl = MG_State::pGLContext.get();
-        if (gl->IsCapabilityEnabled(CapabilityInput::Blend)) {
-            const auto& blendColor = gl->GetBlendColor();
-            const WGPUColor wgpuBlendColor = {static_cast<double>(blendColor[0]), static_cast<double>(blendColor[1]),
-                                              static_cast<double>(blendColor[2]), static_cast<double>(blendColor[3])};
-            wgpuRenderPassEncoderSetBlendConstant(pass, &wgpuBlendColor);
-        }
+        const auto& blendColor = gl->GetBlendColor();
+        const WGPUColor wgpuBlendColor = {static_cast<double>(blendColor[0]), static_cast<double>(blendColor[1]),
+                                          static_cast<double>(blendColor[2]), static_cast<double>(blendColor[3])};
+        wgpuRenderPassEncoderSetBlendConstant(pass, &wgpuBlendColor);
         // Viewport. Render targets are stored in GL texel order (row 0 = GL window
         // bottom; see RemapClipSpace), so GL's bottom-left viewport rectangle maps to
         // texel rows directly with no flip. Only set when the app set a non-empty
         // viewport; otherwise WebGPU's default covers the whole target.
         const auto& vp = gl->GetViewport();
+        const auto& depthRange = gl->GetDepthRange();
         if (vp.z() > 0 && vp.w() > 0) {
             wgpuRenderPassEncoderSetViewport(pass, static_cast<float>(vp.x()),
                                              static_cast<float>(vp.y()), static_cast<float>(vp.z()),
-                                             static_cast<float>(vp.w()), 0.0f, 1.0f);
+                                             static_cast<float>(vp.w()), depthRange.x(), depthRange.y());
         }
         // Scissor: like the viewport, GL's bottom-left box maps to texel rows with no
         // flip (targets are stored in GL texel order). GL allows a scissor box
@@ -3157,19 +3397,56 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (bindGroup) {
             wgpuRenderPassEncoderSetBindGroup(pass, 0, bindGroup, 0, nullptr);
         }
+        if (gl->IsCapabilityEnabled(CapabilityInput::StencilTest) && HasStencilAspect(m_curDepthFormat)) {
+            const auto& front = gl->GetStencilState(StencilFace::Front);
+            const auto& back = gl->GetStencilState(StencilFace::Back);
+            static Bool warnedFaceMismatch = false;
+            if (!warnedFaceMismatch && (front.Ref != back.Ref || front.ValueMask != back.ValueMask ||
+                                        front.WriteMask != back.WriteMask)) {
+                warnedFaceMismatch = true;
+                MGLOG_W("DirectWebGPU: WebGPU shares stencil reference/read/write masks across faces; "
+                        "using front-face values");
+            }
+            wgpuRenderPassEncoderSetStencilReference(pass,
+                static_cast<Uint32>(std::max(front.Ref, 0)));
+        }
 
         Uint32 slot = 0;
         for (const auto& [vb, offset] : vertexBuffers) {
             wgpuRenderPassEncoderSetVertexBuffer(pass, slot, vb, offset, WGPU_WHOLE_SIZE);
             ++slot;
         }
-        // Dummy (constant zero) buffers for shader inputs the VAO didn't supply, in the
-        // same order the pipeline appended their layouts.
+        // Constant vertex attributes for shader inputs the VAO didn't supply. WebGPU has no
+        // generic vertex attributes, so these must read a real buffer; feed them the values
+        // set via glVertexAttrib4f / glColor4f (GetCurrentVertexAttribute), in the SAME dummy
+        // order the pipeline appended (prog->vertexLocations, skipping covered locations).
+        // The old shared zero buffer forced e.g. a blit's glColor4f colour/alpha to 0, so
+        // no-colour-array GUI draws (button backgrounds, logos) sampled color*0 -> invisible.
         if (p->dummyVertexSlots > 0) {
-            WGPUBuffer dummy = GetDummyVertexBuffer();
-            for (Uint d = 0; d < p->dummyVertexSlots; ++d) {
-                wgpuRenderPassEncoderSetVertexBuffer(pass, slot, dummy, 0, WGPU_WHOLE_SIZE);
-                ++slot;
+            auto* glc = MG_State::pGLContext.get();
+            Uint8 dummyData[16 * 16] = {}; // 16 vec4 slots (matches the pipeline dummy layout)
+            Uint di = 0;
+            for (const auto& vi : prog->vertexLocations) {
+                if (vi.location < 64 && coveredLoc[vi.location]) continue;
+                if (di >= 16) break;
+                const auto& cur = glc->GetCurrentVertexAttribute(vi.location);
+                void* dst = dummyData + static_cast<SizeT>(di) * 16u;
+                if (!vi.isInt) Memcpy(dst, cur.floatValue.data(), 16);
+                else if (vi.isUnsigned) Memcpy(dst, cur.uintValue.data(), 16);
+                else Memcpy(dst, cur.intValue.data(), 16);
+                ++di;
+            }
+            WGPUBufferDescriptor bd{};
+            bd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
+            bd.size = sizeof(dummyData);
+            WGPUBuffer dummy = wgpuDeviceCreateBuffer(m_device, &bd);
+            if (dummy) {
+                m_frameUboBuffers.push_back(dummy); // released at frame end
+                wgpuQueueWriteBuffer(m_queue, dummy, 0, dummyData, sizeof(dummyData));
+                for (Uint s = 0; s < p->dummyVertexSlots; ++s) {
+                    wgpuRenderPassEncoderSetVertexBuffer(pass, slot, dummy, 0, WGPU_WHOLE_SIZE);
+                    ++slot;
+                }
             }
         }
         return pass;
@@ -3184,10 +3461,6 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (!m_device || !MG_State::pGLContext || count <= 0 || instanceCount <= 0) {
             return;
         }
-        if (baseInstance != 0) {
-            MGLOG_W("DirectWebGPU: non-zero baseInstance (%u) unsupported (needs indirect-first-instance); "
-                    "using 0", baseInstance);
-        }
         const auto& programPtr = MG_State::pGLContext->GetCurrentProgram();
         const auto& vaoPtr = MG_State::pGLContext->GetBoundVertexArray();
         if (!programPtr || !vaoPtr) {
@@ -3197,12 +3470,13 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (!m_frameActive) {
             return;
         }
-        WGPURenderPassEncoder pass = BeginDrawPass(*programPtr, *vaoPtr, mode);
+        WGPURenderPassEncoder pass = BeginDrawPass(*programPtr, *vaoPtr, mode, WGPUIndexFormat_Undefined,
+                                                   static_cast<Int64>(first) + count);
         if (!pass) {
             return;
         }
         wgpuRenderPassEncoderDraw(pass, static_cast<Uint32>(count), static_cast<Uint32>(instanceCount),
-                                  static_cast<Uint32>(first), 0);
+                                  static_cast<Uint32>(first), baseInstance);
         wgpuRenderPassEncoderEnd(pass);
         wgpuRenderPassEncoderRelease(pass);
     }
@@ -3220,10 +3494,6 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (indexFormat == WGPUIndexFormat_Undefined) {
             MGLOG_E("DirectWebGPU: unsupported index type 0x%x (GL_UNSIGNED_BYTE not in WebGPU)", type);
             return;
-        }
-        if (baseInstance != 0) {
-            MGLOG_W("DirectWebGPU: non-zero baseInstance (%u) unsupported (needs indirect-first-instance); "
-                    "using 0", baseInstance);
         }
         const auto& programPtr = MG_State::pGLContext->GetCurrentProgram();
         const auto& vaoPtr = MG_State::pGLContext->GetBoundVertexArray();
@@ -3243,7 +3513,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (!indexBuffer) {
             return;
         }
-        WGPURenderPassEncoder pass = BeginDrawPass(*programPtr, *vaoPtr, mode);
+        WGPURenderPassEncoder pass = BeginDrawPass(*programPtr, *vaoPtr, mode, indexFormat);
         if (!pass) {
             return;
         }
@@ -3253,7 +3523,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         wgpuRenderPassEncoderSetIndexBuffer(pass, indexBuffer, indexFormat, byteOffset, WGPU_WHOLE_SIZE);
         wgpuRenderPassEncoderDrawIndexed(pass, static_cast<Uint32>(count),
                                          static_cast<Uint32>(instanceCount), 0,
-                                         static_cast<int32_t>(baseVertex), 0);
+                                         static_cast<int32_t>(baseVertex), baseInstance);
         wgpuRenderPassEncoderEnd(pass);
         wgpuRenderPassEncoderRelease(pass);
     }
@@ -3287,7 +3557,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (!indexBuffer) {
             return;
         }
-        WGPURenderPassEncoder pass = BeginDrawPass(*programPtr, *vaoPtr, mode);
+        WGPURenderPassEncoder pass = BeginDrawPass(*programPtr, *vaoPtr, mode, indexFormat);
         if (!pass) {
             return;
         }

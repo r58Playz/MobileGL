@@ -38,6 +38,22 @@ target_link_libraries(
         ${LINK_LIBRARIES}
 )
 
+if (EMSCRIPTEN)
+        set(_program_test_webgpu_js)
+        foreach(_js ${EMDAWNWEBGPU_JS_LIBRARIES})
+                list(APPEND _program_test_webgpu_js "--js-library=${_js}")
+        endforeach()
+        foreach(_program_target ProgramUtilTest ProgramTest)
+                target_link_options(${_program_target} PRIVATE
+                        ${_program_test_webgpu_js}
+                        "--js-library=${MGL_ROOT}/MobileGL/MG_Backend/DirectWebGPU/lib_mobilegl_webgpu.js"
+                        "-sWASM_BIGINT"
+                        "-sALLOW_MEMORY_GROWTH=1")
+        endforeach()
+endif()
+
 include(GoogleTest)
-gtest_discover_tests(ProgramUtilTest DISCOVERY_TIMEOUT 30)
-gtest_discover_tests(ProgramTest DISCOVERY_TIMEOUT 30)
+if (NOT EMSCRIPTEN)
+        gtest_discover_tests(ProgramUtilTest DISCOVERY_TIMEOUT 30)
+        gtest_discover_tests(ProgramTest DISCOVERY_TIMEOUT 30)
+endif()

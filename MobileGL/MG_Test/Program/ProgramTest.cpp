@@ -12,8 +12,10 @@
 
 #include "Includes.h"
 #include "Init.h"
+#ifndef __EMSCRIPTEN__
 #include "MG_Backend/DirectVulkan/DirectVulkanResourceState.h"
 #include "MG_Backend/DirectVulkan/BackendObject_DirectVulkan.h"
+#endif
 #include "MG_Backend/BackendObjects.h"
 #include "MG_Impl/GLImpl/Getter/GL_Getter.h"
 #include "MG_Impl/GLImpl/Program/GL_Program.h"
@@ -170,6 +172,7 @@ void main() {
     EXPECT_EQ(compileStatus, GL_TRUE) << infoLog;
 }
 
+#ifndef __EMSCRIPTEN__
 TEST_F(ProgramTest, CompileVoxyGpuShaderInt64QuadDecode) {
     auto previousBackend = Move(MG_Backend::pActiveBackendObject);
     MG_Backend::pActiveBackendObject = MakeUnique<MG_Backend::DirectVulkan::BackendObject_DirectVulkan>();
@@ -222,6 +225,7 @@ void main() {
 
     MG_Backend::pActiveBackendObject = Move(previousBackend);
 }
+#endif
 
 TEST_F(ProgramTest, ShaderSourceKeepsOriginalTextAfterCompile) {
     const char* part0 = R"(#define HIGHP_OR_DEFAULT highp
@@ -345,6 +349,7 @@ void main() {
     EXPECT_EQ(GetError(), GL_NO_ERROR);
 }
 
+#ifndef __EMSCRIPTEN__
 TEST_F(ProgramTest, DirectVulkanStorageBlockUsesShaderLayoutBinding) {
     char infoLog[1024] = "";
     const char* csSrc = R"(#version 460 core
@@ -382,6 +387,7 @@ void main() {
     EXPECT_EQ(MG_Backend::DirectVulkan::GetShaderStorageBlockBinding(*programObject, blockIndex), 2u);
     EXPECT_EQ(GetError(), GL_NO_ERROR);
 }
+#endif
 
 TEST_F(ProgramTest, CompileAndLink) {
     char infoLog[1024] = "";
@@ -1601,4 +1607,160 @@ TEST_F(ProgramTest, CompileShaderWithSamplerAsVarName) {
     const char* result = nullptr;
     spvcSession.Compile(&result);
     printf("decomp from fragSpirv:\n%s\n\n", result);
+}
+
+TEST_F(ProgramTest, PlainUniformsUseIndependentStageLayoutsAndSharedValuesFanOut) {
+    const char* vertexSource = R"(#version 460 core
+layout(location = 0) in vec4 Position;
+uniform mat4 SharedMat;
+uniform mat4 VertexOnlyMat;
+void main() {
+    gl_Position = SharedMat * VertexOnlyMat * Position;
+}
+)";
+    const char* fragmentSource = R"(#version 460 core
+layout(location = 0) out vec4 FragColor;
+uniform float FragmentOnly;
+uniform mat4 SharedMat;
+void main() {
+    FragColor = vec4(FragmentOnly + SharedMat[0][0]);
+}
+)";
+
+    GLuint vs = CreateShader(GL_VERTEX_SHADER);
+    ShaderSource(vs, 1, &vertexSource, nullptr);
+    CompileShader(vs);
+    GLint compileStatus = GL_FALSE;
+    GetShaderiv(vs, GL_COMPILE_STATUS, &compileStatus);
+    ASSERT_EQ(compileStatus, GL_TRUE);
+
+    GLuint fs = CreateShader(GL_FRAGMENT_SHADER);
+    ShaderSource(fs, 1, &fragmentSource, nullptr);
+    CompileShader(fs);
+    GetShaderiv(fs, GL_COMPILE_STATUS, &compileStatus);
+    ASSERT_EQ(compileStatus, GL_TRUE);
+
+    GLuint program = CreateProgram();
+    AttachShader(program, vs);
+    AttachShader(program, fs);
+    LinkProgram(program);
+    GLint linkStatus = GL_FALSE;
+    GetProgramiv(program, GL_LINK_STATUS, &linkStatus);
+    ASSERT_EQ(linkStatus, GL_TRUE);
+    UseProgram(program);
+
+    const GLint sharedLocation = GetUniformLocation(program, "SharedMat");
+    const GLint vertexLocation = GetUniformLocation(program, "VertexOnlyMat");
+    const GLint fragmentLocation = GetUniformLocation(program, "FragmentOnly");
+    ASSERT_GE(sharedLocation, 0);
+    ASSERT_GE(vertexLocation, 0);
+    ASSERT_GE(fragmentLocation, 0);
+
+    GLfloat shared[16] = {};
+    GLfloat vertexOnly[16] = {};
+    shared[0] = 2.0f;
+    shared[5] = shared[10] = shared[15] = 1.0f;
+    vertexOnly[0] = 3.0f;
+    vertexOnly[5] = vertexOnly[10] = vertexOnly[15] = 1.0f;
+    UniformMatrix4fv(sharedLocation, 1, GL_FALSE, shared);
+    UniformMatrix4fv(vertexLocation, 1, GL_FALSE, vertexOnly);
+    Uniform1f(fragmentLocation, 0.25f);
+
+    const auto programObject = MG_State::pGLContext->GetCurrentProgram();
+    ASSERT_NE(programObject, nullptr);
+    ASSERT_NE(programObject->GetStageGlobalUbo(ShaderStage::Vertex), nullptr);
+    ASSERT_NE(programObject->GetStageGlobalUbo(ShaderStage::Fragment), nullptr);
+
+    const auto* sharedVs = reinterpret_cast<const GLfloat*>(
+        programObject->GetUniformData(static_cast<Uint>(sharedLocation), ShaderStage::Vertex));
+    const auto* sharedFs = reinterpret_cast<const GLfloat*>(
+        programObject->GetUniformData(static_cast<Uint>(sharedLocation), ShaderStage::Fragment));
+    const auto* vertexValue = reinterpret_cast<const GLfloat*>(
+        programObject->GetUniformData(static_cast<Uint>(vertexLocation), ShaderStage::Vertex));
+    const auto* fragmentValue = reinterpret_cast<const GLfloat*>(
+        programObject->GetUniformData(static_cast<Uint>(fragmentLocation), ShaderStage::Fragment));
+    ASSERT_NE(sharedVs, nullptr);
+    ASSERT_NE(sharedFs, nullptr);
+    ASSERT_NE(vertexValue, nullptr);
+    ASSERT_NE(fragmentValue, nullptr);
+    EXPECT_FLOAT_EQ(sharedVs[0], 2.0f);
+    EXPECT_FLOAT_EQ(sharedFs[0], 2.0f);
+    EXPECT_FLOAT_EQ(vertexValue[0], 3.0f);
+    EXPECT_FLOAT_EQ(fragmentValue[0], 0.25f);
+}
+
+TEST_F(ProgramTest, StructUniformLeafWritesReachFragmentStageData) {
+    const char* vertexSource = R"(#version 460 core
+layout(location = 0) in vec4 Position;
+void main() { gl_Position = Position; }
+)";
+    const char* fragmentSource = R"(#version 460 core
+struct fog_param_t {
+    vec4 color;
+    float density;
+    float start;
+    float end;
+};
+uniform fog_param_t fogParam;
+layout(location = 0) out vec4 FragColor;
+void main() {
+    FragColor = fogParam.color * fogParam.density + vec4(fogParam.start + fogParam.end);
+}
+)";
+
+    GLuint vs = CreateShader(GL_VERTEX_SHADER);
+    ShaderSource(vs, 1, &vertexSource, nullptr);
+    CompileShader(vs);
+    GLint status = GL_FALSE;
+    GetShaderiv(vs, GL_COMPILE_STATUS, &status);
+    ASSERT_EQ(status, GL_TRUE);
+
+    GLuint fs = CreateShader(GL_FRAGMENT_SHADER);
+    ShaderSource(fs, 1, &fragmentSource, nullptr);
+    CompileShader(fs);
+    GetShaderiv(fs, GL_COMPILE_STATUS, &status);
+    ASSERT_EQ(status, GL_TRUE);
+
+    GLuint program = CreateProgram();
+    AttachShader(program, vs);
+    AttachShader(program, fs);
+    LinkProgram(program);
+    GetProgramiv(program, GL_LINK_STATUS, &status);
+    ASSERT_EQ(status, GL_TRUE);
+    UseProgram(program);
+
+    const GLint colorLocation = GetUniformLocation(program, "fogParam.color");
+    const GLint densityLocation = GetUniformLocation(program, "fogParam.density");
+    const GLint startLocation = GetUniformLocation(program, "fogParam.start");
+    const GLint endLocation = GetUniformLocation(program, "fogParam.end");
+    ASSERT_GE(colorLocation, 0);
+    ASSERT_GE(densityLocation, 0);
+    ASSERT_GE(startLocation, 0);
+    ASSERT_GE(endLocation, 0);
+
+    const GLfloat color[] = {0.1f, 0.2f, 0.3f, 0.4f};
+    Uniform4fv(colorLocation, 1, color);
+    Uniform1f(densityLocation, 0.75f);
+    Uniform1f(startLocation, 2.0f);
+    Uniform1f(endLocation, 10.0f);
+
+    const auto programObject = MG_State::pGLContext->GetCurrentProgram();
+    ASSERT_NE(programObject, nullptr);
+    const auto* storedColor = reinterpret_cast<const GLfloat*>(
+        programObject->GetUniformData(static_cast<Uint>(colorLocation), ShaderStage::Fragment));
+    const auto* storedDensity = reinterpret_cast<const GLfloat*>(
+        programObject->GetUniformData(static_cast<Uint>(densityLocation), ShaderStage::Fragment));
+    const auto* storedStart = reinterpret_cast<const GLfloat*>(
+        programObject->GetUniformData(static_cast<Uint>(startLocation), ShaderStage::Fragment));
+    const auto* storedEnd = reinterpret_cast<const GLfloat*>(
+        programObject->GetUniformData(static_cast<Uint>(endLocation), ShaderStage::Fragment));
+    ASSERT_NE(storedColor, nullptr);
+    ASSERT_NE(storedDensity, nullptr);
+    ASSERT_NE(storedStart, nullptr);
+    ASSERT_NE(storedEnd, nullptr);
+    EXPECT_FLOAT_EQ(storedColor[0], 0.1f);
+    EXPECT_FLOAT_EQ(storedColor[3], 0.4f);
+    EXPECT_FLOAT_EQ(*storedDensity, 0.75f);
+    EXPECT_FLOAT_EQ(*storedStart, 2.0f);
+    EXPECT_FLOAT_EQ(*storedEnd, 10.0f);
 }

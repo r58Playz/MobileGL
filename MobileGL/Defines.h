@@ -40,8 +40,22 @@
 #define MOBILEGL_LOG_ACTIVE_LEVEL MOBILEGL_LOG_LEVEL_INFO
 #endif
 
+#ifndef MOBILEGL_LOG_ENABLE_CONSOLE
+#ifdef __EMSCRIPTEN__
+// Emscripten forwards stdout to the browser console. A native file sink is not a
+// useful default in WASM (and was leaving every MGLOG_* call invisible).
+#define MOBILEGL_LOG_ENABLE_CONSOLE 1
+#else
 #define MOBILEGL_LOG_ENABLE_CONSOLE 0
+#endif
+#endif
+#ifndef MOBILEGL_LOG_ENABLE_FILE
+#ifdef __EMSCRIPTEN__
+#define MOBILEGL_LOG_ENABLE_FILE 0
+#else
 #define MOBILEGL_LOG_ENABLE_FILE 1
+#endif
+#endif
 #define MOBILEGL_LOG_ENABLE_ANDROID 1
 #define MOBILEGL_ENABLE_SCOPE_MARKER 0
 

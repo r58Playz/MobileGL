@@ -32,12 +32,6 @@ add_executable(
   SanityTest
   SanityTest.cpp
 )
-target_link_libraries(
-  SanityTest
-  GTest::gtest_main
-  MobileGL_s
-)
-
 target_include_directories(SanityTest PRIVATE
   ${MGL_ROOT}/include
   ${MGL_ROOT}/MobileGL
@@ -57,8 +51,22 @@ target_include_directories(SanityTest PRIVATE
 #   list(APPEND LINK_LIBRARIES ${SPIRVTools_LIBRARIES})
 # endif()
 
-set(LINK_LIBRARIES 
-    MobileGL_s
+if (TARGET MobileGL_s)
+  set(MOBILEGL_TEST_LIBRARY MobileGL_s)
+else()
+  # Emscripten only builds the primary static MobileGL target; treating MobileGL_s
+  # as a bare library name loses its usage requirements and eventually links -lMobileGL_s.
+  set(MOBILEGL_TEST_LIBRARY MobileGL)
+endif()
+
+target_link_libraries(
+  SanityTest
+  GTest::gtest_main
+  ${MOBILEGL_TEST_LIBRARY}
+)
+
+set(LINK_LIBRARIES
+    ${MOBILEGL_TEST_LIBRARY}
 )
 
 include(GoogleTest)

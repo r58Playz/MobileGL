@@ -20,6 +20,8 @@ namespace MobileGL {
         constexpr char* GetOSName() {
 #if defined(_WIN32)
             return (char*)"Windows";
+#elif defined(__EMSCRIPTEN__)
+            return (char*)"WebAssembly";
 #elif defined(__ANDROID__)
             return (char*)"Android";
 #elif defined(__APPLE__)

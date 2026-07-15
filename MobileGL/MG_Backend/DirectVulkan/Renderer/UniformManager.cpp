@@ -588,9 +588,16 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         MOBILEGL_ASSERT(programObj.bindingKinds[binding] == ProgramFactory::DescriptorBindingKind::UniformBufferDynamic,
                         "ResolveUniformBufferPayload: binding %u is not a uniform buffer descriptor", binding);
 
-        if (programObj.globalUboBinding == static_cast<Int>(binding)) {
-            outData = program.GetUBOData();
-            outSize = static_cast<VkDeviceSize>(program.GetUBOSize());
+        const ShaderStage globalUboStage = binding < programObj.globalUboStageByBinding.size()
+                                               ? programObj.globalUboStageByBinding[binding]
+                                               : ShaderStage::Unknown;
+        if (globalUboStage != ShaderStage::Unknown) {
+            const auto* stageUbo = program.GetStageGlobalUbo(globalUboStage);
+            const auto* stageData = static_cast<const Uint8*>(program.GetStageUBOData());
+            if (stageUbo && stageData) {
+                outData = stageData + stageUbo->scratchOffset;
+                outSize = static_cast<VkDeviceSize>(stageUbo->size);
+            }
             static const Array<Uint8, 16> emptyGlobalUbo{};
             if (outData == nullptr || outSize == 0) {
                 outData = emptyGlobalUbo.data();

@@ -30,6 +30,23 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
     }
 
+    void DrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const void* indices,
+                                GLint basevertex) {
+        if (pWebGPURenderer) {
+            pWebGPURenderer->DrawElementsInstanced(mode, count, type, indices, 1, basevertex, 0);
+        }
+    }
+
+    void DrawRangeElements(GLenum mode, GLuint, GLuint, GLsizei count, GLenum type,
+                           const void* indices) {
+        DrawElements(mode, count, type, indices);
+    }
+
+    void DrawRangeElementsBaseVertex(GLenum mode, GLuint, GLuint, GLsizei count, GLenum type,
+                                     const void* indices, GLint basevertex) {
+        DrawElementsBaseVertex(mode, count, type, indices, basevertex);
+    }
+
     void DrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instancecount) {
         if (pWebGPURenderer) {
             pWebGPURenderer->DrawArraysInstanced(mode, first, count, instancecount, 0);

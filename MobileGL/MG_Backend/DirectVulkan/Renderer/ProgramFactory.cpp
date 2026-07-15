@@ -32,15 +32,17 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         struct DescriptorKey {
             ProgramFactory::DescriptorBindingKind kind = ProgramFactory::DescriptorBindingKind::None;
             String name;
+            Int stage = -1; // only distinguishes independently laid-out global UBOs
 
             Bool operator==(const DescriptorKey& other) const {
-                return kind == other.kind && name == other.name;
+                return kind == other.kind && name == other.name && stage == other.stage;
             }
         };
 
         struct DescriptorKeyHash {
             SizeT operator()(const DescriptorKey& key) const noexcept {
-                return std::hash<String>{}(key.name) ^ (static_cast<SizeT>(key.kind) << 1);
+                return std::hash<String>{}(key.name) ^ (static_cast<SizeT>(key.kind) << 1) ^
+                       (static_cast<SizeT>(key.stage + 1) << 8);
             }
         };
 
@@ -1018,7 +1020,8 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             return name;
         }
 
-        Bool RemapDescriptorBindingsForVulkan(const Vector<Vector<Uint>>& inputModules, Uint32 maxBindings,
+        Bool RemapDescriptorBindingsForVulkan(const Vector<Vector<Uint>>& inputModules,
+                                              const Vector<SharedPtr<ShaderObject>>& shaders, Uint32 maxBindings,
                                               Vector<Vector<Uint>>& outputModules) {
             outputModules = inputModules;
 
@@ -1100,6 +1103,13 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                     DescriptorKey key{};
                     key.kind = kind;
                     key.name = NormalizeDescriptorName(*binding, kind);
+                    if (kind == ProgramFactory::DescriptorBindingKind::UniformBufferDynamic &&
+                        key.name.find(MG_Util::ShaderTranspiler::GLOBAL_UBO_NAME) != String::npos) {
+                        const ShaderStage stage = moduleIndex < shaders.size() && shaders[moduleIndex]
+                                                      ? shaders[moduleIndex]->GetShaderStage()
+                                                      : ShaderStage::Unknown;
+                        key.stage = static_cast<Int>(stage);
+                    }
 
                     Uint32 assignedBinding = 0;
                     const auto it = assignedBindings.find(key);
@@ -1438,14 +1448,19 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         entry.samplerTextureTargetByBinding.assign(m_maxBindings, TextureTarget::Texture2D);
         entry.storageBlockNameByBinding.assign(m_maxBindings, String());
         entry.storageBlockIndexByBinding.assign(m_maxBindings, -1);
-        entry.globalUboBinding = -1;
+        entry.globalUboStageByBinding.assign(m_maxBindings, ShaderStage::Unknown);
         entry.dynamicBindings.clear();
 
         // Use SpvcSession (Reflection mode) to reflect all SPIR-V modules in a single pass per module
-        for (const auto& module : spirv) {
+        const auto& shaders = program.GetAttachedShaders();
+        for (SizeT moduleIndex = 0; moduleIndex < spirv.size(); ++moduleIndex) {
+            const auto& module = spirv[moduleIndex];
             if (module.empty()) {
                 continue;
             }
+            const ShaderStage moduleStage = moduleIndex < shaders.size() && shaders[moduleIndex]
+                                                ? shaders[moduleIndex]->GetShaderStage()
+                                                : ShaderStage::Unknown;
 
             SpvcSession session(module, SessionUsageBit::Reflection);
             SpvReflectShaderModule reflectModule{};
@@ -1470,13 +1485,14 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                                     "ProgramFactory::ReflectLayout: descriptor binding %u has conflicting kinds for UBO '%s'",
                                     binding, ubo.name.c_str());
                     entry.bindingKinds[binding] = DescriptorBindingKind::UniformBufferDynamic;
-                    MOBILEGL_ASSERT(entry.globalUboBinding < 0 || entry.globalUboBinding == static_cast<Int>(binding),
-                                    "ProgramFactory::ReflectLayout: global UBO binding mismatch (%d vs %u)",
-                                    entry.globalUboBinding, binding);
                     MOBILEGL_ASSERT(entry.uniformBlockIndexByBinding[binding] < 0,
                                     "ProgramFactory::ReflectLayout: global UBO shares binding %u with regular UBO index %d",
                                     binding, entry.uniformBlockIndexByBinding[binding]);
-                    entry.globalUboBinding = static_cast<Int>(binding);
+                    MOBILEGL_ASSERT(entry.globalUboStageByBinding[binding] == ShaderStage::Unknown ||
+                                        entry.globalUboStageByBinding[binding] == moduleStage,
+                                    "ProgramFactory::ReflectLayout: global UBO binding %u is shared by different stages",
+                                    binding);
+                    entry.globalUboStageByBinding[binding] = moduleStage;
                     continue;
                 }
 
@@ -1492,7 +1508,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                                 "ProgramFactory::ReflectLayout: descriptor binding %u has conflicting kinds for UBO '%s'",
                                 binding, ubo.name.c_str());
                 entry.bindingKinds[binding] = DescriptorBindingKind::UniformBufferDynamic;
-                MOBILEGL_ASSERT(entry.globalUboBinding != static_cast<Int>(binding),
+                MOBILEGL_ASSERT(entry.globalUboStageByBinding[binding] == ShaderStage::Unknown,
                                 "ProgramFactory::ReflectLayout: regular UBO '%s' collides with global UBO binding %u",
                                 ubo.name.c_str(), binding);
                 MOBILEGL_ASSERT(entry.uniformBlockIndexByBinding[binding] < 0 ||
@@ -1663,7 +1679,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             }
         }
 
-        const Bool remapOk = RemapDescriptorBindingsForVulkan(moduleSpirvs, m_maxBindings, moduleSpirvs);
+        const Bool remapOk = RemapDescriptorBindingsForVulkan(moduleSpirvs, shaders, m_maxBindings, moduleSpirvs);
         MOBILEGL_ASSERT(remapOk, "ProgramFactory::GetOrCreateProgram: descriptor binding remap failed");
 
         for (SizeT i = 0; i < shaders.size(); ++i) {

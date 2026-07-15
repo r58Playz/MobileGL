@@ -8,6 +8,7 @@
 
 #pragma once
 #include <Includes.h>
+#include <MG_State/GLState/ProgramState/ShaderObject.h>
 #include <MG_State/GLState/TextureState/TextureEnum.h>
 #include "../WgpuApi.h"
 
@@ -46,8 +47,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         void DrawArrays(GLenum mode, GLint first, GLsizei count);
         void DrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices);
         // Instanced draws (all glDraw*Instanced* variants route here). baseVertex is
-        // applied via drawIndexed; baseInstance is clamped to 0 (WebGPU direct draws
-        // need the indirect-first-instance feature for a non-zero first instance).
+        // applied via drawIndexed. WebGPU direct draws support a non-zero first instance;
+        // only indirect draws require the indirect-first-instance feature.
         void DrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei instanceCount,
                                  GLuint baseInstance);
         void DrawElementsInstanced(GLenum mode, GLsizei count, GLenum type, const void* indices,
@@ -116,15 +117,22 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         };
 
         struct WgpuProgram {
+            struct StageUboBinding {
+                Uint32 binding = 0;
+                ShaderStage stage = ShaderStage::Unknown;
+                // -1 is the synthetic default block populated by glUniform*. Other
+                // values index ProgramObject's named uniform blocks.
+                Int blockIndex = -1;
+            };
+
             WGPUShaderModule vertex = nullptr;
             WGPUShaderModule fragment = nullptr;
             // Bindings parsed from tint's WGSL. WebGPU merges all stages into one
             // @group(0), but glslang numbers each stage's resources from 0, so we
             // offset each stage into a disjoint binding range (StageBindingOffset).
-            // The shared default-block UBO appears once per stage that uses it -> one
-            // binding each, all pointing at the same per-draw buffer.
-            Vector<Uint32> uboBindings;
-            Uint globalUboSize = 0;
+            // The default-block UBO appears once per stage that uses it. Each binding
+            // must receive that stage's independently reflected layout/payload.
+            Vector<StageUboBinding> uboBindings;
             Vector<ResourceRef> resources;
             Vector<VertexInput> vertexLocations;
             // Fragment-stage output @location(N) values parsed from tint's WGSL. Drives
@@ -216,12 +224,12 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         const WgpuProgram* GetOrCreateProgram(MG_State::GLState::ProgramObject& program);
         const WgpuPipeline* GetOrCreatePipeline(MG_State::GLState::ProgramObject& program,
                                                 const MG_State::GLState::VertexArrayObject& vao,
-                                                GLenum mode);
+                                                GLenum mode, WGPUIndexFormat stripIndexFormat);
         // Hash of everything WebGPU bakes into a render pipeline for the current GL
         // state, so distinct states map to distinct cached pipelines.
         Uint64 ComputePipelineKey(const MG_State::GLState::ProgramObject& program,
                                   const MG_State::GLState::VertexArrayObject& vao, GLenum mode,
-                                  const WgpuProgram* prog) const;
+                                  WGPUIndexFormat stripIndexFormat, const WgpuProgram* prog) const;
         // Depth texture creation (sampleable depth-format textures, for depthtex/shadowtex).
         const WgpuTexture* GetOrCreateDepthTexture(MG_State::GLState::ITextureObject& texture,
                                                    WGPUTextureFormat depthFmt);
@@ -269,7 +277,9 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // Begins a Load render pass, binds the pipeline + vertex buffers for the
         // current program/VAO. Returns the pass (caller draws + ends) or nullptr.
         WGPURenderPassEncoder BeginDrawPass(MG_State::GLState::ProgramObject& program,
-                                            const MG_State::GLState::VertexArrayObject& vao, GLenum mode);
+                                            const MG_State::GLState::VertexArrayObject& vao, GLenum mode,
+                                            WGPUIndexFormat stripIndexFormat = WGPUIndexFormat_Undefined,
+                                            Int64 vertexAccessEnd = -1);
 
         WGPUInstance m_instance = nullptr;
         WGPUDevice m_device = nullptr;
@@ -314,10 +324,13 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         WGPUTextureView m_offscreenSrgbView = nullptr;
         Uint32 m_offscreenWidth = 0;
         Uint32 m_offscreenHeight = 0;
-        // Companion depth target for the default framebuffer (depth-only, no stencil).
+        // Companion depth/stencil target for the default framebuffer.
         WGPUTexture m_depthTexture = nullptr;
         WGPUTextureView m_depthView = nullptr;
-        static constexpr WGPUTextureFormat kDepthFormat = WGPUTextureFormat_Depth24Plus;
+        // The GL default framebuffer carries stencil state too. Depth24PlusStencil8 is
+        // core WebGPU and lets clears/tests match Vulkan instead of silently discarding
+        // every stencil operation.
+        static constexpr WGPUTextureFormat kDepthFormat = WGPUTextureFormat_Depth24PlusStencil8;
 
         // Current draw target(s), resolved per Clear/draw from the bound draw FBO. For
         // the default FB slot 0 aliases the offscreen; for a user FBO the slots map to
@@ -333,13 +346,12 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         CurColorTarget m_curColor[kMaxColorTargets];
         Uint m_curColorCount = 0; // number of resolved slots (holes included)
         WGPUTextureView m_curDepthView = nullptr; // null => target has no depth
-        WGPUTextureFormat m_curDepthFormat = WGPUTextureFormat_Depth24Plus; // format of m_curDepthView
+        WGPUTextureFormat m_curDepthFormat = kDepthFormat; // format of m_curDepthView
         Uint32 m_curWidth = 0;
         Uint32 m_curHeight = 0;
         Bool m_curIsDefault = true;
 
-        // Transient depth buffers for user FBOs that have a depth attachment (the depth
-        // contents themselves aren't sampled yet — shadow maps are a follow-up).
+        // Transient depth/stencil buffers for user FBO renderbuffer attachments.
         struct FboDepth {
             WGPUTexture texture = nullptr;
             WGPUTextureView view = nullptr;

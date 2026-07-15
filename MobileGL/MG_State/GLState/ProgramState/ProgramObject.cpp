@@ -116,6 +116,9 @@ namespace MobileGL::MG_State::GLState {
         m_uniformOffsets.clear();
         m_uniformSizesInBytes.clear();
         m_globalUboScratch.clear();
+        m_uniformWriteTargets.clear();
+        m_stageGlobalUbos.clear();
+        m_stageGlobalUboScratch.clear();
         m_attribs.clear();
         m_attribTypes.clear();
         m_activeUniformCount = 0;
@@ -300,6 +303,52 @@ namespace MobileGL::MG_State::GLState {
 
     const Vector<SharedPtr<ShaderObject>>& ProgramObject::GetAttachedShaders() const {
         return m_shaders;
+    }
+
+    const ProgramObject::StageGlobalUbo* ProgramObject::GetStageGlobalUbo(ShaderStage stage) const {
+        const auto it = std::find_if(m_stageGlobalUbos.begin(), m_stageGlobalUbos.end(),
+                                     [stage](const StageGlobalUbo& ubo) { return ubo.stage == stage; });
+        return it == m_stageGlobalUbos.end() ? nullptr : &*it;
+    }
+
+    void ProgramObject::WriteUniformData(Uint location, SizeT byteOffsetInsideUniform, const void* data, SizeT size) {
+        MOBILEGL_ASSERT(location < m_uniformOffsets.size(), "Uniform location %u is out of range", location);
+
+        // Preserve the original packed scratch representation for DirectGLES until
+        // its recompiled GLSL program adopts stage-local block bindings too.
+        const SizeT legacyOffset = static_cast<SizeT>(m_uniformOffsets[location]) + byteOffsetInsideUniform;
+        MOBILEGL_ASSERT(legacyOffset + size <= m_globalUboScratch.size(),
+                        "Legacy uniform write exceeds scratch buffer");
+        Memcpy(m_globalUboScratch.data() + legacyOffset, data, size);
+
+        if (location >= m_uniformWriteTargets.size()) return;
+        for (const auto& target : m_uniformWriteTargets[location]) {
+            MOBILEGL_ASSERT(byteOffsetInsideUniform + size <= target.memberSize,
+                            "Stage-local uniform write exceeds reflected member size");
+            const SizeT targetOffset = static_cast<SizeT>(target.scratchOffset) + byteOffsetInsideUniform;
+            MOBILEGL_ASSERT(targetOffset + size <= m_stageGlobalUboScratch.size(),
+                            "Stage-local uniform write exceeds scratch buffer");
+            Memcpy(m_stageGlobalUboScratch.data() + targetOffset, data, size);
+        }
+    }
+
+    const Uint8* ProgramObject::GetUniformData(Uint location) const {
+        if (location < m_uniformWriteTargets.size() && !m_uniformWriteTargets[location].empty()) {
+            const Uint offset = m_uniformWriteTargets[location].front().scratchOffset;
+            if (offset < m_stageGlobalUboScratch.size()) return m_stageGlobalUboScratch.data() + offset;
+        }
+        if (location >= m_uniformOffsets.size()) return nullptr;
+        const Uint offset = m_uniformOffsets[location];
+        return offset < m_globalUboScratch.size() ? m_globalUboScratch.data() + offset : nullptr;
+    }
+
+    const Uint8* ProgramObject::GetUniformData(Uint location, ShaderStage stage) const {
+        if (location >= m_uniformWriteTargets.size()) return nullptr;
+        const auto& targets = m_uniformWriteTargets[location];
+        const auto it = std::find_if(targets.begin(), targets.end(),
+                                     [stage](const UniformWriteTarget& target) { return target.stage == stage; });
+        if (it == targets.end() || it->scratchOffset >= m_stageGlobalUboScratch.size()) return nullptr;
+        return m_stageGlobalUboScratch.data() + it->scratchOffset;
     }
 
     void ProgramObject::DoReflection() {
@@ -586,8 +635,12 @@ namespace MobileGL::MG_State::GLState {
         m_uniformSizesInBytes.clear();
         m_uniformOffsets.clear();
         m_globalUboScratch.clear();
+        m_uniformWriteTargets.clear();
+        m_stageGlobalUbos.clear();
+        m_stageGlobalUboScratch.clear();
         m_uniformOffsets.resize(m_maxUniformLocation + 1);
         m_uniformSizesInBytes.resize(m_maxUniformLocation + 1);
+        m_uniformWriteTargets.resize(m_maxUniformLocation + 1);
         for (SizeT i = 0; i < m_generatedSpirv.size(); i++) {
             auto& spv = m_generatedSpirv[i];
 
@@ -613,30 +666,44 @@ namespace MobileGL::MG_State::GLState {
                 if (size == 0) {
                     continue;
                 }
+                // Keep every stage's independently generated default-block layout in
+                // a disjoint CPU region. Sixteen-byte alignment is sufficient here;
+                // WebGPU and Vulkan upload each region as an independent binding.
+                const Uint stageBase = static_cast<Uint>((m_stageGlobalUboScratch.size() + 15u) & ~SizeT(15u));
+                m_stageGlobalUboScratch.resize(stageBase + size);
+                const ShaderStage shaderStage = i < m_shaders.size() ? m_shaders[i]->GetShaderStage()
+                                                                     : ShaderStage::Unknown;
+                m_stageGlobalUbos.push_back({shaderStage, stageBase, static_cast<Uint>(size)});
                 if (m_globalUboScratch.size() < size) {
                     m_globalUboScratch.resize(size);
                 }
                 for (const auto& [name, offset] : meta.plainUniformOffsetsInUBO) {
                     if (m_uniformLocations.find(name) != m_uniformLocations.end()) {
-                        m_uniformOffsets[m_uniformLocations[name]] = offset;
+                        const Uint location = m_uniformLocations[name];
+                        m_uniformOffsets[location] = offset;
+                        const auto sizeIt = meta.plainUniformMemberSizesInBytes.find(name);
+                        const Uint memberSize = sizeIt == meta.plainUniformMemberSizesInBytes.end()
+                                                    ? 0u
+                                                    : static_cast<Uint>(sizeIt->second);
+                        m_uniformWriteTargets[location].push_back({shaderStage, stageBase + offset, memberSize});
                         MGLOG_D("ProgramObject %u: GenerateBinary - uniform '%s' offset=%u assigned to location %u",
-                                m_externalIndex, name.c_str(), offset, m_uniformLocations[name]);
-            } else {
-                MGLOG_D("ProgramObject %u: GenerateBinary - uniform '%s' offset=%u but not found in "
-                        "m_uniformLocations",
-                        m_externalIndex, name.c_str(), offset);
-            }
+                                m_externalIndex, name.c_str(), offset, location);
+                    } else {
+                        MGLOG_D("ProgramObject %u: GenerateBinary - uniform '%s' offset=%u but not found in "
+                                "m_uniformLocations",
+                                m_externalIndex, name.c_str(), offset);
+                    }
                 }
                 for (const auto& [name, size] : meta.plainUniformMemberSizesInBytes) {
                     if (m_uniformLocations.find(name) != m_uniformLocations.end()) {
                         m_uniformSizesInBytes[m_uniformLocations[name]] = size;
                         MGLOG_D("ProgramObject %u: GenerateBinary - uniform '%s' size=%u assigned to location %u",
                                 m_externalIndex, name.c_str(), size, m_uniformLocations[name]);
-            } else {
-                MGLOG_D("ProgramObject %u: GenerateBinary - uniform '%s' size=%u but not found in "
-                        "m_uniformLocations",
-                        m_externalIndex, name.c_str(), size);
-            }
+                    } else {
+                        MGLOG_D("ProgramObject %u: GenerateBinary - uniform '%s' size=%u but not found in "
+                                "m_uniformLocations",
+                                m_externalIndex, name.c_str(), size);
+                    }
                 }
                 MGLOG_D("ProgramObject %u: GenerateBinary - finished parsing module %zu metadata",
                         m_externalIndex, i);

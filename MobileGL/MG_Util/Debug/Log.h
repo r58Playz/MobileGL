@@ -10,9 +10,9 @@
 #include <Includes.h>
 
 #define MOBILEGL_LOG_LEVEL_DEBUG 0
-#define MOBILEGL_LOG_LEVEL_WARN 1
-#define MOBILEGL_LOG_LEVEL_ERROR 2
-#define MOBILEGL_LOG_LEVEL_INFO 3
+#define MOBILEGL_LOG_LEVEL_INFO 1
+#define MOBILEGL_LOG_LEVEL_WARN 2
+#define MOBILEGL_LOG_LEVEL_ERROR 3
 #define MOBILEGL_LOG_LEVEL_FATAL 4
 
 #define MOBILEGL_LOG_INTERNAL(levelTag, androidLogLevel, fmt, ...)                                                     \

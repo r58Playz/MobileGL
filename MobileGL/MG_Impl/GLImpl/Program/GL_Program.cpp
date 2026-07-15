@@ -635,17 +635,16 @@ namespace MobileGL::MG_Impl::GLImpl {
         auto isOpaque = programObject->IsUniformOpaqueAtLocation(location);
         if (!isOpaque) {
             // TODO: probably handle int/float differences
-            auto offset = programObject->GetUniformOffset(location);
             auto size = programObject->GetUniformSizesInBytes(location);
-            char* pUBO = (char*)programObject->MapUBO();
+            const char* pUniform = reinterpret_cast<const char*>(programObject->GetUniformData(location));
             auto* ttype = programObject->GetUniformTType(location);
 
             if (!ttype->isMatrix() || ttype->getMatrixCols() != 3)
-                Memcpy(params, pUBO + offset, size);
+                Memcpy(params, pUniform, size);
             else {
                 // TODO: we only deal with mat3 yet, deal with other types later
                 // assuming float here, which may not be the case
-                auto* pBase = pUBO + offset;
+                auto* pBase = pUniform;
                 for (int i = 0; i < ttype->getMatrixRows(); i++) {
                     Memcpy((char*)params + ttype->getMatrixCols() * sizeof(float) * i, pBase + 4 * sizeof(float) * i,
                            ttype->getMatrixCols() * sizeof(float));
@@ -684,14 +683,13 @@ namespace MobileGL::MG_Impl::GLImpl {
             return;
         }
 
-        auto offset = programObject->GetUniformOffset(location);
         auto size = programObject->GetUniformSizesInBytes(location);
-        char* pUBO = static_cast<char*>(programObject->MapUBO());
+        const char* pUniform = reinterpret_cast<const char*>(programObject->GetUniformData(location));
         auto* ttype = programObject->GetUniformTType(location);
 
         if constexpr (std::is_same_v<T, GLfloat>) {
             if (ttype->isMatrix() && ttype->getMatrixCols() == 3) {
-                auto* pBase = pUBO + offset;
+                auto* pBase = pUniform;
                 for (int i = 0; i < ttype->getMatrixRows(); i++) {
                     Memcpy(reinterpret_cast<char*>(params) + ttype->getMatrixCols() * sizeof(GLfloat) * i,
                            pBase + 4 * sizeof(GLfloat) * i, ttype->getMatrixCols() * sizeof(GLfloat));
@@ -700,7 +698,7 @@ namespace MobileGL::MG_Impl::GLImpl {
             }
         }
 
-        Memcpy(params, pUBO + offset, size);
+        Memcpy(params, pUniform, size);
     }
 
     void GetUniformfv_State(GLuint program, GLint location, GLfloat* params) {
@@ -805,13 +803,12 @@ namespace MobileGL::MG_Impl::GLImpl {
             MGLOG_D("%s: program = %d, location = %d, maxLocation = %d", __func__, programObject.GetExternalIndex(),
                     location, programObject.GetMaxUniformLocation());
             auto size = programObject.GetUniformSizesInBytes(location);
-            auto offset = programObject.GetUniformOffset(location);
             MOBILEGL_ASSERT(size >= ItemCount * sizeof(T),
                             "Uniform size mismatch, expected at least %zu bytes, got %zu bytes.", ItemCount * sizeof(T),
                             size);
-            MGLOG_D("%s: program = %d, location = %d, byteOffset = %d", __func__, programObject.GetExternalIndex(),
-                    location, offset + byteOffsetInsideUniform);
-            Memcpy((char*)programObject.MapUBO() + offset + byteOffsetInsideUniform, value, ItemCount * sizeof(T));
+            MGLOG_D("%s: program = %d, location = %d, byteOffsetInsideUniform = %zu", __func__,
+                    programObject.GetExternalIndex(), location, byteOffsetInsideUniform);
+            programObject.WriteUniformData(location, byteOffsetInsideUniform, value, ItemCount * sizeof(T));
         } else {
             auto* ttype = programObject.GetUniformTType(location);
             if (!ttype->isTexture() && !ttype->isImage()) return;

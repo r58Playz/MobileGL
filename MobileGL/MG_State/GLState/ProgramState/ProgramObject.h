@@ -16,6 +16,12 @@
 namespace MobileGL::MG_State::GLState {
     class ProgramObject {
     public:
+        struct StageGlobalUbo {
+            ShaderStage stage = ShaderStage::Unknown;
+            Uint scratchOffset = 0;
+            Uint size = 0;
+        };
+
         ProgramObject(Uint externalIndex) : m_externalIndex(externalIndex) {}
         bool ShaderIsAttached(const SharedPtr<ShaderObject>& shader);
         bool AttachShader(const SharedPtr<ShaderObject>& shader);
@@ -170,6 +176,12 @@ namespace MobileGL::MG_State::GLState {
         void* MapUBO() { return m_globalUboScratch.data(); }
         const void* GetUBOData() const { return m_globalUboScratch.data(); }
         Uint GetUBOSize() const { return static_cast<Uint>(m_globalUboScratch.size()); }
+        const StageGlobalUbo* GetStageGlobalUbo(ShaderStage stage) const;
+        const void* GetStageUBOData() const { return m_stageGlobalUboScratch.data(); }
+        Uint GetStageUBOSize() const { return static_cast<Uint>(m_stageGlobalUboScratch.size()); }
+        void WriteUniformData(Uint location, SizeT byteOffsetInsideUniform, const void* data, SizeT size);
+        const Uint8* GetUniformData(Uint location) const;
+        const Uint8* GetUniformData(Uint location, ShaderStage stage) const;
         Uint32 GetBackendStateVersion() const { return m_backendStateVersion; }
 
         void SetUniformSamplerOrImageUnitIndex(Uint location, Int unit) {
@@ -296,6 +308,18 @@ namespace MobileGL::MG_State::GLState {
         Vector<Uint> m_uniformOffsets;
         Vector<Uint> m_uniformSizesInBytes;
         Vector<Uint8> m_globalUboScratch;
+
+        struct UniformWriteTarget {
+            ShaderStage stage = ShaderStage::Unknown;
+            Uint scratchOffset = 0;
+            Uint memberSize = 0;
+        };
+        // glslang lowers default-block uniforms into a separate physical UBO layout
+        // for every stage. A linked GL uniform remains one logical value, so each
+        // location may need to update multiple stage-local destinations.
+        Vector<Vector<UniformWriteTarget>> m_uniformWriteTargets;
+        Vector<StageGlobalUbo> m_stageGlobalUbos;
+        Vector<Uint8> m_stageGlobalUboScratch;
 
         Uint m_activeUniformCount = 0;
         Uint m_maxUniformLocation = 0;

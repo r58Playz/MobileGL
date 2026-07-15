@@ -43,26 +43,39 @@ if (NOT EXISTS "${EMDAWNWEBGPU_PKG_DIR}/webgpu/include/webgpu/webgpu.h")
     message(FATAL_ERROR "emdawnwebgpu package layout unexpected at ${EMDAWNWEBGPU_PKG_DIR}")
 endif()
 
-# Apply the 3.1.56 compatibility patch idempotently (git apply works outside a
-# repo). --reverse --check succeeds only if the patch is already applied.
-find_program(GIT_EXECUTABLE git REQUIRED)
-set(_emdawn_patch "${CMAKE_SOURCE_DIR}/3rdparty/emdawnwebgpu-3.1.56.patch")
-execute_process(
-    COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${_emdawn_patch}"
-    WORKING_DIRECTORY "${EMDAWNWEBGPU_PKG_DIR}"
-    RESULT_VARIABLE _emdawn_already_applied
-    OUTPUT_QUIET ERROR_QUIET)
-if (NOT _emdawn_already_applied EQUAL 0)
-    execute_process(
-        COMMAND "${GIT_EXECUTABLE}" apply "${_emdawn_patch}"
-        WORKING_DIRECTORY "${EMDAWNWEBGPU_PKG_DIR}"
-        RESULT_VARIABLE _emdawn_patch_rc)
-    if (NOT _emdawn_patch_rc EQUAL 0)
-        message(FATAL_ERROR "Failed to apply ${_emdawn_patch}")
+# Apply both 3.1.56 compatibility edits independently. A single `git apply`
+# cannot recover when an interrupted/older configure applied only one hunk.
+set(_emdawn_library "${EMDAWNWEBGPU_PKG_DIR}/webgpu/src/library_webgpu.js")
+file(READ "${_emdawn_library}" _emdawn_js)
+set(_emdawn_js_original "${_emdawn_js}")
+
+set(_emdawn_old_deps "errorCallback__deps: ['$stackSave', '$stackRestore', '$stringToUTF8OnStack']")
+set(_emdawn_new_deps "errorCallback__deps: ['stackSave', 'stackRestore', '$stringToUTF8OnStack']")
+string(FIND "${_emdawn_js}" "${_emdawn_new_deps}" _emdawn_has_new_deps)
+if (_emdawn_has_new_deps EQUAL -1)
+    string(FIND "${_emdawn_js}" "${_emdawn_old_deps}" _emdawn_has_old_deps)
+    if (_emdawn_has_old_deps EQUAL -1)
+        message(FATAL_ERROR "emdawnwebgpu errorCallback dependency syntax is unrecognized")
     endif()
-    message(STATUS "emdawnwebgpu: applied 3.1.56 compatibility patch")
+    string(REPLACE "${_emdawn_old_deps}" "${_emdawn_new_deps}" _emdawn_js "${_emdawn_js}")
+endif()
+
+set(_emdawn_old_wait "emwgpuWaitAny: () => {")
+set(_emdawn_new_wait "emwgpuWaitAny: (futurePtr, futureCount, timeoutNSPtr) => {")
+string(FIND "${_emdawn_js}" "${_emdawn_new_wait}" _emdawn_has_new_wait)
+if (_emdawn_has_new_wait EQUAL -1)
+    string(FIND "${_emdawn_js}" "${_emdawn_old_wait}" _emdawn_has_old_wait)
+    if (_emdawn_has_old_wait EQUAL -1)
+        message(FATAL_ERROR "emdawnwebgpu asyncify-free WaitAny stub syntax is unrecognized")
+    endif()
+    string(REPLACE "${_emdawn_old_wait}" "${_emdawn_new_wait}" _emdawn_js "${_emdawn_js}")
+endif()
+
+if (NOT _emdawn_js STREQUAL _emdawn_js_original)
+    file(WRITE "${_emdawn_library}" "${_emdawn_js}")
+    message(STATUS "emdawnwebgpu: applied 3.1.56 compatibility edits")
 else()
-    message(STATUS "emdawnwebgpu: 3.1.56 patch already applied")
+    message(STATUS "emdawnwebgpu: 3.1.56 compatibility edits already applied")
 endif()
 
 set(EMDAWNWEBGPU_INCLUDE_DIRS
