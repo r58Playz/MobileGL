@@ -74,7 +74,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# -fPIC. Turn OFF when static-linking MobileGL into a non-PIC (non-MAIN_MODULE) Emscripten binary:
+# under -fPIC the default-visibility exported gl*/egl* symbols' addresses become GOT.func entries
+# that resolve to null in such a link, so proc-address lookups hand LWJGL null function pointers.
+option(MOBILEGL_POSITION_INDEPENDENT_CODE "Build MobileGL with -fPIC" ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ${MOBILEGL_POSITION_INDEPENDENT_CODE})
 
 if (MSVC)
     set(CMAKE_CXX_FLAGS "/EHsc ${CMAKE_CXX_FLAGS}")
