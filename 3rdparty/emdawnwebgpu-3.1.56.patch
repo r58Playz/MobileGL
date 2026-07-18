@@ -1,5 +1,32 @@
 --- a/webgpu/src/library_webgpu.js
 +++ b/webgpu/src/library_webgpu.js
+@@ -63,7 +63,7 @@
+         importJs${object}__deps: ['emwgpuCreate${object}'],
+         importJs${object}: (obj, parentPtr = 0) => {
+           var ptr = _emwgpuCreate${object}(parentPtr);
+-          WebGPU.Internals.jsObjects[ptr] = obj;
++          WebGPU.Internals.jsObjects[ptr >>> 0] = obj;
+           return ptr;
+         },
+       `
+@@ -93,7 +93,7 @@
+       // care about object type, and is keyed on the pointer address.
+       jsObjects: [],
+       jsObjectInsert: (ptr, jsObject) => {
+-        WebGPU.Internals.jsObjects[ptr] = jsObject;
++        WebGPU.Internals.jsObjects[ptr >>> 0] = jsObject;
+       },
+ 
+       // Buffer unmapping callbacks are stored in a separate table to keep
+@@ -132,7 +132,7 @@
+ #if ASSERTIONS
+       assert(ptr in WebGPU.Internals.jsObjects);
+ #endif
+-      return WebGPU.Internals.jsObjects[ptr];
++      return WebGPU.Internals.jsObjects[ptr >>> 0];
+     },
+     {{{ gpu.makeImportJsObject('Adapter') }}}
+     {{{ gpu.makeImportJsObject('BindGroup') }}}
 @@ -178,7 +178,7 @@
      {{{ gpu.makeImportJsObject('TextureView') }}}
  
@@ -9,6 +36,15 @@
      errorCallback: (callback, type, message, userdata) => {
        var sp = stackSave();
        var messagePtr = stringToUTF8OnStack(message);
+@@ -604,7 +604,7 @@
+ 
+   emwgpuDelete__sig: 'vp',
+   emwgpuDelete: (ptr) => {
+-    delete WebGPU.Internals.jsObjects[ptr];
++    delete WebGPU.Internals.jsObjects[ptr >>> 0];
+   },
+ 
+   emwgpuSetLabel__deps: ['$UTF8ToString'],
 @@ -643,7 +643,7 @@
      return firstResolvedFuture;
    }),

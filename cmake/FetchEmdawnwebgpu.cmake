@@ -71,6 +71,21 @@ if (_emdawn_has_new_wait EQUAL -1)
     string(REPLACE "${_emdawn_old_wait}" "${_emdawn_new_wait}" _emdawn_js "${_emdawn_js}")
 endif()
 
+# >=2GB pointer fix: emdawnwebgpu keys its single jsObjects table by raw pointer, but the
+# _emwgpuCreate* wasm returns are read into JS as SIGNED i32 (negative for a >=2GB pointer
+# under CAN_ADDRESS_2GB, e.g. the dotnet host's ~4GB heap), so inserts land under a negative
+# key while every lookup is >>>0'd (unsigned) -> getJsObject misses -> undefined handle ->
+# TextureCreateView / RenderPassEncoderEnd / etc. crash. Normalize every jsObjects key to
+# unsigned. Idempotent: the replacement no longer contains the "[ptr]" substring.
+string(FIND "${_emdawn_js}" "WebGPU.Internals.jsObjects[ptr >>> 0]" _emdawn_has_ptrfix)
+if (_emdawn_has_ptrfix EQUAL -1)
+    string(FIND "${_emdawn_js}" "WebGPU.Internals.jsObjects[ptr]" _emdawn_has_rawkey)
+    if (_emdawn_has_rawkey EQUAL -1)
+        message(FATAL_ERROR "emdawnwebgpu jsObjects key-access syntax is unrecognized")
+    endif()
+    string(REPLACE "WebGPU.Internals.jsObjects[ptr]" "WebGPU.Internals.jsObjects[ptr >>> 0]" _emdawn_js "${_emdawn_js}")
+endif()
+
 if (NOT _emdawn_js STREQUAL _emdawn_js_original)
     file(WRITE "${_emdawn_library}" "${_emdawn_js}")
     message(STATUS "emdawnwebgpu: applied 3.1.56 compatibility edits")
