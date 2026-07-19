@@ -104,6 +104,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             // the WebGPU bind-group entry type (depth sample type / comparison sampler).
             Bool wgslDepth = false;
             Bool wgslComparison = false;
+            // Parsed as `texture_cube<...>` (from a GLSL samplerCube): resolve the bound
+            // texture from the unit's CUBE_MAP slot, bind it through a cube view, and (in an
+            // explicit layout) declare the entry's viewDimension as Cube.
+            Bool wgslCube = false;
         };
 
         // A vertex shader input (@location(N) ... : TYPE), parsed from tint's WGSL.
@@ -254,15 +258,22 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         WGPUBuffer GetOrCreateBuffer(UnorderedMap<const MG_State::GLState::BufferObject*, WgpuBuffer>& cache,
                                      MG_State::GLState::BufferObject& buffer, WGPUBufferUsage usage);
         const WgpuTexture* GetOrCreateTexture(MG_State::GLState::ITextureObject& texture);
+        // Cube-map counterpart of GetOrCreateTexture: uploads the 6 faces into a 6-layer
+        // texture and returns a WgpuTexture whose `view` is a WGPUTextureViewDimension_Cube.
+        const WgpuTexture* GetOrCreateCubeTexture(MG_State::GLState::ITextureObject& texture);
         // Uploads every valid 2D mip level stored in `mip` into `tex` via the queue.
         // Levels with no CPU pixels are left zero-initialized. bytesPerTexel comes from
         // the resolved WGPU format (RGBA8=4, RGBA16F=8, ...); it sizes the row pitch.
         // When swizzleSrcChannels != 0, a non-identity GL texture swizzle is baked into
         // the RGBA8 output: each texel becomes swizzle(baseExpand(src)) (see the .cpp).
         // swizzlePacked holds the 4 TextureSwizzleParam values (3 bits each).
+        // `target`/`arrayLayer` select the source upload target and destination array layer:
+        // defaults upload a plain 2D texture; a cube passes each face target and layer 0..5.
         void UploadTextureLevels(WGPUTexture tex, MG_State::GLState::TextureObjectMipmap& mip,
                                  Uint32 bytesPerTexel, Uint32 srcBytesPerTexel,
-                                 Uint32 swizzleSrcChannels = 0, Uint32 swizzlePacked = 0);
+                                 Uint32 swizzleSrcChannels = 0, Uint32 swizzlePacked = 0,
+                                 TextureUploadTarget target = TextureUploadTarget::Texture2D,
+                                 Uint32 arrayLayer = 0);
         // Builds (or reuses) a WGPUSampler matching the GL sampler params
         // (glTexParameter / glBindSampler). Cached by the resolved param values.
         // comparison: emit a compare sampler (for sampler2DShadow / sampler_comparison).

@@ -14,6 +14,7 @@
 #include <MG_State/GLState/BufferState/BufferObject.h>
 #include <MG_State/GLState/TextureState/TextureUnit.h>
 #include <MG_State/GLState/TextureState/TextureObject.h>
+#include <MG_State/GLState/TextureState/TextureObject2DCube.h>
 #include <MG_State/GLState/TextureState/TextureEnum.h>
 #include <MG_State/GLState/SamplerState/SamplerObject.h>
 #include <MG_State/GLState/FramebufferState/FramebufferObject.h>
@@ -1033,6 +1034,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         String typeName;
         bool depth = false;      // texture_depth_2d (from GLSL sampler2DShadow)
         bool comparison = false; // sampler_comparison
+        bool cube = false;       // texture_cube<...> (from GLSL samplerCube)
     };
     static void ParseWgslResources(const std::string& wgsl, std::vector<ParsedWgslResource>& out) {
         static const std::string tok = "@binding(";
@@ -1075,6 +1077,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             } else if (r.typeName.find("texture") != std::string::npos) {
                 r.kind = ParsedWgslResource::Kind::Texture;
                 r.depth = r.typeName.find("texture_depth") != std::string::npos;
+                // texture_cube<...>, but not texture_cube_array (unsupported -> left 2D, whose
+                // bind-dimension mismatch cleanly skips the draw instead of misbinding).
+                r.cube = r.typeName.find("texture_cube") != std::string::npos &&
+                         r.typeName.find("texture_cube_array") == std::string::npos;
             } else if (r.typeName.find("sampler") != std::string::npos) {
                 r.kind = ParsedWgslResource::Kind::Sampler;
                 r.comparison = r.typeName.find("sampler_comparison") != std::string::npos;
@@ -1755,6 +1761,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                     ref.glName = BaseUniformName(r.varName);
                     ref.wgslDepth = r.depth;
                     ref.wgslComparison = r.comparison;
+                    ref.wgslCube = r.cube;
                     prog.resources.push_back(ref);
                 }
             }
@@ -2224,7 +2231,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                 e.binding = r.binding;
                 e.visibility = visOf(r.binding);
                 if (r.kind == ResourceRef::Kind::Texture) {
-                    e.texture.viewDimension = WGPUTextureViewDimension_2D;
+                    e.texture.viewDimension = r.wgslCube ? WGPUTextureViewDimension_Cube
+                                                         : WGPUTextureViewDimension_2D;
                     e.texture.multisampled = 0;
                     e.texture.sampleType = r.wgslDepth ? WGPUTextureSampleType_Depth
                                            : BoundTextureIsDepth(program, r.glName)
@@ -2318,9 +2326,26 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         auto it = cache.find(&buffer);
         if (it != cache.end()) {
             WgpuBuffer& cb = it->second;
-            if (cb.serial == serial) {
+            // A cached GPU buffer of a different size is never up to date, even if the change
+            // serial appears unchanged. Minecraft's AutoStorageIndexBuffer grows the element
+            // buffer on demand; if any resize path fails to advance the serial, trusting the
+            // serial alone hands back the stale (smaller) buffer and DrawIndexed over-reads it,
+            // which WebGPU rejects and poisons the whole frame. Gate on the size too.
+            if (cb.serial == serial && cb.size == allocSize) {
                 cb.lastUseSerial = m_flushSerial;
                 return cb.buffer; // up to date
+            }
+            if (cb.serial == serial && cb.size != allocSize) {
+                // The BufferObject changed size but its change serial did not advance — a resize
+                // path that skipped its Notify* (the AutoStorageIndexBuffer stale-buffer bug).
+                // We recreate below regardless; log once per size pair to pin the offending path.
+                static std::unordered_set<uint64_t> loggedResizeNoSerial;
+                if (loggedResizeNoSerial.insert((static_cast<uint64_t>(cb.size) << 32) ^ allocSize).second) {
+                    std::printf("[webgpu] buffer resized %llu->%llu B with unchanged serial %llu; recreating\n",
+                                static_cast<unsigned long long>(cb.size),
+                                static_cast<unsigned long long>(allocSize),
+                                static_cast<unsigned long long>(serial));
+                }
             }
             if (cb.buffer && cb.size == allocSize && data) {
                 // Same size, new contents -> re-upload in place. queueWriteBuffer
@@ -2704,6 +2729,124 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     }
 
     const WebGPURenderer::WgpuTexture*
+    WebGPURenderer::GetOrCreateCubeTexture(MG_State::GLState::ITextureObject& texture) {
+        // Cube faces in WebGPU array-layer order (+X,-X,+Y,-Y,+Z,-Z) — matches the GL /
+        // TextureUploadTarget enum order, so face index == destination array layer.
+        static const TextureUploadTarget kFaces[6] = {
+            TextureUploadTarget::CubeMapPositiveX, TextureUploadTarget::CubeMapNegativeX,
+            TextureUploadTarget::CubeMapPositiveY, TextureUploadTarget::CubeMapNegativeY,
+            TextureUploadTarget::CubeMapPositiveZ, TextureUploadTarget::CubeMapNegativeZ,
+        };
+        ColorFormatInfo info = ToColorFormat(texture.GetFormat());
+        const WGPUTextureFormat fmt = info.format;
+        if (fmt == WGPUTextureFormat_Undefined) {
+            MGLOG_E("DirectWebGPU: unsupported cube texture internal format for sampling");
+            return nullptr;
+        }
+        auto* mip = dynamic_cast<MG_State::GLState::TextureObjectMipmap*>(&texture);
+        if (!mip) {
+            return nullptr;
+        }
+        const IntVec3 dim = texture.GetBaseSize();
+        if (dim.x() <= 0 || dim.y() <= 0 || dim.x() != dim.y()) {
+            return nullptr; // cube faces must be square
+        }
+        const Uint32 w = static_cast<Uint32>(dim.x());
+        const Uint32 h = static_cast<Uint32>(dim.y());
+        const Uint32 mipLevelCount = CountValidMipLevels(*mip, kFaces[0]); // all faces share a chain
+        if (mipLevelCount == 0) {
+            return nullptr;
+        }
+        const auto& levelRange = texture.GetLevelRange();
+        const Uint32 baseMipLevel = std::min(levelRange.x(), mipLevelCount - 1u);
+        const Uint32 maxMipLevel = std::min(levelRange.y(), mipLevelCount - 1u);
+        const Uint32 viewMipLevelCount = maxMipLevel >= baseMipLevel ? (maxMipLevel - baseMipLevel + 1u) : 1u;
+        const Uint16 textureParamsVersion = texture.GetTextureParamsVersion();
+
+        const Uint32 srcBpt = info.srcBytesPerTexel ? info.srcBytesPerTexel : info.bytesPerTexel;
+        auto uploadFaces = [&](WGPUTexture tex) {
+            for (Uint32 face = 0; face < 6; ++face) {
+                UploadTextureLevels(tex, *mip, info.bytesPerTexel, srcBpt, 0, 0, kFaces[face], face);
+            }
+        };
+        auto makeCubeView = [&](WGPUTexture tex) {
+            WGPUTextureViewDescriptor vd{};
+            vd.format = fmt;
+            vd.dimension = WGPUTextureViewDimension_Cube;
+            vd.baseMipLevel = baseMipLevel;
+            vd.mipLevelCount = viewMipLevelCount;
+            vd.baseArrayLayer = 0;
+            vd.arrayLayerCount = 6;
+            vd.aspect = WGPUTextureAspect_All;
+            return wgpuTextureCreateView(tex, &vd);
+        };
+
+        auto it = m_textureCache.find(&texture);
+        if (it != m_textureCache.end()) {
+            WgpuTexture& cached = it->second;
+            if (cached.width != w || cached.height != h || cached.format != fmt ||
+                cached.mipLevelCount != mipLevelCount) {
+                if (cached.view) wgpuTextureViewRelease(cached.view);
+                if (cached.texture) wgpuTextureRelease(cached.texture);
+                m_textureCache.erase(it);
+            } else {
+                Bool dirty = false;
+                for (Uint32 face = 0; face < 6 && !dirty; ++face) {
+                    for (Uint32 level = 0; level < mipLevelCount; ++level) {
+                        if (mip->IsStorageDirty(kFaces[face], level)) { dirty = true; break; }
+                    }
+                }
+                const Bool viewDirty = cached.textureParamsVersion != textureParamsVersion ||
+                                       cached.viewBaseMipLevel != baseMipLevel ||
+                                       cached.viewMipLevelCount != viewMipLevelCount;
+                if (dirty) {
+                    if (cached.lastUseSerial == m_flushSerial) {
+                        FlushFrame(); // queueWriteTexture runs at submit; flush draws that sample it
+                    }
+                    uploadFaces(cached.texture);
+                }
+                if (viewDirty) {
+                    if (cached.view) wgpuTextureViewRelease(cached.view);
+                    cached.view = makeCubeView(cached.texture);
+                    cached.viewBaseMipLevel = baseMipLevel;
+                    cached.viewMipLevelCount = viewMipLevelCount;
+                    cached.textureParamsVersion = textureParamsVersion;
+                }
+                cached.lastUseSerial = m_flushSerial;
+                return &cached;
+            }
+        }
+
+        WGPUTextureDescriptor td{};
+        td.usage = WGPUTextureUsage_CopyDst | WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc;
+        td.dimension = WGPUTextureDimension_2D; // a WebGPU cube is a 2D texture with 6 layers
+        td.size = {w, h, 6};
+        td.format = fmt;
+        td.mipLevelCount = mipLevelCount;
+        td.sampleCount = 1;
+        WGPUTexture tex = wgpuDeviceCreateTexture(m_device, &td);
+        if (!tex) {
+            return nullptr;
+        }
+        uploadFaces(tex);
+
+        WgpuTexture wt;
+        wt.texture = tex;
+        wt.view = makeCubeView(tex);
+        wt.width = w;
+        wt.height = h;
+        wt.mipLevelCount = mipLevelCount;
+        wt.viewBaseMipLevel = baseMipLevel;
+        wt.viewMipLevelCount = viewMipLevelCount;
+        wt.textureParamsVersion = textureParamsVersion;
+        wt.swizzleKey = kNoSwizzle;
+        wt.format = fmt;
+        wt.lastUseSerial = m_flushSerial;
+        auto [ins, ok] = m_textureCache.emplace(&texture, wt);
+        return &ins->second;
+    }
+
+    const WebGPURenderer::WgpuTexture*
     WebGPURenderer::GetOrCreateDepthTexture(MG_State::GLState::ITextureObject& texture,
                                             WGPUTextureFormat depthFmt) {
         const IntVec3 dim = texture.GetBaseSize();
@@ -2769,8 +2912,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
 
     void WebGPURenderer::UploadTextureLevels(WGPUTexture tex, MG_State::GLState::TextureObjectMipmap& mip,
                                              Uint32 bytesPerTexel, Uint32 srcBytesPerTexel,
-                                             Uint32 swizzleSrcChannels, Uint32 swizzlePacked) {
-        const auto target = TextureUploadTarget::Texture2D;
+                                             Uint32 swizzleSrcChannels, Uint32 swizzlePacked,
+                                             TextureUploadTarget target, Uint32 arrayLayer) {
         const Uint32 levelCount = CountValidMipLevels(mip, target);
         std::vector<Uint8> expandScratch;
         // Unpack the 4 swizzle selectors (3 bits each) once; only used when materializing.
@@ -2827,6 +2970,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                 WGPUTexelCopyTextureInfo dst{};
                 dst.texture = tex;
                 dst.mipLevel = level;
+                dst.origin.z = arrayLayer;
                 WGPUTexelCopyBufferLayout dataLayout{};
                 // Row pitch from the resolved WGPU format's texel size (RGBA8=4,
                 // RGBA16F=8, RGBA32F=16, ...). queueWriteTexture has no 256B alignment
@@ -3177,17 +3321,26 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                     std::printf("[webgpu] sampler uniform '%s' not found; defaulting to unit 0\n", r.glName.c_str());
                 }
                 auto& textureUnit = MG_State::pGLContext->GetTextureUnitObject(unit);
-                auto texObj = textureUnit.GetBindingSlot(TextureTarget::Texture2D).GetBoundObject();
+                // A cube sampler (texture_cube) reads the unit's CUBE_MAP slot; everything else
+                // reads Texture2D. The sampler half of a combined samplerCube has wgslCube=false,
+                // so if its Texture2D slot is empty fall back to the cube slot for its params.
+                auto texObj = r.wgslCube
+                                  ? textureUnit.GetBindingSlot(TextureTarget::TextureCubeMap).GetBoundObject()
+                                  : textureUnit.GetBindingSlot(TextureTarget::Texture2D).GetBoundObject();
+                if (!texObj && r.kind == ResourceRef::Kind::Sampler) {
+                    texObj = textureUnit.GetBindingSlot(TextureTarget::TextureCubeMap).GetBoundObject();
+                }
                 if (r.kind == ResourceRef::Kind::Texture) {
                     if (!texObj) {
                         if (g_loggedMissingSamplerUnits.insert(r.glName + "#tex").second) {
-                            std::printf("[webgpu] sampler '%s' resolved to unit %d with no Texture2D bound\n",
-                                        r.glName.c_str(), unit);
+                            std::printf("[webgpu] sampler '%s' resolved to unit %d with no %s bound\n",
+                                        r.glName.c_str(), unit, r.wgslCube ? "CubeMap" : "Texture2D");
                         }
                         resourcesOk = false;
                         break;
                     }
-                    const WgpuTexture* wt = GetOrCreateTexture(*texObj);
+                    const WgpuTexture* wt = r.wgslCube ? GetOrCreateCubeTexture(*texObj)
+                                                       : GetOrCreateTexture(*texObj);
                     if (!wt) { resourcesOk = false; break; }
                     WGPUBindGroupEntry te{};
                     te.binding = r.binding;
@@ -3513,13 +3666,32 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (!indexBuffer) {
             return;
         }
+        // `indices` is a byte offset into the bound element array buffer; baseVertex is
+        // added to every index by drawIndexed.
+        const uint64_t byteOffset = reinterpret_cast<uintptr_t>(indices);
+        // WebGPU validates that the index range fits the bound buffer and poisons the whole
+        // command buffer (blank frame) on a violation; GL tolerates over-reads. If the bound
+        // element buffer is shorter than this draw needs, skip it (keeps the rest of the frame)
+        // and log the shortfall once per (count,size) so an undersized/stale index buffer can be
+        // diagnosed from the reported size vs. change serial.
+        const Uint32 indexSize = (indexFormat == WGPUIndexFormat_Uint16) ? 2u : 4u;
+        const uint64_t needBytes = byteOffset + static_cast<uint64_t>(count) * indexSize;
+        if (needBytes > iboPtr->GetSize()) {
+            static std::unordered_set<uint64_t> loggedIndexOverrun;
+            if (loggedIndexOverrun.insert((static_cast<uint64_t>(count) << 40) ^ iboPtr->GetSize()).second) {
+                std::printf("[webgpu] DrawElements index range out of bounds: count=%d indexSize=%u "
+                            "byteOffset=%llu needs %llu B, element buffer=%llu B (serial %llu); skipping\n",
+                            count, indexSize, static_cast<unsigned long long>(byteOffset),
+                            static_cast<unsigned long long>(needBytes),
+                            static_cast<unsigned long long>(iboPtr->GetSize()),
+                            static_cast<unsigned long long>(iboPtr->GetChangeSerial()));
+            }
+            return;
+        }
         WGPURenderPassEncoder pass = BeginDrawPass(*programPtr, *vaoPtr, mode, indexFormat);
         if (!pass) {
             return;
         }
-        // `indices` is a byte offset into the bound element array buffer; baseVertex is
-        // added to every index by drawIndexed.
-        const uint64_t byteOffset = reinterpret_cast<uintptr_t>(indices);
         wgpuRenderPassEncoderSetIndexBuffer(pass, indexBuffer, indexFormat, byteOffset, WGPU_WHOLE_SIZE);
         wgpuRenderPassEncoderDrawIndexed(pass, static_cast<Uint32>(count),
                                          static_cast<Uint32>(instanceCount), 0,
@@ -3567,6 +3739,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         for (GLsizei i = 0; i < drawcount; ++i) {
             if (count[i] <= 0) continue;
             const uint64_t byteOffset = reinterpret_cast<uintptr_t>(indices[i]);
+            // Skip a sub-draw that would over-read the element buffer (see DrawElementsInstanced).
+            if (byteOffset + static_cast<uint64_t>(count[i]) * indexSize > iboPtr->GetSize()) {
+                continue;
+            }
             const Uint32 firstIndex = static_cast<Uint32>(byteOffset / indexSize);
             const int32_t bv = basevertex ? static_cast<int32_t>(basevertex[i]) : 0;
             wgpuRenderPassEncoderDrawIndexed(pass, static_cast<Uint32>(count[i]), 1, firstIndex, bv, 0);
