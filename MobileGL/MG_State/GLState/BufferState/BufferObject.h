@@ -145,16 +145,22 @@ namespace MobileGL {
             // Monotonic counter bumped on every shadow mutation; backends use it to
             // validate cached transient slices.
             Uint64 GetChangeSerial() const;
+            // Monotonic per-instance id. GL names and this object's heap address are
+            // recycled after glDeleteBuffers, so a pointer-keyed GPU cache must also
+            // compare this id to detect a recycled slot and rebuild.
+            Uint64 GetLifetimeId() const;
 
             const SharedPtr<BackendBufferResource>& GetBackendResource() const;
             void SetBackendResource(SharedPtr<BackendBufferResource> resource);
 
         private:
+            static Uint64 AllocateLifetimeId();
             void NotifyRespecify();
             void NotifySubData(SizeT offset, SizeT size);
             void NotifyFlushMappedRange(Range1D range, Flags<BufferMappingAccessBit> appAccess);
 
             const Uint m_externalIndex = 0;
+            const Uint64 m_lifetimeId = 0;
             SizeT m_size = 0;
             BufferUsage m_usage = BufferUsage::StaticDraw;
             SharedPtr<Data> m_dataPtr;

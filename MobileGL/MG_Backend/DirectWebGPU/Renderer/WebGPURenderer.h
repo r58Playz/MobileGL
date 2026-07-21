@@ -145,6 +145,11 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             // the pipeline's color-target array and the render pass' color attachments:
             // WebGPU requires a target for exactly the locations the shader writes.
             Vector<Uint32> fragmentOutputs;
+            // ProgramObject::GetLifetimeId() this entry was built for. The cache is keyed
+            // by the raw ProgramObject*, whose heap address GL recycles after
+            // glDeleteProgram; a mismatch means the slot was reused by a new program and
+            // the entry is stale (wrong bindings/pipeline) and must be rebuilt.
+            Uint64 lifetimeId = 0;
             Bool HasResources() const { return !uboBindings.empty() || !resources.empty(); }
         };
 
@@ -178,6 +183,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             // queueWriteTexture re-uploads of a texture recorded draws sample or
             // render into.
             Uint64 lastUseSerial = 0;
+            // ITextureObject::GetLifetimeId() this entry was built for; a mismatch means
+            // the cache slot (keyed by the recycled ITextureObject*) belongs to a new
+            // texture and must be rebuilt.
+            Uint64 lifetimeId = 0;
         };
 
         // GPU copy of a GL buffer; re-uploaded when the buffer's change serial advances
@@ -192,6 +201,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             Uint64 serial = ~Uint64(0);
             Uint64 size = 0;
             Uint64 lastUseSerial = 0;
+            // BufferObject::GetLifetimeId() this entry was built for. The change serial is
+            // per-object and resets for a new object, so a recycled BufferObject* could
+            // otherwise alias a stale GPU buffer with a coincidentally matching serial+size.
+            Uint64 lifetimeId = 0;
         };
 
         void BeginFrameIfNeeded();
@@ -294,6 +307,17 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                                             WGPUIndexFormat stripIndexFormat = WGPUIndexFormat_Undefined,
                                             Int64 vertexAccessEnd = -1);
 
+        // Recycling pool for orphaned dynamic (client-array) vertex/index buffers.
+        // Orphaning a busy re-upload (see GetOrCreateBuffer) keeps every draw's storage
+        // private so batched submits never alias, but creating/destroying a buffer per
+        // draw churns thousands of allocations per frame and Dawn's deferred destruction
+        // balloons native memory. Retired buffers are parked for a few frames (until
+        // their submit is certainly GPU-complete) then reused for a same-size request.
+        WGPUBuffer AcquirePooledBuffer(Uint64 size, WGPUBufferUsage usage);
+        void RetirePooledBuffer(WGPUBuffer buffer, Uint64 size, WGPUBufferUsage usage);
+        void ReclaimPooledBuffers();     // move GPU-idle retired buffers back to the free list
+        void DestroyBufferPool();        // release everything (device teardown)
+
         WGPUInstance m_instance = nullptr;
         WGPUDevice m_device = nullptr;
         WGPUQueue m_queue = nullptr;
@@ -331,6 +355,18 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // interleave with the recorded passes, so a shared buffer would make every pass
         // in a frame read the last-written uniforms). Released at frame end.
         Vector<WGPUBuffer> m_frameUboBuffers;
+
+        // Buffer recycling pool (see AcquirePooledBuffer). Free buckets are keyed by
+        // (usage<<40)^size; every buffer in a bucket has that exact size, so a request
+        // reuses storage directly. Retired buffers wait kBufferPoolFrameDelay frames so
+        // the submit that referenced them is GPU-complete before reuse.
+        struct RetiredPoolBuffer { Uint64 frame; Uint64 key; Uint64 size; WGPUBuffer buffer; };
+        UnorderedMap<Uint64, Vector<WGPUBuffer>> m_bufferPoolFree;
+        Vector<RetiredPoolBuffer> m_bufferPoolPending;
+        Uint64 m_bufferPoolFreeBytes = 0;
+        Uint64 m_frameIndex = 0;
+        static constexpr Uint64 kBufferPoolFrameDelay = 3;
+        static constexpr Uint64 kBufferPoolMaxFreeBytes = 128ull * 1024 * 1024;
 
         // Persistent offscreen color target: all rendering goes here, then Present
         // copies it to the acquired swapchain texture. ReadPixels copies from it.
@@ -372,6 +408,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             WGPUTextureView view = nullptr;
             Uint32 width = 0;
             Uint32 height = 0;
+            // FramebufferObject::GetLifetimeId() this transient depth was built for; a
+            // mismatch means the FBO slot (keyed by the recycled FramebufferObject*) is a
+            // new framebuffer and the cached depth must be rebuilt.
+            Uint64 lifetimeId = 0;
         };
         UnorderedMap<const MG_State::GLState::FramebufferObject*, FboDepth> m_fboDepthCache;
         // Guards against reentrant readback while a JSPI suspension is in flight.

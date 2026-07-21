@@ -160,7 +160,11 @@ draw state, shaders, attachments, or frontend translation are wrong.
   ```
 
 - Force X11/XWayland. The current bridge does not implement a native Wayland
-  window-system path; `launch.sh` clears `WAYLAND_DISPLAY` for this reason.
+  window-system path; `launch.sh` **unsets** `WAYLAND_DISPLAY` for this reason.
+  It must be unset (`env -u`), not emptied: GLFW 3.4 (system GLFW used by
+  lwjgl3ify/GTNH) picks the Wayland backend whenever `WAYLAND_DISPLAY` is present
+  even when empty, then fails with "Wayland: Failed to connect to display" rather
+  than falling back to X11.
 - If SDL is involved, verify `SDL_OPENGL_LIBRARY`, `SDL_EGL_LIBRARY`, and
   `SDL_VIDEO_FORCE_EGL` in the launcher trace.
 

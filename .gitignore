@@ -30,3 +30,9 @@ tools/tint/out/
 /build-web
 /build-dawn
 /build-vulkan
+
+# Locally-fetched Dawn checkout for native builds (FetchDawnNative.cmake)
+/3rdparty/dawn
+
+/logs
+/captures

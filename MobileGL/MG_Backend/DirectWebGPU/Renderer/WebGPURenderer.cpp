@@ -473,6 +473,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
 
     void WebGPURenderer::Shutdown() {
         EndFrame();
+        DestroyBufferPool();
         for (auto& [k, b] : m_vertexBufferCache) { if (b.buffer) wgpuBufferRelease(b.buffer); }
         m_vertexBufferCache.clear();
         for (auto& [k, b] : m_repackedVertexBufferCache) { if (b.buffer) wgpuBufferRelease(b.buffer); }
@@ -589,7 +590,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                                                         Uint32 w, Uint32 h) {
         auto it = m_fboDepthCache.find(&fbo);
         if (it != m_fboDepthCache.end()) {
-            if (it->second.width == w && it->second.height == h) {
+            if (it->second.width == w && it->second.height == h &&
+                it->second.lifetimeId == fbo.GetLifetimeId()) {
                 return it->second.view;
             }
             if (it->second.view) wgpuTextureViewRelease(it->second.view);
@@ -608,6 +610,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         fd.view = fd.texture ? wgpuTextureCreateView(fd.texture, nullptr) : nullptr;
         fd.width = w;
         fd.height = h;
+        fd.lifetimeId = fbo.GetLifetimeId();
         auto [ins, ok] = m_fboDepthCache.emplace(&fbo, fd);
         return ins->second.view;
     }
@@ -907,6 +910,79 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (m_frameTexture) { wgpuTextureRelease(m_frameTexture); m_frameTexture = nullptr; }
         if (m_encoder) { wgpuCommandEncoderRelease(m_encoder); m_encoder = nullptr; }
         m_frameActive = false;
+        // Advance the frame clock and recycle buffers whose submits are now GPU-complete.
+        ++m_frameIndex;
+        ReclaimPooledBuffers();
+    }
+
+    // Hand out a buffer of exactly `size` with `usage`, reusing a parked one when
+    // available. Same-size requests (e.g. every cube icon, or a chunk mesh redrawn each
+    // frame) hit the free list, so steady-state allocation is near zero.
+    WGPUBuffer WebGPURenderer::AcquirePooledBuffer(Uint64 size, WGPUBufferUsage usage) {
+        const Uint64 key = (static_cast<Uint64>(usage) << 40) ^ size;
+        auto it = m_bufferPoolFree.find(key);
+        if (it != m_bufferPoolFree.end() && !it->second.empty()) {
+            WGPUBuffer b = it->second.back();
+            it->second.pop_back();
+            m_bufferPoolFreeBytes -= std::min<Uint64>(m_bufferPoolFreeBytes, size);
+            return b;
+        }
+        WGPUBufferDescriptor bd{};
+        bd.usage = usage;
+        bd.size = size;
+        return wgpuDeviceCreateBuffer(m_device, &bd);
+    }
+
+    // Park a buffer for reuse. It may still be referenced by an unsubmitted/in-flight
+    // draw, so it is not reusable until kBufferPoolFrameDelay frames pass (its submit is
+    // GPU-complete by then); ReclaimPooledBuffers moves it to the free list.
+    void WebGPURenderer::RetirePooledBuffer(WGPUBuffer buffer, Uint64 size, WGPUBufferUsage usage) {
+        if (!buffer) return;
+        const Uint64 key = (static_cast<Uint64>(usage) << 40) ^ size;
+        m_bufferPoolPending.push_back(RetiredPoolBuffer{m_frameIndex, key, size, buffer});
+    }
+
+    void WebGPURenderer::ReclaimPooledBuffers() {
+        const Uint64 safeBefore =
+            (m_frameIndex >= kBufferPoolFrameDelay) ? m_frameIndex - kBufferPoolFrameDelay : 0;
+        SizeT keep = 0;
+        for (SizeT i = 0; i < m_bufferPoolPending.size(); ++i) {
+            RetiredPoolBuffer& r = m_bufferPoolPending[i];
+            if (r.frame <= safeBefore) {
+                m_bufferPoolFree[r.key].push_back(r.buffer);
+                m_bufferPoolFreeBytes += r.size;
+            } else {
+                m_bufferPoolPending[keep++] = r;
+            }
+        }
+        m_bufferPoolPending.resize(keep);
+        // Cap the idle pool so a burst of odd sizes (e.g. chunk remeshes) can't grow it
+        // without bound; release excess buffers back to Dawn.
+        if (m_bufferPoolFreeBytes > kBufferPoolMaxFreeBytes) {
+            for (auto& [key, list] : m_bufferPoolFree) {
+                const Uint64 sz = key & ((1ull << 40) - 1);
+                while (!list.empty() && m_bufferPoolFreeBytes > kBufferPoolMaxFreeBytes) {
+                    wgpuBufferRelease(list.back());
+                    list.pop_back();
+                    m_bufferPoolFreeBytes -= std::min<Uint64>(m_bufferPoolFreeBytes, sz);
+                }
+                if (m_bufferPoolFreeBytes <= kBufferPoolMaxFreeBytes) break;
+            }
+        }
+    }
+
+    void WebGPURenderer::DestroyBufferPool() {
+        for (auto& [key, list] : m_bufferPoolFree) {
+            for (WGPUBuffer b : list) {
+                if (b) wgpuBufferRelease(b);
+            }
+        }
+        m_bufferPoolFree.clear();
+        for (RetiredPoolBuffer& r : m_bufferPoolPending) {
+            if (r.buffer) wgpuBufferRelease(r.buffer);
+        }
+        m_bufferPoolPending.clear();
+        m_bufferPoolFreeBytes = 0;
     }
 
     void WebGPURenderer::Clear(GLbitfield mask) {
@@ -1691,7 +1767,17 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     const WebGPURenderer::WgpuProgram*
     WebGPURenderer::GetOrCreateProgram(MG_State::GLState::ProgramObject& program) {
         if (auto it = m_programCache.find(&program); it != m_programCache.end()) {
-            return &it->second;
+            if (it->second.lifetimeId == program.GetLifetimeId()) {
+                return &it->second;
+            }
+            // The ProgramObject* was recycled: the old program at this address was
+            // deleted (glDeleteProgram) and a new one allocated in the same slot. The
+            // cached entry holds the OLD program's WGSL modules and binding layout, so
+            // returning it would build the new program's bind group against the wrong
+            // bindings. Drop it and fall through to rebuild for the current program.
+            if (it->second.vertex) wgpuShaderModuleRelease(it->second.vertex);
+            if (it->second.fragment) wgpuShaderModuleRelease(it->second.fragment);
+            m_programCache.erase(it);
         }
         // SPIR-V is produced at link time, one blob per attached shader (parallel
         // to GetAttachedShaders). Transpile each stage to WGSL via tint.
@@ -1826,6 +1912,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             if (prog.fragment) wgpuShaderModuleRelease(prog.fragment);
             return nullptr;
         }
+        prog.lifetimeId = program.GetLifetimeId();
         auto [ins, ok] = m_programCache.emplace(&program, prog);
         return &ins->second;
     }
@@ -1842,6 +1929,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             }
         };
         mix(static_cast<Uint64>(reinterpret_cast<SizeT>(&program)));
+        // The pointer alone collides when a deleted program's address is reused; the
+        // per-instance lifetime id disambiguates so a recycled slot can't hit a stale
+        // pipeline built for the old program.
+        mix(program.GetLifetimeId());
         mix(static_cast<Uint64>(mode));
         mix(static_cast<Uint64>(stripIndexFormat));
         // Vertex layout (per enabled attribute: index, format, stride, instance divisor>0).
@@ -2353,6 +2444,14 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         const auto& data = buffer.GetDataReadOnly();
         const Uint64 allocSize = (static_cast<Uint64>(size) + 3u) & ~Uint64(3); // 4-byte aligned
         auto it = cache.find(&buffer);
+        if (it != cache.end() && it->second.lifetimeId != buffer.GetLifetimeId()) {
+            // The BufferObject* was recycled (old buffer deleted, address reused). The
+            // change serial is per-object and resets, so a fresh buffer could otherwise
+            // alias this stale GPU buffer on a coincidentally matching serial+size. Drop it.
+            RetirePooledBuffer(it->second.buffer, it->second.size, usage | WGPUBufferUsage_CopyDst);
+            cache.erase(it);
+            it = cache.end();
+        }
         if (it != cache.end()) {
             WgpuBuffer& cb = it->second;
             // A cached GPU buffer of a different size is never up to date, even if the change
@@ -2377,12 +2476,34 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                 }
             }
             if (cb.buffer && cb.size == allocSize && data) {
-                // Same size, new contents -> re-upload in place. queueWriteBuffer
-                // executes at submit time (before the whole pending command buffer),
-                // so if a recorded-but-unsubmitted draw uses this buffer, submit it
-                // first — else that draw would read the NEW contents. (Callers must
-                // therefore resolve buffers before opening a render pass.)
+                // Same size, new contents. queueWriteBuffer executes at submit time,
+                // *before* the whole pending command buffer runs, so overwriting a
+                // buffer that a recorded-but-unsubmitted draw still references would
+                // corrupt it: every pending draw sharing this buffer would sample the
+                // LAST contents written this submit. That is the creative-inventory
+                // "icons shift by one" bug — a run of same-size glBufferData draws on
+                // one shared client-array VBO all reading the final upload.
+                //
+                // When the buffer is busy (already used by the open encoder this
+                // submit), orphan it instead of overwriting: hand this draw fresh
+                // storage and let the pending draw keep the old buffer, retired once
+                // the next submit has consumed it. This mirrors DirectVulkan's
+                // conditional orphan (VkBufferManager::OnRespecify) and is more robust
+                // than a per-draw FlushFrame(), which serialises every draw into its
+                // own submit and still depends on exact queueWriteBuffer/submit order.
                 if (cb.lastUseSerial == m_flushSerial) {
+                    if (WGPUBuffer fresh = AcquirePooledBuffer(allocSize, usage | WGPUBufferUsage_CopyDst)) {
+                        WriteBufferPadded(m_queue, fresh, data->data(), size);
+                        // Park the old buffer: the pending draw keeps reading it until its
+                        // submit is GPU-complete, then it is recycled (RetirePooledBuffer).
+                        RetirePooledBuffer(cb.buffer, cb.size, usage | WGPUBufferUsage_CopyDst);
+                        cb.buffer = fresh;
+                        cb.serial = serial;
+                        cb.lastUseSerial = m_flushSerial;
+                        return fresh;
+                    }
+                    // Pool/allocation failed: fall back to submitting the pending draw
+                    // before overwriting in place.
                     FlushFrame();
                 }
                 WriteBufferPadded(m_queue, cb.buffer, data->data(), size);
@@ -2390,21 +2511,20 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                 cb.lastUseSerial = m_flushSerial;
                 return cb.buffer;
             }
-            if (cb.buffer) wgpuBufferRelease(cb.buffer);
+            // Recreating (size changed): park the old buffer for recycling; the pool's
+            // frame delay keeps it alive past any pending draw that still references it.
+            RetirePooledBuffer(cb.buffer, cb.size, usage | WGPUBufferUsage_CopyDst);
             cache.erase(it);
         }
         if (size == 0 || !data) {
             return nullptr;
         }
-        WGPUBufferDescriptor bd{};
-        bd.usage = usage | WGPUBufferUsage_CopyDst;
-        bd.size = allocSize;
-        WGPUBuffer buf = wgpuDeviceCreateBuffer(m_device, &bd);
+        WGPUBuffer buf = AcquirePooledBuffer(allocSize, usage | WGPUBufferUsage_CopyDst);
         if (!buf) {
             return nullptr;
         }
         WriteBufferPadded(m_queue, buf, data->data(), size);
-        cache.emplace(&buffer, WgpuBuffer{buf, serial, allocSize, m_flushSerial});
+        cache.emplace(&buffer, WgpuBuffer{buf, serial, allocSize, m_flushSerial, buffer.GetLifetimeId()});
         return buf;
     }
 
@@ -2451,9 +2571,20 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                 return cb.buffer; // up to date
             }
             if (cb.buffer && cb.size == newSize) {
-                // Same size, new contents -> re-upload. queueWriteBuffer lands at submit
-                // time, so submit any recorded draws still using it first (see WgpuBuffer).
+                // Same size, new contents. queueWriteBuffer lands at submit time, so
+                // overwriting a buffer a pending draw still uses would corrupt it.
+                // Orphan (from the recycling pool) when busy (see GetOrCreateBuffer).
                 if (cb.lastUseSerial == m_flushSerial) {
+                    if (WGPUBuffer fresh = AcquirePooledBuffer(
+                            newSize, WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst)) {
+                        build(fresh);
+                        RetirePooledBuffer(cb.buffer, cb.size,
+                                           WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst);
+                        cb.buffer = fresh;
+                        cb.serial = serial;
+                        cb.lastUseSerial = m_flushSerial;
+                        return fresh;
+                    }
                     FlushFrame();
                 }
                 build(cb.buffer);
@@ -2461,13 +2592,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                 cb.lastUseSerial = m_flushSerial;
                 return cb.buffer;
             }
-            if (cb.buffer) wgpuBufferRelease(cb.buffer);
+            RetirePooledBuffer(cb.buffer, cb.size, WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst);
             m_repackedVertexBufferCache.erase(it);
         }
-        WGPUBufferDescriptor bd{};
-        bd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
-        bd.size = newSize;
-        WGPUBuffer buf = wgpuDeviceCreateBuffer(m_device, &bd);
+        WGPUBuffer buf = AcquirePooledBuffer(newSize, WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst);
         if (!buf) {
             return nullptr;
         }
@@ -2535,7 +2663,19 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                 return cb.buffer;
             }
             if (cb.buffer && cb.size == newSize) {
+                // Orphan (from the recycling pool) when busy instead of flushing per
+                // draw (see GetOrCreateBuffer for the full rationale).
                 if (cb.lastUseSerial == m_flushSerial) {
+                    if (WGPUBuffer fresh = AcquirePooledBuffer(
+                            newSize, WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst)) {
+                        build(fresh);
+                        RetirePooledBuffer(cb.buffer, cb.size,
+                                           WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst);
+                        cb.buffer = fresh;
+                        cb.serial = serial;
+                        cb.lastUseSerial = m_flushSerial;
+                        return fresh;
+                    }
                     FlushFrame();
                 }
                 build(cb.buffer);
@@ -2543,13 +2683,10 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                 cb.lastUseSerial = m_flushSerial;
                 return cb.buffer;
             }
-            if (cb.buffer) wgpuBufferRelease(cb.buffer);
+            RetirePooledBuffer(cb.buffer, cb.size, WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst);
             m_repackedVertexBufferCache.erase(it);
         }
-        WGPUBufferDescriptor bd{};
-        bd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
-        bd.size = newSize;
-        WGPUBuffer buf = wgpuDeviceCreateBuffer(m_device, &bd);
+        WGPUBuffer buf = AcquirePooledBuffer(newSize, WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst);
         if (!buf) {
             return nullptr;
         }
@@ -2648,12 +2785,21 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             const Bool viewDirty = cached.textureParamsVersion != textureParamsVersion ||
                                    cached.viewBaseMipLevel != baseMipLevel ||
                                    cached.viewMipLevelCount != viewMipLevelCount;
-            if (!dirty && !viewDirty) {
+            // A size/format/mip/swizzle change forces a recreate. This must be checked
+            // independently of `dirty`: glTexImage2D on a render-target texture (NULL
+            // pixels, e.g. the GUI sprite atlas) resizes the GL storage but marks no
+            // level dirty (there is no CPU data to upload), so the old-sized WGPU texture
+            // would otherwise be reused forever and later draws/samples would hit the
+            // stale dimensions.
+            const Bool needsRecreate = cached.width != w || cached.height != h ||
+                                       cached.format != fmt || cached.mipLevelCount != mipLevelCount ||
+                                       cached.swizzleKey != swizzleKey ||
+                                       cached.lifetimeId != texture.GetLifetimeId();
+            if (!dirty && !viewDirty && !needsRecreate) {
                 cached.lastUseSerial = m_flushSerial;
                 return &cached; // up to date
             }
-            if (cached.width != w || cached.height != h || cached.format != fmt ||
-                cached.mipLevelCount != mipLevelCount || cached.swizzleKey != swizzleKey) {
+            if (needsRecreate) {
                 if (cached.attachmentSrgbView) wgpuTextureViewRelease(cached.attachmentSrgbView);
                 if (cached.attachmentView) wgpuTextureViewRelease(cached.attachmentView);
                 if (cached.view) wgpuTextureViewRelease(cached.view);
@@ -2753,6 +2899,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         wt.swizzleKey = swizzleKey;
         wt.format = fmt;
         wt.lastUseSerial = m_flushSerial;
+        wt.lifetimeId = texture.GetLifetimeId();
         auto [ins, ok] = m_textureCache.emplace(&texture, wt);
         return &ins->second;
     }
@@ -2814,7 +2961,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         if (it != m_textureCache.end()) {
             WgpuTexture& cached = it->second;
             if (cached.width != w || cached.height != h || cached.format != fmt ||
-                cached.mipLevelCount != mipLevelCount) {
+                cached.mipLevelCount != mipLevelCount || cached.lifetimeId != texture.GetLifetimeId()) {
                 if (cached.view) wgpuTextureViewRelease(cached.view);
                 if (cached.texture) wgpuTextureRelease(cached.texture);
                 m_textureCache.erase(it);
@@ -2871,6 +3018,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         wt.swizzleKey = kNoSwizzle;
         wt.format = fmt;
         wt.lastUseSerial = m_flushSerial;
+        wt.lifetimeId = texture.GetLifetimeId();
         auto [ins, ok] = m_textureCache.emplace(&texture, wt);
         return &ins->second;
     }
@@ -2889,7 +3037,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         auto it = m_textureCache.find(&texture);
         if (it != m_textureCache.end()) {
             WgpuTexture& c = it->second;
-            if (c.isDepth && c.width == w && c.height == h && c.format == depthFmt) {
+            if (c.isDepth && c.width == w && c.height == h && c.format == depthFmt &&
+                c.lifetimeId == texture.GetLifetimeId()) {
                 c.lastUseSerial = m_flushSerial;
                 return &c; // depth targets carry no CPU data to re-upload
             }
@@ -2935,6 +3084,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         wt.format = depthFmt;
         wt.isDepth = true;
         wt.lastUseSerial = m_flushSerial;
+        wt.lifetimeId = texture.GetLifetimeId();
         auto [ins, ok] = m_textureCache.emplace(&texture, wt);
         return &ins->second;
     }
@@ -3227,6 +3377,18 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
                                                         GLenum mode, WGPUIndexFormat stripIndexFormat,
                                                         Int64 vertexAccessEnd) {
         auto* gl = MG_State::pGLContext.get();
+        // Bound the per-frame retired-buffer backlog. Orphaning dynamic client-array
+        // buffers (see GetOrCreateBuffer) keeps each draw self-contained but hands every
+        // busy re-upload fresh storage, and the retired buffers + per-draw UBOs are only
+        // released on the next submit. Without periodic submits they accumulate for the
+        // whole frame (thousands of chunk draws re-upload the shared SFPEW VBO), and
+        // Dawn's deferred destruction balloons native memory. A flush here is safe now
+        // that draws never share mutated storage, so submit once the backlog is large to
+        // let Dawn reclaim; the next draw simply re-uploads in place (not busy).
+        constexpr SizeT kRetireFlushThreshold = 64;
+        if (m_frameActive && m_frameUboBuffers.size() >= kRetireFlushThreshold) {
+            FlushFrame();
+        }
         // Both states mean "produce no rasterized fragments". WebGPU has no pipeline
         // rasterizer-discard switch and no FrontAndBack cull mode, so skipping the draw
         // is the exact observable result (transform feedback is not implemented here).

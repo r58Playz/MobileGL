@@ -21,8 +21,14 @@ namespace MobileGL::MG_State::GLState {
         return g_bufferBackendOps;
     }
 
+    Uint64 BufferObject::AllocateLifetimeId() {
+        static std::atomic<Uint64> s_next{1};
+        return s_next.fetch_add(1, std::memory_order_relaxed);
+    }
+
     BufferObject::BufferObject(Uint externalIndex)
-        : m_externalIndex(externalIndex), m_size(0), m_usage(BufferUsage::StaticDraw), m_isMapped(false),
+        : m_externalIndex(externalIndex), m_lifetimeId(AllocateLifetimeId()), m_size(0),
+          m_usage(BufferUsage::StaticDraw), m_isMapped(false),
           m_mappingAccess(BufferMappingAccessBit::Null), m_mappedRange({0, 0}), m_dataPtr(MakeShared<Data>()),
           m_ownsStagingData{} {}
 
@@ -251,6 +257,10 @@ namespace MobileGL::MG_State::GLState {
 
     BufferUsage BufferObject::GetUsage() const {
         return m_usage;
+    }
+
+    Uint64 BufferObject::GetLifetimeId() const {
+        return m_lifetimeId;
     }
 
     Uint64 BufferObject::GetChangeSerial() const {

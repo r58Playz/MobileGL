@@ -104,6 +104,11 @@ namespace {
 }
 
 namespace MobileGL::MG_State::GLState {
+    Uint64 ProgramObject::AllocateLifetimeId() {
+        static std::atomic<Uint64> s_next{1};
+        return s_next.fetch_add(1, std::memory_order_relaxed);
+    }
+
     void ProgramObject::ResetLinkArtifacts() {
         m_program.reset();
         m_generatedSpirv.clear();

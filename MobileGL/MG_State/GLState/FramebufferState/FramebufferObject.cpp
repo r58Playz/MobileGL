@@ -96,6 +96,11 @@ namespace MobileGL::MG_State::GLState {
     }
 
     // FramebufferObject
+    Uint64 FramebufferObject::AllocateLifetimeId() {
+        static std::atomic<Uint64> s_next{1};
+        return s_next.fetch_add(1, std::memory_order_relaxed);
+    }
+
     FramebufferObject::FramebufferObject(Uint externalIndex)
         : m_externalIndex(externalIndex), m_attachmentVersions{}, m_drawBuffers{} {
         m_attachmentObjects.fill(FramebufferAttachmentObject(false));

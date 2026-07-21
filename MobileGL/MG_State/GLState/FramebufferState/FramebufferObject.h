@@ -137,11 +137,17 @@ namespace MobileGL {
 
             Uint GetExternalIndex() const;
             Bool IsDefaultFramebuffer() const { return m_externalIndex == 0; }
+            // Monotonic per-instance id. GL names and this object's heap address are
+            // recycled after glDeleteFramebuffers, so a pointer-keyed GPU cache must
+            // also compare this id to detect a recycled slot and rebuild.
+            Uint64 GetLifetimeId() const { return m_lifetimeId; }
 
         private:
+            static Uint64 AllocateLifetimeId();
             void BumpAttachmentVersion(FramebufferAttachmentType type);
 
             const Uint m_externalIndex = 0;
+            const Uint64 m_lifetimeId = AllocateLifetimeId();
             FramebufferAttachmentObjectArray m_attachmentObjects;
             FramebufferAttachmentVersionArray m_attachmentVersions;
 

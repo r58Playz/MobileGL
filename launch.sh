@@ -23,4 +23,10 @@ launcher_args=(
 if [[ "$frontend" == "sfpew" ]]; then
     launcher_args+=(--sfpew "$sfpew_library")
 fi
-WAYLAND_DISPLAY= python3 tools/native_harness/launch_prism.py "${launcher_args[@]}" -- "$@"
+# Force the GL clients onto X11: the GLX bridge only implements the X11/GLX path.
+# WAYLAND_DISPLAY must be UNSET, not merely emptied — GLFW 3.4 (used by
+# lwjgl3ify/GTNH via -Dorg.lwjgl.glfw.libname=/usr/lib/libglfw.so) selects the
+# Wayland backend whenever the variable is *present* (even empty), then aborts with
+# "Wayland: Failed to connect to display" instead of falling back to X11. SDL
+# tolerates the empty value, which is why only the GLFW clients broke.
+env -u WAYLAND_DISPLAY python3 tools/native_harness/launch_prism.py "${launcher_args[@]}" -- "$@"
