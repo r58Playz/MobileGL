@@ -16,8 +16,10 @@ void PrintUsage(const char *argv0) {
             << "  --golden PATH             Golden PNG to compare against\n"
             << "  --alternate-golden PATH   Additional acceptable golden PNG\n"
             << "  --diff PATH               Difference PNG output path\n"
-            << "  --backend NAME            DirectGLES or DirectVulkan (default: DirectGLES)\n"
+            << "  --backend NAME            DirectGLES, DirectVulkan, or DirectWebGPU (default: DirectGLES)\n"
             << "  --mobilegl-library PATH   libMobileGL.so path (default: libMobileGL.so)\n"
+            << "  --frontend core|sfpew    GL frontend (default: core)\n"
+            << "  --sfpew-library PATH     SFPEW library used by the legacy frontend\n"
             << "  --width N                 Replay surface width override\n"
             << "  --height N                Replay surface height override\n"
             << "  --window-surface          Replay to a native window surface\n"
@@ -89,6 +91,10 @@ bool ParseArgs(int argc, char **argv, mobilegl_trace::Request &request) {
             if (!ReadValue(argc, argv, i, request.backend)) return false;
         } else if (arg == "--mobilegl-library") {
             if (!ReadValue(argc, argv, i, request.mobileGlLibrary)) return false;
+        } else if (arg == "--frontend") {
+            if (!ReadValue(argc, argv, i, request.frontend)) return false;
+        } else if (arg == "--sfpew-library") {
+            if (!ReadValue(argc, argv, i, request.sfpewLibrary)) return false;
         } else if (arg == "--target-frame") {
             if (!ReadInt(argc, argv, i, request.targetFrame)) return false;
         } else if (arg == "--target-call") {
@@ -131,6 +137,10 @@ bool ParseArgs(int argc, char **argv, mobilegl_trace::Request &request) {
     }
     if (request.targetCall < 0) {
         std::cerr << "--target-call is required\n";
+        return false;
+    }
+    if (request.frontend != "core" && request.frontend != "sfpew") {
+        std::cerr << "--frontend must be core or sfpew\n";
         return false;
     }
     if (request.holdMs < 0) {

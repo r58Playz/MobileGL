@@ -35,6 +35,7 @@ namespace MobileGL {
                 // Display
                 EGLDisplayHandle GetDisplay(NativeDisplayType nativeDisplay);
                 EGLDisplayHandle GetPlatformDisplay(EGLenum platform, void* nativeDisplay);
+                Uint64 GetNativeDisplayKey(EGLDisplayHandle display) const;
                 Bool ValidateDisplay(EGLDisplayHandle display) const;
                 Bool IsDisplayInitialized(EGLDisplayHandle display) const;
                 Bool InitializeDisplay(EGLDisplayHandle display, EGLint* major, EGLint* minor);

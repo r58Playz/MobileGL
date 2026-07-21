@@ -7,6 +7,8 @@ option(MOBILEGL_BUILD_BENCHMARK   "Build MobileGL benchmarks"                   
 option(MOBILEGL_FORCE_RELEASE_OPT "Enable Release optimization flags in Debug build" ON )
 option(MOBILEGL_ENABLE_TRACY      "Enable tracy for profiling"                       OFF)
 option(MOBILEGL_BUILD_TRACE_REPLAY "Build desktop apitrace replay runner"            OFF)
+option(MOBILEGL_NATIVE_WEBGPU     "Build DirectWebGPU against native Dawn (Linux)"   OFF)
+option(MOBILEGL_BUILD_NATIVE_HARNESS "Build the Linux GLX launcher bridge"           OFF)
 option(MOBILEGL_IOS               "Build MobileGL for iOS instead of macOS when APPLE is set" OFF)
 # Emscripten GL-translation-backend adapter for the patched pongasoft emscripten-glfw
 # (exports mobilegl_webgl_* / mobilegl_get_proc_address over MobileGL's EGL/WebGPU flow).
@@ -16,6 +18,10 @@ option(MOBILEGL_EMSCRIPTEN_GLFW   "Build the emscripten-glfw GL-backend adapter"
 option(MOBILEGL_EMSCRIPTEN_GLFW_FPE "Enable SimpleFPEWrapper fixed-function front layer" OFF)
 set(MOBILEGL_LOG_ACTIVE_LEVEL "MOBILEGL_LOG_LEVEL_INFO" CACHE STRING "MobileGL active log level macro")
 set(MOBILEGL_VULKAN_LIBRARY "" CACHE FILEPATH "Vulkan loader/MoltenVK library to link for iOS builds")
+
+if(MOBILEGL_NATIVE_WEBGPU AND (EMSCRIPTEN OR NOT UNIX OR APPLE OR ANDROID))
+    message(FATAL_ERROR "MOBILEGL_NATIVE_WEBGPU currently supports desktop Linux only")
+endif()
 
 if (ANDROID)
     set(MOBILEGL_BUILD_TEST       OFF CACHE BOOL "Build MobileGL tests"      FORCE)
@@ -125,10 +131,18 @@ set(SPIRV_REFLECT_ENABLE_ASSERTS OFF CACHE BOOL  "Enable asserts for debugging" 
 set(SPIRV_REFLECT_ENABLE_ASAN    OFF CACHE BOOL "Use address sanitization" FORCE)
 set(SPIRV_REFLECT_INSTALL        OFF CACHE BOOL "Whether to install" FORCE)
 
+# Native Dawn and Tint must register their pinned SPIRV-Tools targets before
+# glslang. Otherwise both dependency trees expose the same CMake target names,
+# Tint sees MobileGL's generated include directory, and its generated grammar
+# headers are missing at compile time.
+if(MOBILEGL_NATIVE_WEBGPU)
+    include(${CMAKE_SOURCE_DIR}/cmake/FetchDawnNative.cmake)
+endif()
+
 # add_subdirectory(3rdparty/DiligentCore)
 add_subdirectory(3rdparty/glslang)
 add_subdirectory(3rdparty/SPIRV-Cross)
-if (NOT EMSCRIPTEN)
+if (NOT EMSCRIPTEN AND NOT MOBILEGL_NATIVE_WEBGPU)
     add_subdirectory(3rdparty/VulkanMemoryAllocator)
     add_subdirectory(3rdparty/Vulkan-Headers)
     add_subdirectory(3rdparty/Vulkan-Utility-Libraries)
@@ -313,7 +327,7 @@ if (APPLE AND NOT MOBILEGL_IOS)
     )
 endif()
 
-if (EMSCRIPTEN)
+if (EMSCRIPTEN OR MOBILEGL_NATIVE_WEBGPU)
     # Emscripten/WebGPU build: drop the Vulkan + GLES backends and their loaders /
     # Vulkan enum converters, and add the DirectWebGPU backend plus the vendored
     # emdawnwebgpu C++ glue (webgpu.cpp).
@@ -349,9 +363,13 @@ if (EMSCRIPTEN)
         MobileGL/MG_Backend/DirectWebGPU/BackendObject_DirectWebGPU.cpp
         MobileGL/MG_Backend/DirectWebGPU/DirectWebGPU.cpp
         MobileGL/MG_Backend/DirectWebGPU/Renderer/WebGPURenderer.cpp
+        MobileGL/MG_Backend/DirectWebGPU/Renderer/WebGPUPlatformEmscripten.cpp
+        MobileGL/MG_Backend/DirectWebGPU/Renderer/WebGPUPlatformDawn.cpp
         MobileGL/MG_Util/ShaderTranspiler/WgslTranspiler.cpp
-        ${EMDAWNWEBGPU_WEBGPU_CPP}
     )
+    if(EMSCRIPTEN)
+        list(APPEND SOURCE_FILES ${EMDAWNWEBGPU_WEBGPU_CPP})
+    endif()
 
     # emscripten-glfw GL-backend adapter (mobilegl_webgl_* / mobilegl_get_proc_address).
     # Defines are scoped to the adapter TU so toggling the option doesn't recompile the archive.
@@ -371,8 +389,11 @@ if (EMSCRIPTEN)
     set_source_files_properties(MobileGL/MG_Util/ShaderTranspiler/WgslTranspiler.cpp
         PROPERTIES
         COMPILE_OPTIONS "-std=c++20;-fno-rtti;-fno-exceptions"
-        INCLUDE_DIRECTORIES "${MOBILEGL_TINT_DIR}/include"
         COMPILE_DEFINITIONS "TINT_BUILD_SPV_READER=1;TINT_BUILD_WGSL_READER=1;TINT_BUILD_WGSL_WRITER=1;TINT_BUILD_SPV_WRITER=0;TINT_BUILD_GLSL_WRITER=0;TINT_BUILD_HLSL_WRITER=0;TINT_BUILD_MSL_WRITER=0;TINT_BUILD_IR_BINARY=0;TINT_BUILD_IS_LINUX=1;TINT_BUILD_IS_MAC=0;TINT_BUILD_IS_WIN=0")
+    if(EMSCRIPTEN)
+        set_property(SOURCE MobileGL/MG_Util/ShaderTranspiler/WgslTranspiler.cpp APPEND PROPERTY
+            INCLUDE_DIRECTORIES "${MOBILEGL_TINT_DIR}/include")
+    endif()
 endif()
 
 set(MOBILEGL_LINK_LIBRARIES
@@ -383,13 +404,17 @@ set(MOBILEGL_LINK_LIBRARIES
         xxHash::xxhash
         spirv-reflect-static
 )
-if (NOT EMSCRIPTEN)
+if (NOT EMSCRIPTEN AND NOT MOBILEGL_NATIVE_WEBGPU)
     list(APPEND MOBILEGL_LINK_LIBRARIES
         GPUOpen::VulkanMemoryAllocator
         Vulkan::UtilityHeaders
     )
 else()
-    list(APPEND MOBILEGL_LINK_LIBRARIES mobilegl_tint)
+    if(EMSCRIPTEN)
+        list(APPEND MOBILEGL_LINK_LIBRARIES mobilegl_tint)
+    else()
+        list(APPEND MOBILEGL_LINK_LIBRARIES dawn::webgpu_dawn tint_api)
+    endif()
 endif()
 
 set(MOBILEGL_COMPILE_DEF
@@ -412,6 +437,8 @@ if (EMSCRIPTEN)
     # Fetched emdawnwebgpu headers. Placed first so the new standardized
     # <webgpu/webgpu.h> wins over Emscripten's built-in legacy copy in the sysroot.
     list(PREPEND MOBILEGL_INCLUDE_DIR ${EMDAWNWEBGPU_INCLUDE_DIRS})
+elseif(MOBILEGL_NATIVE_WEBGPU)
+    list(PREPEND MOBILEGL_INCLUDE_DIR "${dawn_SOURCE_DIR}/include")
 endif()
 
 if (EMSCRIPTEN)
@@ -455,6 +482,9 @@ target_compile_definitions(${CMAKE_PROJECT_NAME}
         ${MOBILEGL_COMPILE_DEF}
         MOBILEGL_LOG_ACTIVE_LEVEL=${MOBILEGL_LOG_ACTIVE_LEVEL}
 )
+if(MOBILEGL_NATIVE_WEBGPU)
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PUBLIC MOBILEGL_NATIVE_WEBGPU=1)
+endif()
 
 if(UNIX AND NOT APPLE AND NOT ANDROID AND NOT EMSCRIPTEN)
     foreach(MOBILEGL_LOADER_ALIAS
@@ -501,6 +531,9 @@ if(NOT ANDROID AND NOT EMSCRIPTEN)
             ${MOBILEGL_COMPILE_DEF}
             MOBILEGL_LOG_ACTIVE_LEVEL=${MOBILEGL_LOG_ACTIVE_LEVEL}
     )
+    if(MOBILEGL_NATIVE_WEBGPU)
+        target_compile_definitions(${CMAKE_PROJECT_NAME}_s PUBLIC MOBILEGL_NATIVE_WEBGPU=1)
+    endif()
 endif()
 
 if (TRACY_ENABLE)
@@ -559,7 +592,7 @@ if (APPLE AND MOBILEGL_IOS)
     endif()
 endif()
 
-if (NOT ANDROID AND NOT MOBILEGL_IOS AND NOT EMSCRIPTEN)
+if (NOT ANDROID AND NOT MOBILEGL_IOS AND NOT EMSCRIPTEN AND NOT MOBILEGL_NATIVE_WEBGPU)
     find_package(Vulkan)
     if (Vulkan_FOUND)
         target_link_libraries(${CMAKE_PROJECT_NAME} PUBLIC Vulkan::Vulkan Vulkan::Headers)
@@ -582,6 +615,13 @@ if (NOT ANDROID)
         enable_testing()
         add_subdirectory(tools/trace_replay)
     endif()
+endif()
+
+if(MOBILEGL_BUILD_NATIVE_HARNESS)
+    if(NOT UNIX OR APPLE)
+        message(FATAL_ERROR "The native GLX harness currently supports Linux/X11 only")
+    endif()
+    add_subdirectory(tools/native_harness)
 endif()
 
 if (EMSCRIPTEN)
@@ -662,7 +702,12 @@ if (EMSCRIPTEN)
         target_link_options(mobilegl_fpe_probe PRIVATE
             ${_emdawn_js_flags_probe}
             "--js-library=${CMAKE_SOURCE_DIR}/MobileGL/MG_Backend/DirectWebGPU/lib_mobilegl_webgpu.js"
-            "-sWASM_BIGINT" "-sSTACK_SIZE=16MB" "-sALLOW_MEMORY_GROWTH=1" "-sEXIT_RUNTIME=0"
+            # The production SFPEW archive is intentionally built without LTO, while
+            # MobileGL uses ThinLTO.  Emscripten cannot add its bitcode system libraries
+            # after the first non-LTO wasm object, so use a normal final application link.
+            "-fno-lto"
+            "-sWASM_BIGINT" "-sSTACK_SIZE=16MB" "-sINITIAL_MEMORY=32MB"
+            "-sALLOW_MEMORY_GROWTH=1" "-sEXIT_RUNTIME=0"
             "-sEXPORTED_RUNTIME_METHODS=addRunDependency,removeRunDependency"
             "-sEXPORTED_FUNCTIONS=_main"
             "-sWASM_ASYNC_COMPILATION=0"

@@ -122,6 +122,7 @@ namespace MobileGL::MG_Impl::EGLImpl {
 
         const MG_Backend::WindowHandle windowHandle = {
             .Backend = DetectWindowBackend(),
+            .Display = ToVoidHandle(state->GetNativeDisplayKey(dpy)),
             .Handle = ToVoidHandle(window),
             .Width = static_cast<Uint32>(std::max<EGLint>(GetAttribValue(attrib_list, EGL_WIDTH, 0), 0)),
             .Height = static_cast<Uint32>(std::max<EGLint>(GetAttribValue(attrib_list, EGL_HEIGHT, 0), 0)),
@@ -661,6 +662,7 @@ namespace MobileGL::MG_Impl::EGLImpl {
 
         const MG_Backend::WindowHandle windowHandle = {
             .Backend = DetectWindowBackend(),
+            .Display = ToVoidHandle(state->GetNativeDisplayKey(dpy)),
             .Handle = native_window,
             .Width = static_cast<Uint32>(std::max<EGLint>(GetAttribValueAttrib(attrib_list, EGL_WIDTH, 0), 0)),
             .Height = static_cast<Uint32>(std::max<EGLint>(GetAttribValueAttrib(attrib_list, EGL_HEIGHT, 0), 0)),

@@ -19,7 +19,6 @@
 #include <MG_State/GLState/SamplerState/SamplerObject.h>
 #include <MG_State/GLState/FramebufferState/FramebufferObject.h>
 #include "MG_Util/ShaderTranspiler/WgslTranspiler.h"
-#include <emscripten/html5.h>
 #include <vector>
 #include <cstring>
 #include <cstdlib>
@@ -28,30 +27,6 @@
 #include <cmath>
 #include <unordered_set>
 #include <cstdio>
-
-// Returns the device's preferred canvas format so the surface (and pipeline color
-// targets, which share m_format) avoid an extra blit copy: 1 = rgba8unorm,
-// 0 = bgra8unorm (the WebGPU-guaranteed canvas formats). Defined in lib_mobilegl_webgpu.js
-// (a --js-library function, NOT EM_JS: EM_JS creates a per-function symbol that emcc must
-// re-materialize at final link from the em_js section, which does not survive the
-// `emcc -r` relocatable combine used to pack this into libglfw3.a).
-extern "C" int mobilegl_preferred_canvas_format();
-
-// JSPI suspend primitive (defined in lib_mobilegl_webgpu.js). mobilegl_jspi_wait is
-// wrapped in WebAssembly.Suspending: calling it suspends the whole wasm stack (which
-// must have been entered via WebAssembly.promising) until mobilegl_jspi_signal()
-// resolves the pending promise from a WebGPU completion callback.
-extern "C" void mobilegl_jspi_wait();
-extern "C" void mobilegl_jspi_signal();
-
-// WebGPU device bootstrap (defined in lib_mobilegl_webgpu.js). The device must live on the thread
-// that renders. In the single-threaded harness it is preinitialized in JS (preRun) and
-// mobilegl_has_webgpu_device() returns 1, so we never suspend. In the threaded host (e.g. ikvmcraft's
-// render pthread) no device is preset, so mobilegl_acquire_webgpu_device() — wrapped in
-// WebAssembly.Suspending — requests an adapter/device via navigator.gpu on THIS worker and JSPI-suspends
-// until it's ready (the render entry must be WebAssembly.promising, which the host's render loop is).
-extern "C" int mobilegl_has_webgpu_device();
-extern "C" void mobilegl_acquire_webgpu_device();
 
 namespace MobileGL::MG_Backend::DirectWebGPU {
     namespace {
@@ -461,65 +436,39 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         Shutdown();
     }
 
-    Bool WebGPURenderer::Initialize(const String& canvasSelector) {
-        m_canvasSelector = canvasSelector;
-
-        m_instance = wgpuCreateInstance(nullptr);
-        if (!m_instance) {
-            MGLOG_E("WebGPURenderer: wgpuCreateInstance failed");
+    Bool WebGPURenderer::Initialize(const Platform::InitInfo& info) {
+        m_canvasSelector = info.CanvasSelector;
+        if (!Platform::Initialize(info, m_platformHandles)) {
+            MGLOG_E("WebGPURenderer: platform initialization failed");
+            Platform::Shutdown(m_platformHandles);
             return false;
         }
+        m_instance = m_platformHandles.Instance;
+        m_device = m_platformHandles.Device;
+        m_queue = m_platformHandles.Queue;
+        m_surface = m_platformHandles.Surface;
+        m_format = m_platformHandles.SurfaceFormat;
+        m_width = std::max<Uint32>(m_platformHandles.Width, 1);
+        m_height = std::max<Uint32>(m_platformHandles.Height, 1);
+        Resize(m_width, m_height);
+        MGLOG_I("WebGPURenderer initialized: %ux%u headless=%d", m_width, m_height,
+                m_surface ? 0 : 1);
+        return true;
+    }
 
-        // Ensure a WebGPU device exists on THIS thread. No-op (no suspend) when one was already
-        // preinitialized in JS; otherwise acquires one on this worker via JSPI (see the externs above).
-        if (!mobilegl_has_webgpu_device()) {
-            mobilegl_acquire_webgpu_device();
-        }
-
-        // The device is created asynchronously by JS at startup and handed to the
-        // module; we retrieve the ready handle synchronously here.
-        m_device = emscripten_webgpu_get_device();
-        if (!m_device) {
-            MGLOG_E("WebGPURenderer: no preinitialized WebGPU device "
-                    "(set Module.preinitializedWebGPUDevice before creating the surface)");
-            return false;
-        }
-        m_queue = wgpuDeviceGetQueue(m_device);
-
-        // Match the canvas' preferred format (avoids an implicit copy at present).
-        m_format = mobilegl_preferred_canvas_format() == 1 ? WGPUTextureFormat_RGBA8Unorm
-                                                           : WGPUTextureFormat_BGRA8Unorm;
-
-        // Create the canvas surface (emdawnwebgpu canvas selector source).
-        WGPUEmscriptenSurfaceSourceCanvasHTMLSelector canvasSrc{};
-        canvasSrc.chain.sType = WGPUSType_EmscriptenSurfaceSourceCanvasHTMLSelector;
-        canvasSrc.selector = Wgpu::View(m_canvasSelector.c_str());
-        WGPUSurfaceDescriptor surfaceDesc{};
-        surfaceDesc.nextInChain = &canvasSrc.chain;
-        m_surface = wgpuInstanceCreateSurface(m_instance, &surfaceDesc);
-        if (!m_surface) {
-            MGLOG_E("WebGPURenderer: wgpuInstanceCreateSurface failed for '%s'", m_canvasSelector.c_str());
-            return false;
-        }
-
-        int w = 0, h = 0;
-        emscripten_get_canvas_element_size(m_canvasSelector.c_str(), &w, &h);
-        m_width = w > 0 ? static_cast<Uint32>(w) : 512u;
-        m_height = h > 0 ? static_cast<Uint32>(h) : 512u;
-
+    void WebGPURenderer::Resize(Uint32 width, Uint32 height) {
+        m_width = std::max<Uint32>(width, 1);
+        m_height = std::max<Uint32>(height, 1);
+        if (!m_surface || !m_device) return;
         WGPUSurfaceConfiguration cfg{};
         cfg.device = m_device;
         cfg.format = m_format;
-        // CopyDst so Present can copy the offscreen target onto the swapchain texture.
         cfg.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopyDst;
         cfg.width = m_width;
         cfg.height = m_height;
         cfg.alphaMode = WGPUCompositeAlphaMode_Opaque;
         cfg.presentMode = WGPUPresentMode_Fifo;
         wgpuSurfaceConfigure(m_surface, &cfg);
-
-        MGLOG_I("WebGPURenderer initialized: canvas='%s' %ux%u", m_canvasSelector.c_str(), m_width, m_height);
-        return true;
     }
 
     void WebGPURenderer::Shutdown() {
@@ -545,6 +494,11 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         m_textureCache.clear();
         for (auto& [k, s] : m_samplerCache) { if (s) wgpuSamplerRelease(s); }
         m_samplerCache.clear();
+        for (auto& [k, p] : m_mipPipelines) { if (p) wgpuRenderPipelineRelease(p); }
+        m_mipPipelines.clear();
+        if (m_blitNearestSampler) { wgpuSamplerRelease(m_blitNearestSampler); m_blitNearestSampler = nullptr; }
+        if (m_mipSampler) { wgpuSamplerRelease(m_mipSampler); m_mipSampler = nullptr; }
+        if (m_mipShaderModule) { wgpuShaderModuleRelease(m_mipShaderModule); m_mipShaderModule = nullptr; }
         for (auto& [k, prog] : m_programCache) {
             if (prog.vertex) wgpuShaderModuleRelease(prog.vertex);
             if (prog.fragment) wgpuShaderModuleRelease(prog.fragment);
@@ -561,11 +515,11 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
         m_fboDepthCache.clear();
         m_offscreenWidth = m_offscreenHeight = 0;
-        if (m_surface) { wgpuSurfaceRelease(m_surface); m_surface = nullptr; }
-        if (m_queue) { wgpuQueueRelease(m_queue); m_queue = nullptr; }
-        // m_device is owned by JS (emscripten_webgpu_get_device); do not destroy it.
+        Platform::Shutdown(m_platformHandles);
+        m_surface = nullptr;
+        m_queue = nullptr;
         m_device = nullptr;
-        if (m_instance) { wgpuInstanceRelease(m_instance); m_instance = nullptr; }
+        m_instance = nullptr;
     }
 
     Bool WebGPURenderer::AcquireSurfaceView() {
@@ -798,7 +752,6 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     void WebGPURenderer::BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0,
                                          GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask,
                                          GLenum filter) {
-        (void)filter;
         if (!m_device || (mask & GL_COLOR_BUFFER_BIT) == 0) {
             return; // depth/stencil blits unsupported for now
         }
@@ -811,13 +764,11 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
         const Int32 w = std::abs(srcX1 - srcX0), h = std::abs(srcY1 - srcY0);
         const Int32 dw = std::abs(dstX1 - dstX0), dh = std::abs(dstY1 - dstY0);
-        if (w != dw || h != dh) {
-            MGLOG_E("DirectWebGPU: scaling glBlitFramebuffer unsupported (src %dx%d -> dst %dx%d)", w, h, dw,
-                    dh);
+        if (w <= 0 || h <= 0 || dw <= 0 || dh <= 0) {
             return;
         }
-        if (srcFmt != dstFmt || srcTex == dstTex) {
-            MGLOG_E("DirectWebGPU: glBlitFramebuffer needs matching formats and distinct src/dst");
+        if (srcTex == dstTex) {
+            MGLOG_E("DirectWebGPU: same-texture glBlitFramebuffer unsupported");
             return;
         }
         BeginFrameIfNeeded();
@@ -826,17 +777,90 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         }
         // Render targets are stored in GL texel order (see RemapClipSpace), so GL's
         // bottom-left rectangles map to texel rows directly.
-        (void)srcH; (void)dstH;
+        (void)dstW; (void)dstH;
         const Int32 sx = std::min(srcX0, srcX1), sy = std::min(srcY0, srcY1);
         const Int32 dx = std::min(dstX0, dstX1), dy = std::min(dstY0, dstY1);
-        WGPUTexelCopyTextureInfo src{};
-        src.texture = srcTex;
-        src.origin = {static_cast<Uint32>(sx < 0 ? 0 : sx), static_cast<Uint32>(sy < 0 ? 0 : sy), 0};
-        WGPUTexelCopyTextureInfo dst{};
-        dst.texture = dstTex;
-        dst.origin = {static_cast<Uint32>(dx < 0 ? 0 : dx), static_cast<Uint32>(dy < 0 ? 0 : dy), 0};
-        WGPUExtent3D ext{static_cast<Uint32>(w), static_cast<Uint32>(h), 1};
-        wgpuCommandEncoderCopyTextureToTexture(m_encoder, &src, &dst, &ext);
+        // The copy command is cheapest but requires identical formats and extents.
+        if (srcFmt == dstFmt && w == dw && h == dh && srcX0 <= srcX1 && srcY0 <= srcY1 &&
+            dstX0 <= dstX1 && dstY0 <= dstY1) {
+            WGPUTexelCopyTextureInfo src{};
+            src.texture = srcTex;
+            src.origin = {static_cast<Uint32>(sx < 0 ? 0 : sx), static_cast<Uint32>(sy < 0 ? 0 : sy), 0};
+            WGPUTexelCopyTextureInfo dst{};
+            dst.texture = dstTex;
+            dst.origin = {static_cast<Uint32>(dx < 0 ? 0 : dx), static_cast<Uint32>(dy < 0 ? 0 : dy), 0};
+            WGPUExtent3D ext{static_cast<Uint32>(w), static_cast<Uint32>(h), 1};
+            wgpuCommandEncoderCopyTextureToTexture(m_encoder, &src, &dst, &ext);
+            return;
+        }
+
+        // Minecraft's final frame copy is normally RGBA8 -> the BGRA8 default
+        // framebuffer. WebGPU copyTextureToTexture rejects that even though GL blit
+        // permits format conversion, so draw a sampled fullscreen triangle instead.
+        // The current shader samples the complete source; retain a precise diagnostic
+        // for uncommon partial-source or flipped blits until rectangle uniforms land.
+        if (sx != 0 || sy != 0 || static_cast<Uint32>(w) != srcW || static_cast<Uint32>(h) != srcH ||
+            srcX0 > srcX1 || srcY0 > srcY1 || dstX0 > dstX1 || dstY0 > dstY1) {
+            MGLOG_E("DirectWebGPU: partial/flipped format-converting glBlitFramebuffer unsupported");
+            return;
+        }
+        WGPURenderPipeline pipe = GetOrCreateMipPipeline(dstFmt);
+        if (!pipe) {
+            return;
+        }
+        if (!m_mipSampler) {
+            WGPUSamplerDescriptor sd{};
+            sd.addressModeU = sd.addressModeV = sd.addressModeW = WGPUAddressMode_ClampToEdge;
+            sd.magFilter = sd.minFilter = WGPUFilterMode_Linear;
+            sd.mipmapFilter = WGPUMipmapFilterMode_Nearest;
+            sd.lodMinClamp = 0.0f;
+            sd.lodMaxClamp = 32.0f;
+            sd.maxAnisotropy = 1;
+            m_mipSampler = wgpuDeviceCreateSampler(m_device, &sd);
+        }
+        if (!m_blitNearestSampler) {
+            WGPUSamplerDescriptor sd{};
+            sd.addressModeU = sd.addressModeV = sd.addressModeW = WGPUAddressMode_ClampToEdge;
+            sd.magFilter = sd.minFilter = WGPUFilterMode_Nearest;
+            sd.mipmapFilter = WGPUMipmapFilterMode_Nearest;
+            sd.lodMinClamp = 0.0f;
+            sd.lodMaxClamp = 32.0f;
+            sd.maxAnisotropy = 1;
+            m_blitNearestSampler = wgpuDeviceCreateSampler(m_device, &sd);
+        }
+        WGPUTextureView srcView = wgpuTextureCreateView(srcTex, nullptr);
+        WGPUTextureView dstView = wgpuTextureCreateView(dstTex, nullptr);
+        WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(pipe, 0);
+        WGPUBindGroupEntry entries[2]{};
+        entries[0].binding = 0;
+        entries[0].textureView = srcView;
+        entries[1].binding = 1;
+        entries[1].sampler = filter == GL_LINEAR ? m_mipSampler : m_blitNearestSampler;
+        WGPUBindGroupDescriptor bgd{};
+        bgd.layout = bgl;
+        bgd.entryCount = 2;
+        bgd.entries = entries;
+        WGPUBindGroup bg = wgpuDeviceCreateBindGroup(m_device, &bgd);
+        WGPURenderPassColorAttachment ca{};
+        ca.view = dstView;
+        ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
+        ca.loadOp = WGPULoadOp_Load;
+        ca.storeOp = WGPUStoreOp_Store;
+        WGPURenderPassDescriptor rp{};
+        rp.colorAttachmentCount = 1;
+        rp.colorAttachments = &ca;
+        WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(m_encoder, &rp);
+        wgpuRenderPassEncoderSetPipeline(pass, pipe);
+        wgpuRenderPassEncoderSetBindGroup(pass, 0, bg, 0, nullptr);
+        wgpuRenderPassEncoderSetViewport(pass, static_cast<float>(dx), static_cast<float>(dy),
+                                         static_cast<float>(dw), static_cast<float>(dh), 0.0f, 1.0f);
+        wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+        wgpuRenderPassEncoderEnd(pass);
+        wgpuRenderPassEncoderRelease(pass);
+        wgpuBindGroupRelease(bg);
+        wgpuBindGroupLayoutRelease(bgl);
+        wgpuTextureViewRelease(srcView);
+        wgpuTextureViewRelease(dstView);
     }
 
     void WebGPURenderer::BeginFrameIfNeeded() {
@@ -962,7 +986,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // RemapClipSpace) while the canvas presents row 0 at the top, so copy row by
         // row, reversed. (copyTextureToTexture cannot flip; a sampled blit can replace
         // this if the per-row copies ever matter for performance.)
-        if (AcquireSurfaceView()) {
+        if (m_surface && AcquireSurfaceView()) {
             for (Uint32 row = 0; row < m_height; ++row) {
                 WGPUTexelCopyTextureInfo src{};
                 src.texture = m_offscreenTexture;
@@ -977,9 +1001,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(m_encoder, nullptr);
         wgpuQueueSubmit(m_queue, 1, &cmd);
         wgpuCommandBufferRelease(cmd);
+        Platform::Present(m_surface);
         EndFrame();
-        // On the web the configured canvas surface is presented implicitly when
-        // control returns to the browser event loop.
     }
 
     // WebGPU merges all shader stages into a single shared @group(0), but glslang
@@ -1693,9 +1716,15 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
             const std::string code2 = RemapClipSpace(code, shaders[i]->GetShaderStage());
             // ?dumpwgsl=N (shell) prints the final WGSL of the replay program whose
             // GL name is N, for transpile debugging.
-            static const Uint32 dumpWgslProg = static_cast<Uint32>(EM_ASM_INT({
-                return (typeof Module !== 'undefined' && Module['dumpWgsl']) ? Module['dumpWgsl'] : 0;
-            }));
+            static const Uint32 dumpWgslProg = [] {
+#if defined(__EMSCRIPTEN__)
+                return static_cast<Uint32>(EM_ASM_INT({
+                    return (typeof Module !== 'undefined' && Module['dumpWgsl']) ? Module['dumpWgsl'] : 0;
+                }));
+#else
+                return Uint32{0};
+#endif
+            }();
             if (dumpWgslProg != 0 && program.GetExternalIndex() == dumpWgslProg) {
                 std::printf("[webgpu] WGSL prog=%u stage=%d begin\n%s\n[webgpu] WGSL prog=%u stage=%d end\n",
                             program.GetExternalIndex(), static_cast<int>(shaders[i]->GetShaderStage()),
@@ -3754,17 +3783,27 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     namespace {
         struct ReadbackState {
             WGPUMapAsyncStatus status = static_cast<WGPUMapAsyncStatus>(0);
+            std::atomic_bool done = false;
         };
         void OnBufferMapped(WGPUMapAsyncStatus status, WGPUStringView, void* ud1, void*) {
-            if (ud1) static_cast<ReadbackState*>(ud1)->status = status;
-            mobilegl_jspi_signal();
+            if (ud1) {
+                auto* state = static_cast<ReadbackState*>(ud1);
+                state->status = status;
+                state->done.store(true, std::memory_order_release);
+            }
+            Platform::SignalCallback();
         }
         struct WorkDoneState {
             WGPUQueueWorkDoneStatus status = static_cast<WGPUQueueWorkDoneStatus>(0);
+            std::atomic_bool done = false;
         };
         void OnWorkDone(WGPUQueueWorkDoneStatus status, void* ud1, void*) {
-            if (ud1) static_cast<WorkDoneState*>(ud1)->status = status;
-            mobilegl_jspi_signal();
+            if (ud1) {
+                auto* state = static_cast<WorkDoneState*>(ud1);
+                state->status = status;
+                state->done.store(true, std::memory_order_release);
+            }
+            Platform::SignalCallback();
         }
         constexpr Uint32 AlignUp256(Uint32 v) { return (v + 255u) & ~255u; }
 
@@ -3828,7 +3867,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         ci.callback = &OnWorkDone;
         ci.userdata1 = &st;
         wgpuQueueOnSubmittedWorkDone(m_queue, ci);
-        mobilegl_jspi_wait(); // suspends until OnWorkDone signals
+        Platform::WaitForCallback(m_instance, st.done);
     }
 
     Bool WebGPURenderer::ReadTextureToCPU(WGPUTexture tex, Uint32 srcX, Uint32 srcY, Uint32 w, Uint32 h,
@@ -3876,7 +3915,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         ci.userdata1 = &st;
         m_readbackInFlight = true;
         wgpuBufferMapAsync(readback, WGPUMapMode_Read, 0, bufSize, ci);
-        mobilegl_jspi_wait();
+        Platform::WaitForCallback(m_instance, st.done);
         m_readbackInFlight = false;
 
         Bool ok = false;

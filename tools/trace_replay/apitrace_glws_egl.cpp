@@ -65,6 +65,22 @@ int gRequestedWidth = 0;
 int gRequestedHeight = 0;
 bool gPrintedGlIdentity = false;
 
+void InitializeSfpewIfRequested() {
+    const char *frontend = std::getenv("MOBILEGL_TRACE_FRONTEND");
+    if (!frontend || std::strcmp(frontend, "sfpew") != 0) return;
+    const char *library = std::getenv("SFPEW_LIBRARY");
+    if (!library || !library[0]) library = "libSimpleFPEWrapper.so";
+    void *sfpew = dlopen(library, RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
+    if (!sfpew) sfpew = dlopen(library, RTLD_NOW | RTLD_GLOBAL);
+    using Resolver = __eglMustCastToProperFunctionPointerType (*)(const char *);
+    using Initialize = int (*)(Resolver);
+    auto initialize = sfpew ? reinterpret_cast<Initialize>(dlsym(sfpew, "sfpew_init_with_proc")) : nullptr;
+    auto resolver = gMobileGl ? reinterpret_cast<Resolver>(dlsym(gMobileGl, "eglGetProcAddress")) : nullptr;
+    if (!initialize || !resolver || !initialize(resolver)) {
+        std::cerr << "error: failed to initialize deferred SFPEW frontend\n";
+    }
+}
+
 #if defined(__APPLE__)
 constexpr unsigned long kNSWindowStyleMaskTitled = 1ul << 0;
 constexpr unsigned long kNSWindowStyleMaskClosable = 1ul << 1;
@@ -636,6 +652,7 @@ bool makeCurrentInternal(Drawable *drawable, Drawable *readable, Context *contex
     if (gEgl.makeCurrent(gDisplay, drawSurface, readSurface, eglContext) != EGL_TRUE) {
         return false;
     }
+    InitializeSfpewIfRequested();
     gCurrentDrawable = drawable;
     gCurrentContext = eglContext;
     PrintGlIdentityOnce();

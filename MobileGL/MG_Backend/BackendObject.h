@@ -240,6 +240,7 @@ namespace MobileGL {
 
         struct WindowHandle {
             WindowBackend Backend = WindowBackend::Unknown;
+            void* Display = nullptr;
             void* Handle = nullptr;
             Uint32 Width = 0;
             Uint32 Height = 0;

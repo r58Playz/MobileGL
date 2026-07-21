@@ -46,5 +46,5 @@ cmake --build "${BUILD_DIR}" --target mobilegl_web_harness -j"${JOBS}"
 
 echo
 echo "==> Done. Serve it and open the harness:"
-echo "    (cd '${BUILD_DIR}' && python3 -m http.server 8105)"
+echo "    python3 '${SCRIPT_DIR}/serve.py' --directory '${BUILD_DIR}' --port 8105"
 echo "    then browse http://localhost:8105/mobilegl_web_harness.html"

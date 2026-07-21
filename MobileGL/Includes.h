@@ -104,7 +104,9 @@
 #include <android/native_window.h>
 #endif
 
-#ifndef __EMSCRIPTEN__
+#if defined(MOBILEGL_NATIVE_WEBGPU)
+#include <webgpu/webgpu.h>
+#elif !defined(__EMSCRIPTEN__)
 #ifdef __ANDROID__
 #define VK_USE_PLATFORM_ANDROID_KHR
 #elif _WIN32
@@ -144,7 +146,7 @@ typedef unsigned long VisualID;
 #include <webgpu/webgpu.h>
 #include <emscripten.h>
 #include <emscripten/html5.h>
-#endif // __EMSCRIPTEN__
+#endif // MOBILEGL_NATIVE_WEBGPU / __EMSCRIPTEN__
 
 #ifdef TRACY_ENABLE
 #include <tracy/Tracy.hpp>

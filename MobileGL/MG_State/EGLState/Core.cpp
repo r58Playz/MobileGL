@@ -323,6 +323,12 @@ namespace MobileGL {
                 return GetOrCreateDisplay(ToNativeKey(nativeDisplay), platform);
             }
 
+            Uint64 EGLContext::GetNativeDisplayKey(EGLDisplayHandle display) const {
+                const std::lock_guard<std::recursive_mutex> lock(m_mutex);
+                const auto* displayObject = TryGetDisplay(display);
+                return displayObject ? displayObject->NativeDisplayKey : 0;
+            }
+
             Bool EGLContext::ValidateDisplay(EGLDisplayHandle display) const {
                 const std::lock_guard<std::recursive_mutex> lock(m_mutex);
                 return m_displays.find(display) != m_displays.end();

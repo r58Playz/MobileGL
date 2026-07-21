@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "defaults": {
+    "width": 854,
+    "height": 480,
+    "ssim_threshold": 0.99,
+    "max_changed_pixel_fraction": 0.01,
+    "channel_delta_threshold": 16,
+    "frontend": "core"
+  },
+  "versions": [
+    {"id": "1.7.10", "frontend": "sfpew"},
+    {"id": "1.8.9", "frontend": "sfpew"},
+    {"id": "1.12.2", "frontend": "sfpew"},
+    {"id": "1.16.5", "frontend": "sfpew"},
+    {"id": "1.17.1"},
+    {"id": "1.20.1"},
+    {"id": "1.21.4"},
+    {"id": "26.2"}
+  ]
+}

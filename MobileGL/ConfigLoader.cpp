@@ -62,7 +62,7 @@ namespace MobileGL::MG_ConfigLoader {
 
     inline void InitBackendType() {
         String backendTypeStr;
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) || defined(MOBILEGL_NATIVE_WEBGPU)
         constexpr const char* kDefaultBackend = "DirectWebGPU";
 #else
         constexpr const char* kDefaultBackend = "DirectGLES";

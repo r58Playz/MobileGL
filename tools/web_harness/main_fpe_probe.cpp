@@ -23,6 +23,8 @@ void mobilegl_present();
 using PFN_glClearColor = void (*)(GLfloat, GLfloat, GLfloat, GLfloat);
 using PFN_glClear = void (*)(GLbitfield);
 using PFN_glGetString = const GLubyte* (*)(GLenum);
+using PFN_glGetIntegerv = void (*)(GLenum, GLint*);
+using PFN_glAlphaFunc = void (*)(GLenum, GLclampf);
 
 int main() {
     EmscriptenWebGLContextAttributes attrs;
@@ -43,11 +45,29 @@ int main() {
     void* pClear = mobilegl_get_proc_address("glClear");
     void* pClearColor = mobilegl_get_proc_address("glClearColor");
     void* pGetString = mobilegl_get_proc_address("glGetString");
-    printf("[fpe-probe] proc: glBegin=%p glMatrixMode=%p (FFP via SFPEW) | glClear=%p glClearColor=%p glGetString=%p (core via MobileGL)\n",
-           pBegin, pEnable, pClear, pClearColor, pGetString);
+    void* pGetIntegerv = mobilegl_get_proc_address("glGetIntegerv");
+    void* pAlphaFunc = mobilegl_get_proc_address("glAlphaFunc");
+    printf("[fpe-probe] proc: glBegin=%p glMatrixMode=%p glAlphaFunc=%p (FFP via SFPEW) | glClear=%p glClearColor=%p glGetString=%p glGetIntegerv=%p (core via MobileGL)\n",
+           pBegin, pEnable, pAlphaFunc, pClear, pClearColor, pGetString, pGetIntegerv);
 
-    bool routingOk = pBegin && pEnable && pClear && pClearColor && pGetString;
+    bool routingOk = pBegin && pEnable && pAlphaFunc && pClear && pClearColor && pGetString && pGetIntegerv;
     printf("[fpe-probe] routing %s\n", routingOk ? "OK (SFPEW front + MobileGL fallback both resolve)" : "FAIL");
+
+    bool profileOk = false;
+    if (pGetIntegerv && pAlphaFunc) {
+        auto glGetIntegerv_ = reinterpret_cast<PFN_glGetIntegerv>(pGetIntegerv);
+        auto glAlphaFunc_ = reinterpret_cast<PFN_glAlphaFunc>(pAlphaFunc);
+        GLint profile = 0;
+        GLint flags = -1;
+        glGetIntegerv_(GL_CONTEXT_PROFILE_MASK, &profile);
+        glGetIntegerv_(GL_CONTEXT_FLAGS, &flags);
+        profileOk = (profile & GL_CONTEXT_COMPATIBILITY_PROFILE_BIT) != 0 &&
+                    (flags & GL_CONTEXT_FLAG_FORWARD_COMPATIBLE_BIT) == 0;
+        printf("[fpe-probe] profile=0x%x flags=0x%x -> %s\n", profile, flags,
+               profileOk ? "compatibility/non-forward OK" : "FAIL");
+        // This is the first deprecated call Minecraft 1.16 makes after LWJGL capability setup.
+        glAlphaFunc_(GL_GREATER, 0.1f);
+    }
 
     if (pClearColor && pClear) {
         auto glClearColor_ = reinterpret_cast<PFN_glClearColor>(pClearColor);
@@ -62,7 +82,8 @@ int main() {
         const GLubyte* v = glGetString_(GL_VERSION);
         printf("[fpe-probe] GL_VERSION=%s\n", v ? (const char*)v : "(null)");
     }
-    printf("[fpe-probe] %s\n", routingOk ? "SUCCESS" : "FAILED");
+    const bool success = routingOk && profileOk;
+    printf("[fpe-probe] %s\n", success ? "SUCCESS" : "FAILED");
     EM_ASM({ Module['__probeDone'] = true; });
-    return 0;
+    return success ? 0 : 2;
 }

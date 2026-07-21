@@ -61,13 +61,37 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     }
 
     Bool BackendObject_DirectWebGPU::InitWindowSurface() {
-        // TODO(M3): thread the canvas selector through WindowHandle; default for now.
         pWebGPURenderer = MakeUnique<WebGPURenderer>();
-        if (!pWebGPURenderer->Initialize("#canvas")) {
+        Platform::InitInfo info;
+        info.CanvasSelector = "#canvas";
+        info.NativeDisplay = m_windowHandle.Display;
+        info.NativeWindow = m_windowHandle.Handle;
+        info.Width = m_windowHandle.Width;
+        info.Height = m_windowHandle.Height;
+        if (!pWebGPURenderer->Initialize(info)) {
             MGLOG_E("DirectWebGPU: failed to initialize WebGPU renderer");
             pWebGPURenderer.reset();
             return false;
         }
+        return true;
+    }
+
+    Bool BackendObject_DirectWebGPU::InitPbufferSurface(EGLint width, EGLint height) {
+        pWebGPURenderer = MakeUnique<WebGPURenderer>();
+        Platform::InitInfo info;
+        info.Width = static_cast<Uint32>(std::max<EGLint>(width, 1));
+        info.Height = static_cast<Uint32>(std::max<EGLint>(height, 1));
+        info.Headless = true;
+        if (!pWebGPURenderer->Initialize(info)) {
+            pWebGPURenderer.reset();
+            return false;
+        }
+        return true;
+    }
+
+    Bool BackendObject_DirectWebGPU::ResizeEGLWindowSurface(EGLSurface surface, Uint32 width, Uint32 height) {
+        if (!BackendObject::ResizeEGLWindowSurface(surface, width, height)) return false;
+        if (pWebGPURenderer && m_eglSurface == surface) pWebGPURenderer->Resize(width, height);
         return true;
     }
 
@@ -76,7 +100,11 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
     }
 
     String BackendObject_DirectWebGPU::GetBackendAPIVersionString() const {
+#if defined(MOBILEGL_NATIVE_WEBGPU)
+        return "WebGPU (Dawn/Vulkan)";
+#else
         return "WebGPU (emdawnwebgpu)";
+#endif
     }
 
     const GlobalBackendFunctionsTable& BackendObject_DirectWebGPU::GetBackendFunctions() const {

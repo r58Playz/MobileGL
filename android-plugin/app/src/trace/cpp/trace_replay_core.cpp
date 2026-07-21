@@ -133,6 +133,9 @@ std::string JsonEscape(const std::string& value) {
 bool LoadMobileGL(const Request& request, std::string& error) {
     setenv("MOBILEGL_BACKEND_TYPE", request.backend.c_str(), 1);
     setenv("MOBILEGL_TRACE_LIBRARY", request.mobileGlLibrary.c_str(), 1);
+    setenv("MOBILEGL_TRACE_FRONTEND", request.frontend.c_str(), 1);
+    setenv("SFPEW_LIBRARY", request.sfpewLibrary.c_str(), 1);
+    if (request.frontend == "sfpew") setenv("SFPEW_DEFER_INIT", "1", 1);
     setenv("MOBILEGL_TRACE_SKIP_AUTODESTROY", "1", 1);
     setenv("MOBILEGL_TRACE_SURFACE", request.usePbuffer ? "pbuffer" : "window", 1);
     if (request.backend == "DirectVulkan") {
@@ -861,6 +864,7 @@ bool WriteResultJson(const Request& request, const Result& result) {
     file << "  \"actualPath\": \"" << JsonEscape(result.actualPath) << "\",\n";
     file << "  \"diffPath\": \"" << JsonEscape(result.diffPath) << "\",\n";
     file << "  \"backend\": \"" << JsonEscape(request.backend) << "\",\n";
+    file << "  \"frontend\": \"" << JsonEscape(request.frontend) << "\",\n";
     file << "  \"angleLibraryDir\": \"" << JsonEscape(request.angleLibraryDir) << "\",\n";
     file << "  \"targetFrame\": " << request.targetFrame << ",\n";
     file << "  \"targetCall\": " << request.targetCall << ",\n";
@@ -896,9 +900,10 @@ Result RunTraceReplay(const Request& request) {
         return result;
     }
 
-    if (request.backend != "DirectGLES" && request.backend != "DirectVulkan") {
+    if (request.backend != "DirectGLES" && request.backend != "DirectVulkan" &&
+        request.backend != "DirectWebGPU") {
         result.statusCode = STATUS_INVALID_ARGUMENT;
-        result.message = "backend must be DirectGLES or DirectVulkan";
+        result.message = "backend must be DirectGLES, DirectVulkan, or DirectWebGPU";
         return result;
     }
 

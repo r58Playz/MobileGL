@@ -49,7 +49,7 @@ namespace MobileGL::MG_Backend {
         MGLOG_D("Initializing MobileGL Backend...");
 
         switch (MG_Config::ActiveBackendType) {
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) || defined(MOBILEGL_NATIVE_WEBGPU)
         case BackendType::DirectWebGPU:
             pActiveBackendObject = MakeUnique<DirectWebGPU::BackendObject_DirectWebGPU>();
             break;

@@ -11,6 +11,7 @@
 #include <MG_State/GLState/ProgramState/ShaderObject.h>
 #include <MG_State/GLState/TextureState/TextureEnum.h>
 #include "../WgpuApi.h"
+#include "WebGPUPlatform.h"
 
 namespace MobileGL {
     enum class FramebufferTarget;
@@ -40,7 +41,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         WebGPURenderer(const WebGPURenderer&) = delete;
         WebGPURenderer& operator=(const WebGPURenderer&) = delete;
 
-        Bool Initialize(const String& canvasSelector);
+        Bool Initialize(const Platform::InitInfo& info);
+        void Resize(Uint32 width, Uint32 height);
         void Shutdown();
 
         void Clear(GLbitfield mask);
@@ -73,8 +75,8 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         void GetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void* pixels);
         void GetTextureImage(MG_State::GLState::ITextureObject& texture, TextureUploadTarget uploadTarget,
                              GLint level, GLenum format, GLenum type, GLsizei bufSize, void* pixels);
-        // glBlitFramebuffer: same-size color blit (resolve/copy) via copyTextureToTexture.
-        // Scaling/format-convert and depth/stencil blits aren't supported yet.
+        // glBlitFramebuffer: direct copies for identical textures/formats, with a
+        // sampled render path for scaling and RGBA/BGRA format conversion.
         void BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0,
                              GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter);
         // glGenerateMipmap / glGenerateTextureMipmap: fill mip levels 1+ of the bound
@@ -300,6 +302,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         Uint32 m_width = 0;
         Uint32 m_height = 0;
         String m_canvasSelector;
+        Platform::Handles m_platformHandles;
 
         // Caches (keyed by the MG_State object identity; minimal invalidation for now).
         UnorderedMap<const MG_State::GLState::ProgramObject*, WgpuProgram> m_programCache;
@@ -319,6 +322,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         // render pipeline cached per color format (GenerateMipmaps).
         WGPUShaderModule m_mipShaderModule = nullptr;
         WGPUSampler m_mipSampler = nullptr;
+        WGPUSampler m_blitNearestSampler = nullptr;
         UnorderedMap<Uint32, WGPURenderPipeline> m_mipPipelines;
         // Bind groups reference runtime resources (textures/UBO contents), so they are
         // rebuilt each draw and released at frame end.

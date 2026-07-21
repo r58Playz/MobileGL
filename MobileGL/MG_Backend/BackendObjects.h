@@ -9,7 +9,7 @@
 #pragma once
 #include <Includes.h>
 #include "BackendObject.h"
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) || defined(MOBILEGL_NATIVE_WEBGPU)
 #include "DirectWebGPU/BackendObject_DirectWebGPU.h"
 #else
 #include "DirectGLES/BackendObject_DirectGLES.h"

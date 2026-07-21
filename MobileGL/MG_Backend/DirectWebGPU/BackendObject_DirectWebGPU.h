@@ -20,6 +20,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         void Initialize() override;
         Bool InitCapabilities() override;
         Bool InitWindowSurface() override;
+        Bool ResizeEGLWindowSurface(EGLSurface surface, Uint32 width, Uint32 height) override;
 
         const RendererInfo& GetRendererInfo() const override;
         String GetBackendAPIVersionString() const override;
@@ -28,6 +29,7 @@ namespace MobileGL::MG_Backend::DirectWebGPU {
         BackendType GetBackendType() const override;
 
     private:
+        Bool InitPbufferSurface(EGLint width, EGLint height) override;
         RendererInfo m_rendererInfo;
         GlobalBackendFunctionsTable m_backendFunctions{};
         DynamicBackendParameters m_dynamicParameters{};

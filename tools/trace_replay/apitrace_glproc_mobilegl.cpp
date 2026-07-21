@@ -17,10 +17,22 @@
 #include <dlfcn.h>
 
 void *_libGlHandle = nullptr;
+void *gSfpewHandle = nullptr;
 
 namespace {
 
 void *LookupSymbol(const char *procName);
+
+void *GetFrontendHandle() {
+    const char *frontend = std::getenv("MOBILEGL_TRACE_FRONTEND");
+    if (!frontend || std::strcmp(frontend, "sfpew") != 0) return nullptr;
+    if (gSfpewHandle) return gSfpewHandle;
+    const char *library = std::getenv("SFPEW_LIBRARY");
+    if (!library || !library[0]) library = "libSimpleFPEWrapper.so";
+    gSfpewHandle = dlopen(library, RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
+    if (!gSfpewHandle) gSfpewHandle = dlopen(library, RTLD_NOW | RTLD_GLOBAL);
+    return gSfpewHandle;
+}
 
 void *GetMobileGlHandle() {
     if (_libGlHandle != nullptr) {
@@ -109,6 +121,11 @@ GLenum MobileGLTraceGetError() {
 }
 
 void *LookupSymbol(const char *procName) {
+    if (std::strncmp(procName, "gl", 2) == 0) {
+        if (void *frontend = GetFrontendHandle()) {
+            if (void *proc = dlsym(frontend, procName)) return proc;
+        }
+    }
     void *mobileGl = GetMobileGlHandle();
     if (mobileGl != nullptr) {
         void *proc = dlsym(mobileGl, procName);
